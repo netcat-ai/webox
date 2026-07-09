@@ -46,10 +46,12 @@ APT_DEBIAN_SECURITY_MIRROR=
 - `POST /ilink/bot/sendmessage`
 - `POST /ilink/bot/getconfig`
 - `POST /ilink/bot/sendtyping`
+- `POST /ilink/bot/msg/notifystart`
+- `POST /ilink/bot/msg/notifystop`
 
 根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`、
-`/getconfig`、`/sendtyping`。
-这是为了兼容把 `baseurl` 设为 `http://host/ilink/bot` 后再拼相对路径的 iLink 客户端。
+`/getconfig`、`/sendtyping`、`/msg/notifystart`、`/msg/notifystop`。
+这是为了兼容把 `baseurl` 当服务根地址后再拼相对路径的 iLink 客户端。
 
 `/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码：
 
@@ -69,7 +71,7 @@ APT_DEBIAN_SECURITY_MIRROR=
   "bot_token": "webox",
   "ilink_bot_id": "default",
   "ilink_user_id": "default",
-  "baseurl": "http://127.0.0.1:38080/ilink/bot"
+  "baseurl": "http://127.0.0.1:38080"
 }
 ```
 
@@ -96,11 +98,13 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
-`WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。如果不设置，默认从请求 `Host` 派生
-`http://host/ilink/bot`。
+`WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。标准 iLink SDK 会自己拼 `/ilink/bot/...`，
+所以这里应配置服务根地址，例如 `https://webox.example.com`。如果不设置，默认从请求 `Host` 派生
+`http://host`。为兼容旧配置，末尾的 `/ilink/bot` 会被自动去掉。
 
 `/ilink/bot/getconfig` 和 `/ilink/bot/sendtyping` 用于兼容 iLink SDK 的输入状态流程。当前实现生成无状态
 `typing_ticket`，`sendtyping` 校验 ticket 后返回 `ret=0`；它暂不驱动 Linux WeChat 显示真实输入状态。
+`/ilink/bot/msg/notifystart` 和 `/ilink/bot/msg/notifystop` 接收标准 SDK 启停通知，当前返回 `ret=0`。
 
 ## 核心边界
 

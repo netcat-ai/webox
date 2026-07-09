@@ -85,6 +85,7 @@ WeChat login request/response
 - 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
 - `GET|POST /ilink/bot/get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
 - `GET /ilink/bot/get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。
+- `confirmed.baseurl` 返回服务根地址；标准 SDK 会自己拼 `/ilink/bot/...`。
 - `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
 
 ### 收消息
@@ -101,6 +102,7 @@ WeChat local DB
 - 对外只接受 iLink `get_updates_buf`，不暴露内部 DB cursor。
 - `get_updates_buf` 是不透明游标，内部只编码最后投递的稳定 update id。
 - 每条 `msg` 包含无状态 `context_token`，agent 回复时必须原样传给 `/ilink/bot/sendmessage`。
+- `msg/notifystart` 和 `msg/notifystop` 接收标准 SDK 生命周期通知，不参与本地 DB 游标。
 - 服务端不维护独立 ack 状态。
 - 如果标准 iLink 明确要求持久上下文状态，再增加最小状态；不能预先引入 msghub-style mailbox。
 

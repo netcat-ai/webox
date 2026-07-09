@@ -77,6 +77,12 @@ pub struct SendTypingRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LifecycleRequest {
+    #[serde(default)]
+    pub base_info: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct OutboundMessage {
     #[serde(default)]
     pub to_user_id: Option<String>,
@@ -294,6 +300,26 @@ pub async fn send_typing(
     Ok(Json(json!({ "ret": 0 })))
 }
 
+pub async fn notify_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers)?;
+    let _base_info = request.base_info.as_ref();
+    Ok(Json(json!({ "ret": 0 })))
+}
+
+pub async fn notify_stop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers)?;
+    let _base_info = request.base_info.as_ref();
+    Ok(Json(json!({ "ret": 0 })))
+}
+
 pub async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -326,13 +352,22 @@ fn qrcode_content(qrcode: &LoginQrCode) -> Option<String> {
 
 fn ilink_base_url(state: &AppState, headers: &HeaderMap) -> String {
     if let Some(value) = state.public_base_url.as_deref().and_then(non_empty) {
-        return value.trim_end_matches('/').to_string();
+        return normalize_base_url(&value);
     }
     let proto = header_string(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
     let host = header_string(headers, "x-forwarded-host")
         .or_else(|| header_string(headers, "host"))
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    format!("{}://{}{}", proto, host, ILINK_BASE_PATH)
+    format!("{}://{}", proto, host)
+}
+
+fn normalize_base_url(value: &str) -> String {
+    let value = value.trim().trim_end_matches('/');
+    value
+        .strip_suffix(ILINK_BASE_PATH)
+        .unwrap_or(value)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -721,6 +756,22 @@ mod tests {
         assert_eq!(decoded.provider_account_id, "wx");
         assert_eq!(decoded.ilink_user_id, "alice");
         assert_eq!(decoded.context_token, "ctx");
+    }
+
+    #[test]
+    fn baseurl_normalization_returns_service_root() {
+        assert_eq!(
+            normalize_base_url("https://public.example/ilink/bot/"),
+            "https://public.example"
+        );
+        assert_eq!(
+            normalize_base_url("https://public.example/proxy/ilink/bot"),
+            "https://public.example/proxy"
+        );
+        assert_eq!(
+            normalize_base_url("https://public.example"),
+            "https://public.example"
+        );
     }
 
     #[test]

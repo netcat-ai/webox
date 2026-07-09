@@ -75,6 +75,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/sendmessage", post(ilink::send_message))
         .route("/getconfig", post(ilink::get_config))
         .route("/sendtyping", post(ilink::send_typing))
+        .route("/msg/notifystart", post(ilink::notify_start))
+        .route("/msg/notifystop", post(ilink::notify_stop))
         .route(
             "/ilink/bot/get_bot_qrcode",
             get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
@@ -87,6 +89,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ilink/bot/sendmessage", post(ilink::send_message))
         .route("/ilink/bot/getconfig", post(ilink::get_config))
         .route("/ilink/bot/sendtyping", post(ilink::send_typing))
+        .route("/ilink/bot/msg/notifystart", post(ilink::notify_start))
+        .route("/ilink/bot/msg/notifystop", post(ilink::notify_stop))
         .fallback(ilink::not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -228,7 +232,7 @@ mod tests {
                 .unwrap();
         assert_eq!(body["status"], "confirmed");
         assert_eq!(body["bot_token"], "token");
-        assert_eq!(body["baseurl"], "https://public.example/ilink/bot");
+        assert_eq!(body["baseurl"], "https://public.example");
     }
 
     #[tokio::test]
@@ -318,6 +322,32 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body["ret"], 0);
+    }
+
+    #[tokio::test]
+    async fn standard_lifecycle_notifications_accept_bearer_token() {
+        let app = build_router(test_state());
+        for path in ["/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"base_info":{"channel_version":"2.0.0"}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["ret"], 0);
+        }
     }
 
     #[tokio::test]
