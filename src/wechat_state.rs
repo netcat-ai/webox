@@ -52,6 +52,31 @@ pub struct PollResult {
     pub meta: Value,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LoginStatus {
+    pub status: LoginStatusKind,
+    pub can_read_messages: bool,
+    pub has_key: bool,
+    pub has_db_storage: bool,
+    pub refreshed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginStatusKind {
+    LoggedIn,
+    WaitingForLogin,
+    WaitingForKey,
+    KeyUnavailable,
+}
+
 impl WechatState {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
@@ -72,6 +97,62 @@ impl WechatState {
 
     pub fn has_key(&self) -> bool {
         self.key_file.exists()
+    }
+
+    pub fn login_status(&self, refresh_key: bool) -> LoginStatus {
+        let key = self.read_key().ok();
+        let material = if refresh_key {
+            self.ensure_db_material()
+        } else {
+            self.db_material()
+        };
+        match material {
+            Ok((db_dir, keys)) => {
+                let has_db_storage = db_dir.is_dir();
+                let can_read_messages = has_db_storage && !keys.is_empty();
+                LoginStatus {
+                    status: if can_read_messages {
+                        LoginStatusKind::LoggedIn
+                    } else {
+                        LoginStatusKind::KeyUnavailable
+                    },
+                    can_read_messages,
+                    has_key: true,
+                    has_db_storage,
+                    refreshed: refresh_key,
+                    key_source: key.as_ref().and_then(|key| key.source.clone()),
+                    key_updated_at: key.as_ref().map(|key| key.updated_at),
+                    detail: if has_db_storage {
+                        None
+                    } else {
+                        Some("wechat db_storage directory is missing".to_string())
+                    },
+                }
+            }
+            Err(err) => {
+                let detected_db = key
+                    .as_ref()
+                    .and_then(|key| key.db_dir.as_ref().map(PathBuf::from))
+                    .or_else(wechat_db::detect_db_storage);
+                let has_db_storage = detected_db.as_ref().is_some_and(|path| path.is_dir());
+                LoginStatus {
+                    status: if self.has_key() {
+                        LoginStatusKind::KeyUnavailable
+                    } else if has_db_storage {
+                        LoginStatusKind::WaitingForKey
+                    } else {
+                        LoginStatusKind::WaitingForLogin
+                    },
+                    can_read_messages: false,
+                    has_key: self.has_key(),
+                    has_db_storage,
+                    refreshed: refresh_key,
+                    key_source: key.as_ref().and_then(|key| key.source.clone()),
+                    key_updated_at: key.as_ref().map(|key| key.updated_at),
+                    detail: refresh_key.then(|| err.to_string()),
+                }
+            }
+        }
     }
 
     pub fn poll_messages_after_id(&self, after_id: i64, limit: usize) -> Result<PollResult> {
@@ -277,6 +358,8 @@ fn stable_sequence(message: &Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
     #[test]
     fn message_update_id_keeps_timestamp_prefix() {
@@ -288,5 +371,59 @@ mod tests {
 
         assert_eq!(message_update_id(&message) / UPDATE_ID_SCALE, 1781703356);
         assert_eq!(message_update_id(&message) % UPDATE_ID_SCALE, 42);
+    }
+
+    #[test]
+    fn login_status_waits_for_login_without_key_or_db() {
+        let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
+        let state = WechatState::new(state_dir.clone());
+
+        let status = state.login_status(false);
+
+        fs::remove_dir_all(state_dir).ok();
+        assert_eq!(status.status, LoginStatusKind::WaitingForLogin);
+        assert!(!status.can_read_messages);
+        assert!(!status.has_key);
+        assert!(!status.has_db_storage);
+        assert!(!status.refreshed);
+        assert!(status.detail.is_none());
+    }
+
+    #[test]
+    fn login_status_reports_logged_in_from_existing_key_material() {
+        let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
+        let db_dir = state_dir.join("db_storage");
+        fs::create_dir_all(&db_dir).unwrap();
+        let state = WechatState::new(state_dir.clone());
+        state.ensure_state_dir().unwrap();
+        let mut keys = HashMap::new();
+        keys.insert("message/msg_0.db".to_string(), "00".repeat(32));
+        fs::write(
+            state_dir.join("wechat.key"),
+            serde_json::to_vec(&KeyFile {
+                version: 1,
+                wxid: "wxid_test".to_string(),
+                key: "webox-weagent".to_string(),
+                source: Some("test".to_string()),
+                keys_file: None,
+                db_dir: Some(db_dir.to_string_lossy().into_owned()),
+                keys: Some(keys),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let status = state.login_status(false);
+
+        fs::remove_dir_all(state_dir).ok();
+        assert_eq!(status.status, LoginStatusKind::LoggedIn);
+        assert!(status.can_read_messages);
+        assert!(status.has_key);
+        assert!(status.has_db_storage);
+        assert_eq!(status.key_source.as_deref(), Some("test"));
+        assert_eq!(status.key_updated_at, Some(2));
+        assert!(status.detail.is_none());
     }
 }

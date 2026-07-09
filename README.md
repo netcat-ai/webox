@@ -40,34 +40,61 @@ APT_DEBIAN_SECURITY_MIRROR=
 ## 目标接口
 
 - `GET /healthz`
-- `POST /ilink/sendmessage`
-- `POST /ilink/getupdates`
-- `POST /ilink/ack`
-- `GET /ilink/login/qrcode/latest`
-- `GET /ilink/login/qrcode/events`
+- `GET|POST /ilink/bot/get_bot_qrcode?bot_type=3`
+- `GET /ilink/bot/get_qrcode_status?qrcode=...`
+- `POST /ilink/bot/getupdates`
+- `POST /ilink/bot/sendmessage`
 
-`/ilink/getupdates` 使用 `after_id` + `limit`，响应只返回 `updates`。每个收到的微信消息会被投影为
-`message.received` update，payload 中包含 `room`、`message` 和可直接用于回复的 `context_token`。
-`/ilink/sendmessage` 支持 `context_token`，也支持显式传 `room.outbound_target` 或 `room.external_room_id`。
-发送请求通过 UI 自动化同步执行，响应返回 iLink `task` 视图；成功时 `task_type=send_message`、
-`status=acked`。登录二维码通过 iLink login 相关接口暴露。
+根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`。
+这是为了兼容把 `baseurl` 设为 `http://host/ilink/bot` 后再拼相对路径的 iLink 客户端。
 
-`/ilink/login/qrcode/latest` 返回最新捕获的登录二维码投影：
+`/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码：
 
 ```json
 {
-  "found": true,
-  "qrcode": {
-    "type": "wechat.login_qrcode",
-    "status": "captured",
-    "login_url": "https://login.weixin.qq.com/...",
-    "image_data_uri": "data:image/png;base64,..."
-  },
-  "event": {}
+  "qrcode": "access-log-...",
+  "qrcode_img_content": "data:image/png;base64,..."
 }
 ```
 
-其中 `qrcode` 是给第三方 agent 消费的稳定字段，`event` 是 agentgateway 原始捕获事件，仅用于诊断。
+`/ilink/bot/get_qrcode_status` 轮询本地 WeChat 登录状态。扫码后会主动尝试提取 DB key；能读取消息时返回
+`confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`：
+
+```json
+{
+  "status": "confirmed",
+  "bot_token": "webox",
+  "ilink_bot_id": "default",
+  "ilink_user_id": "default",
+  "baseurl": "http://127.0.0.1:38080/ilink/bot"
+}
+```
+
+`/ilink/bot/getupdates` 使用标准 `get_updates_buf` 不透明游标：
+
+```json
+{
+  "get_updates_buf": "",
+  "base_info": { "channel_version": "2.0.0" }
+}
+```
+
+响应包含 `ret`、`msgs` 和新的 `get_updates_buf`。每条消息包含 `context_token`，回复时必须原样放进
+`/ilink/bot/sendmessage` 的 `msg.context_token`。
+
+```json
+{
+  "msg": {
+    "to_user_id": "wxid_xxx",
+    "context_token": "...",
+    "text": "hello"
+  },
+  "base_info": { "channel_version": "2.0.0" }
+}
+```
+
+`WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。如果不设置，默认从请求 `Host` 派生
+`http://host/ilink/bot`。
 
 ## 核心边界
 

@@ -10,8 +10,6 @@ pub enum ApiError {
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
-    Upstream(String),
-    #[error("{0}")]
     Internal(String),
 }
 
@@ -26,7 +24,6 @@ impl IntoResponse for ApiError {
         let (status, code) = match &self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             ApiError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            ApiError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         (

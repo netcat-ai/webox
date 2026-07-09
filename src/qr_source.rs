@@ -109,12 +109,6 @@ impl QrSource {
         Ok(self.search_newest(1).await?.into_iter().next())
     }
 
-    pub async fn recent(&self, limit: usize) -> Result<Vec<QrEvent>> {
-        let mut events = self.search_newest(limit).await?;
-        events.reverse();
-        Ok(events)
-    }
-
     async fn search_newest(&self, limit: usize) -> Result<Vec<QrEvent>> {
         let wanted = limit.clamp(1, 100);
         let mut out = self.search_access_log_newest(wanted)?;

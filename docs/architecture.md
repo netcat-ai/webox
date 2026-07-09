@@ -16,7 +16,7 @@
    它不是业务消息通道，也不参与收发消息语义。
 
 4. `weagent` 不维护独立消息事实库。
-   消息事实源是 WeChat DB；二维码事实源是 agentgateway 日志 API；发送任务初版只需要进程内串行执行。
+   消息事实源是 WeChat DB；二维码事实源是 agentgateway JSON access log；发送任务初版只需要进程内串行执行。
 
 5. 参考项目只提供证据，不决定架构。
    `woc-agent-rs` 参考 WeChat DB 与 UI 自动化能力；`tinyclaw/msghub` 只参考 iLink 交互形状；`aicat` 不进入核心设计。
@@ -83,7 +83,8 @@ WeChat login request/response
 - `weagent` 默认读取 agentgateway JSON access log，不直接读取 agentgateway SQLite。
 - `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.3.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
 - 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
-- iLink login 接口主响应是 `qrcode` 投影；`event` 保留 agentgateway 原始捕获字段，仅用于诊断。
+- `GET|POST /ilink/bot/get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
+- `GET /ilink/bot/get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。
 - `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
 
 ### 收消息
@@ -91,36 +92,36 @@ WeChat login request/response
 ```text
 WeChat local DB
   -> wechat_db scanner decrypts and polls new rows
-  -> normalize to iLink message.received updates
+  -> normalize to iLink msgs
   -> client pulls through iLink getupdates
 ```
 
 游标原则：
 
-- 对外只接受 iLink `after_id`，不暴露内部 cursor。
-- `update.id` 使用 WeChat 消息时间戳和消息 id 派生的稳定整数，保证第三方 agent 可以按 `after_id` 继续拉取。
-- payload 包含 `room`、`message` 和无状态 `context_token`，agent 回复时可以直接把 `context_token` 传给 `/ilink/sendmessage`。
+- 对外只接受 iLink `get_updates_buf`，不暴露内部 DB cursor。
+- `get_updates_buf` 是不透明游标，内部只编码最后投递的稳定 update id。
+- 每条 `msg` 包含无状态 `context_token`，agent 回复时必须原样传给 `/ilink/bot/sendmessage`。
 - 服务端不维护独立 ack 状态。
-- 如果标准 iLink 明确要求服务端 ack 状态，再增加最小状态；不能预先引入 msghub-style mailbox。
+- 如果标准 iLink 明确要求持久上下文状态，再增加最小状态；不能预先引入 msghub-style mailbox。
 
 ### 发消息
 
 ```text
 iLink sendmessage
-  -> validate target and payload
+  -> validate msg.context_token/msg.to_user_id and payload
   -> execute in-process serial send job
   -> ui_sender activates WeChat window
   -> search/open conversation
   -> paste content
   -> click/send
-  -> return iLink task view with status=acked
+  -> return iLink ret=0
 ```
 
 初版发送策略：
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
-- 优先使用 `context_token` 中的 room target；没有 token 时接受显式 `room.outbound_target` 或 `room.external_room_id`。
-- 不暴露 UI sender receipt；同步执行结果投影成 `send_message` task。
+- 优先使用 `msg.context_token` 中的 room target；没有 token 时接受显式 `msg.to_user_id`。
+- 不暴露 UI sender receipt；同步执行成功返回 `ret=0`。
 - 文本优先；图片和文件在文本链路跑通后接入。
 - 群聊目标必须使用可唯一定位的备注或会话名，否则拒绝发送。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
@@ -140,7 +141,7 @@ weagent
 
 1. 移植 `woc-agent-rs` 的 WeChat DB 解密和 UI 发送能力到 `weagent`。
 2. 用 Rust 实现 iLink HTTP 外壳，只暴露标准 iLink 和健康检查。
-3. 把 WeChat DB scanner 的消息投影成 iLink updates。
+3. 把 WeChat DB scanner 的消息投影成 iLink `msgs`。
 4. 把 iLink send 请求接到 UI sender。
 5. 接入 agentgateway capture 查询登录二维码。
 6. 整理 Dockerfile 和 entrypoint，保证内置 WeChat、权限、Display、代理和 CA 顺序正确。
@@ -148,6 +149,6 @@ weagent
 ## 当前硬缺口
 
 - 真实第三方 iLink 客户端兼容性验证。
-- 如果第三方客户端要求服务端持久 ack 状态，需要补最小 ack 状态；当前只支持 `after_id` 拉取和无状态 ack 回显。
+- 如果第三方客户端要求服务端持久上下文状态，需要补最小状态；当前只支持 `get_updates_buf` 拉取。
 - Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
-- 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `after_id` 投影是否覆盖同秒多消息边界。
+- 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `get_updates_buf` 投影是否覆盖同秒多消息边界。

@@ -1,121 +1,75 @@
 use crate::error::ApiError;
-use crate::qr_source::QrSource;
+use crate::qr_source::{LoginQrCode, QrSource};
 use crate::ui_sender::UiSender;
-use crate::wechat_state::{message_update_id, WechatState};
+use crate::wechat_state::{message_update_id, LoginStatusKind, WechatState};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::SystemTime;
 
-const TASK_TYPE_SEND_MESSAGE: &str = "send_message";
-const TASK_STATUS_ACKED: &str = "acked";
-const TASK_STATUS_FAILED: &str = "failed";
-const PROVIDER_ACTOR_ID_SEED: &str = "webox:provider:wechat";
+const ILINK_BASE_PATH: &str = "/ilink/bot";
+const TEXT_ITEM_TYPE: i64 = 1;
 
 #[derive(Clone)]
 pub struct AppState {
     pub api_token: String,
     pub tenant_id: String,
     pub provider_account_id: String,
+    pub public_base_url: Option<String>,
     pub wechat: WechatState,
     pub sender: Arc<tokio::sync::Mutex<UiSender>>,
     pub qr_source: QrSource,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SendMessageRequest {
+pub struct BotQrcodeQuery {
     #[serde(default)]
-    pub context_token: Option<String>,
-    #[serde(default)]
-    pub room: RoomInput,
-    #[serde(default)]
-    pub external_message_id: Option<String>,
-    #[serde(default)]
-    pub sender_id: Option<String>,
-    #[serde(default)]
-    pub sender_name: Option<String>,
-    #[serde(default)]
-    pub message_time: Option<String>,
-    #[serde(default)]
-    pub message_type: Option<String>,
-    #[serde(default)]
-    pub body: Value,
+    pub bot_type: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct RoomInput {
+#[derive(Debug, Deserialize)]
+pub struct QrcodeStatusQuery {
+    pub qrcode: String,
     #[serde(default)]
-    pub external_room_id: Option<String>,
-    #[serde(default)]
-    pub outbound_target: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SendMessageResponse {
-    pub accepted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duplicate: Option<bool>,
-    pub task: ActorTaskView,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ActorTaskView {
-    pub id: i64,
-    pub room_id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requester_actor_id: Option<i64>,
-    pub assignee_actor_id: i64,
-    pub task_type: String,
-    pub payload: Value,
-    pub status: String,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acked_at: Option<String>,
+    pub verify_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GetUpdatesRequest {
     #[serde(default)]
-    pub after_id: Option<i64>,
+    pub get_updates_buf: Option<String>,
     #[serde(default)]
-    pub limit: Option<usize>,
+    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AckRequest {
+pub struct SendMessageRequest {
+    pub msg: OutboundMessage,
     #[serde(default)]
-    pub update_ids: Vec<i64>,
-    #[serde(default)]
-    pub task_results: Vec<TaskResultInput>,
+    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TaskResultInput {
-    pub task_id: i64,
-    pub status: String,
+pub struct OutboundMessage {
     #[serde(default)]
-    pub error: Option<String>,
+    pub to_user_id: Option<String>,
+    #[serde(default)]
+    pub context_token: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub item_list: Vec<Value>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AckTaskView {
-    pub id: i64,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LimitQuery {
-    #[serde(default)]
-    pub limit: Option<usize>,
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdatesCursor {
+    v: u8,
+    last_update_id: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,38 +91,55 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-pub async fn send_message(
+pub async fn get_bot_qrcode(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BotQrcodeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _bot_type = query.bot_type.as_deref().unwrap_or("3");
+    let event = match state.qr_source.latest().await {
+        Ok(event) => event,
+        Err(err) => {
+            tracing::warn!(error = %err, "qrcode capture source unavailable");
+            None
+        }
+    };
+    let qrcode = event.map(|event| event.to_login_qrcode());
+    Ok(Json(json!({
+        "qrcode": qrcode.as_ref().map(|value| value.id.as_str()).unwrap_or_default(),
+        "qrcode_img_content": qrcode.as_ref().and_then(qrcode_content).unwrap_or_default(),
+    })))
+}
+
+pub async fn get_qrcode_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<SendMessageRequest>,
+    Query(query): Query<QrcodeStatusQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authenticate(&state, &headers)?;
-    let message_type = request.message_type.as_deref().unwrap_or("text");
-    if message_type != "text" {
-        return Err(ApiError::bad_request(
-            "only text messages are supported initially",
-        ));
+    if query.qrcode.trim().is_empty() {
+        return Err(ApiError::bad_request("qrcode is required"));
     }
-    let target = send_target(&request)?.ok_or_else(|| {
-        ApiError::bad_request(
-            "context_token, room.outbound_target, or room.external_room_id is required",
-        )
-    })?;
-    let text = text_body(&request.body)
-        .ok_or_else(|| ApiError::bad_request("body.text or string body is required"))?;
-    let receipt = state
-        .sender
-        .lock()
-        .await
-        .send_text(target, text)
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let task = send_task_view(&state, &request, &receipt);
-    Ok(Json(SendMessageResponse {
-        accepted: true,
-        duplicate: None,
-        task,
-    }))
+    let _verify_code = query.verify_code.as_deref();
+    let login = state.wechat.login_status(true);
+    let mut response = serde_json::Map::new();
+    let status = match login.status {
+        LoginStatusKind::LoggedIn => "confirmed",
+        LoginStatusKind::WaitingForKey | LoginStatusKind::KeyUnavailable => "scaned",
+        LoginStatusKind::WaitingForLogin => "wait",
+    };
+    response.insert("status".to_string(), json!(status));
+    if status == "confirmed" {
+        response.insert("bot_token".to_string(), json!(state.api_token));
+        response.insert("ilink_bot_id".to_string(), json!(state.provider_account_id));
+        response.insert(
+            "ilink_user_id".to_string(),
+            json!(state.provider_account_id),
+        );
+        response.insert(
+            "baseurl".to_string(),
+            json!(ilink_base_url(&state, &headers)),
+        );
+    }
+    Ok(Json(Value::Object(response)))
 }
 
 pub async fn get_updates(
@@ -177,109 +148,59 @@ pub async fn get_updates(
     Json(request): Json<GetUpdatesRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
-    let result = state
-        .wechat
-        .poll_messages_after_id(request.after_id.unwrap_or(0), request.limit.unwrap_or(100))
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let updates = result
+    let _base_info = request.base_info.as_ref();
+    let after_id = decode_updates_buf(request.get_updates_buf.as_deref())?;
+    let result = match state.wechat.poll_messages_after_id(after_id, 100) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(Json(json!({
+                "ret": -14,
+                "errcode": -14,
+                "errmsg": err.to_string(),
+                "msgs": [],
+                "get_updates_buf": request.get_updates_buf.unwrap_or_default(),
+            })));
+        }
+    };
+    let mut last_update_id = after_id;
+    let msgs = result
         .messages
         .iter()
         .map(|message| {
-            let room = room_view(&state, message);
-            let body = message_body(message);
-            let id = message_update_id(message);
-            let created_at = message_time(message);
-            json!({
-                "id": id,
-                "event_type": "message.received",
-                "resource_type": "message",
-                "resource_id": id,
-                "payload": {
-                    "context_token": context_token_for_room(&room),
-                    "room": room,
-                    "message": {
-                        "id": id,
-                        "room_id": room["id"],
-                        "source_actor_id": provider_actor_id(&state),
-                        "external_message_id": external_message_id(message),
-                        "sender_id": sender_id(message),
-                        "sender_name": sender_name(message),
-                        "message_time": created_at,
-                        "message_type": message_type(message),
-                        "body": body,
-                        "created_at": created_at,
-                    },
-                },
-                "created_at": created_at,
-            })
+            let update_id = message_update_id(message);
+            last_update_id = last_update_id.max(update_id);
+            standard_message_view(&state, message)
         })
         .collect::<Vec<_>>();
-    Ok(Json(json!({ "updates": updates })))
-}
-
-pub async fn ack(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(request): Json<AckRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    authenticate(&state, &headers)?;
-    let tasks = request
-        .task_results
-        .into_iter()
-        .map(|task| {
-            let status = task.status.trim().to_string();
-            if status != TASK_STATUS_ACKED && status != TASK_STATUS_FAILED {
-                return Err(ApiError::bad_request(format!(
-                    "unsupported task status {status:?}"
-                )));
-            }
-            Ok(AckTaskView {
-                id: task.task_id,
-                status,
-                error: task.error,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(json!({
-        "acked_update_ids": request.update_ids,
-        "tasks": tasks,
+        "ret": 0,
+        "msgs": msgs,
+        "get_updates_buf": encode_updates_buf(last_update_id),
     })))
 }
 
-pub async fn latest_qrcode(
+pub async fn send_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Json(request): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
-    let event = state
-        .qr_source
-        .latest()
+    let _base_info = request.base_info.as_ref();
+    let target = outbound_target(&request.msg)?
+        .ok_or_else(|| ApiError::bad_request("msg.context_token or msg.to_user_id is required"))?;
+    let text = outbound_text(&request.msg)
+        .ok_or_else(|| ApiError::bad_request("msg.text or text item is required"))?;
+    let receipt = state
+        .sender
+        .lock()
         .await
-        .map_err(|err| ApiError::Upstream(err.to_string()))?;
-    let qrcode = event.as_ref().map(|event| event.to_login_qrcode());
+        .send_text(target, text)
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(Json(json!({
-        "found": qrcode.is_some(),
-        "qrcode": qrcode,
-        "event": event,
+        "ret": 0,
+        "client_msg_id": receipt.client_msg_id,
     })))
-}
-
-pub async fn qrcode_events(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<LimitQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    authenticate(&state, &headers)?;
-    let events = state
-        .qr_source
-        .recent(query.limit.unwrap_or(50))
-        .await
-        .map_err(|err| ApiError::Upstream(err.to_string()))?;
-    let qrcodes = events
-        .iter()
-        .map(|event| event.to_login_qrcode())
-        .collect::<Vec<_>>();
-    Ok(Json(json!({ "qrcodes": qrcodes, "events": events })))
 }
 
 pub async fn not_found() -> impl IntoResponse {
@@ -303,88 +224,116 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     ))
 }
 
-fn text_body(body: &Value) -> Option<String> {
-    match body {
-        Value::String(value) => non_empty(value),
-        Value::Object(map) => map
-            .get("text")
-            .and_then(Value::as_str)
-            .and_then(non_empty)
-            .or_else(|| {
-                map.get("content")
-                    .and_then(Value::as_str)
-                    .and_then(non_empty)
-            }),
-        _ => None,
-    }
-}
-
-fn send_target(request: &SendMessageRequest) -> Result<Option<String>, ApiError> {
-    if let Some(target) = request
-        .room
-        .outbound_target
+fn qrcode_content(qrcode: &LoginQrCode) -> Option<String> {
+    qrcode
+        .image_data_uri
         .as_ref()
-        .or(request.room.external_room_id.as_ref())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(Some(target));
+        .or(qrcode.login_url.as_ref())
+        .or(Some(&qrcode.source_url))
+        .and_then(|value| non_empty(value))
+}
+
+fn ilink_base_url(state: &AppState, headers: &HeaderMap) -> String {
+    if let Some(value) = state.public_base_url.as_deref().and_then(non_empty) {
+        return value.trim_end_matches('/').to_string();
     }
-    let Some(token) = request.context_token.as_deref() else {
-        return Ok(None);
+    let proto = header_string(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
+    let host = header_string(headers, "x-forwarded-host")
+        .or_else(|| header_string(headers, "host"))
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    format!("{}://{}{}", proto, host, ILINK_BASE_PATH)
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(non_empty)
+}
+
+fn decode_updates_buf(raw: Option<&str>) -> Result<i64, ApiError> {
+    let Some(raw) = raw.and_then(non_empty) else {
+        return Ok(0);
     };
-    let context = decode_context_token(token)
-        .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
-    Ok(non_empty(&context.outbound_target).or_else(|| non_empty(&context.external_room_id)))
-}
-
-fn send_task_view(
-    state: &AppState,
-    request: &SendMessageRequest,
-    receipt: &crate::ui_sender::SendReceipt,
-) -> ActorTaskView {
-    let room = room_view_from_target(
-        state,
-        &receipt.target.id,
-        Some(&receipt.target.query),
-        receipt.target.is_group,
-    );
-    let now = now_rfc3339();
-    ActorTaskView {
-        id: stable_positive_id(&receipt.client_msg_id),
-        room_id: room["id"].as_i64().unwrap_or_default(),
-        requester_actor_id: None,
-        assignee_actor_id: provider_actor_id(state),
-        task_type: TASK_TYPE_SEND_MESSAGE.to_string(),
-        payload: send_task_payload(request),
-        status: TASK_STATUS_ACKED.to_string(),
-        created_at: now.clone(),
-        acked_at: Some(now),
+    if let Ok(value) = raw.parse::<i64>() {
+        return Ok(value.max(0));
     }
-}
-
-fn send_task_payload(request: &SendMessageRequest) -> Value {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "message_type".to_string(),
-        json!(request.message_type.as_deref().unwrap_or("text")),
-    );
-    payload.insert("body".to_string(), request.body.clone());
-    insert_optional(
-        &mut payload,
-        "external_message_id",
-        &request.external_message_id,
-    );
-    insert_optional(&mut payload, "sender_id", &request.sender_id);
-    insert_optional(&mut payload, "sender_name", &request.sender_name);
-    insert_optional(&mut payload, "message_time", &request.message_time);
-    Value::Object(payload)
-}
-
-fn insert_optional(map: &mut serde_json::Map<String, Value>, key: &str, value: &Option<String>) {
-    if let Some(value) = value.as_deref().and_then(non_empty) {
-        map.insert(key.to_string(), json!(value));
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|err| ApiError::bad_request(format!("invalid get_updates_buf: {err}")))?;
+    let cursor: UpdatesCursor = serde_json::from_slice(&bytes)
+        .map_err(|err| ApiError::bad_request(format!("invalid get_updates_buf: {err}")))?;
+    if cursor.v != 1 {
+        return Err(ApiError::bad_request("unsupported get_updates_buf version"));
     }
+    Ok(cursor.last_update_id.max(0))
+}
+
+fn encode_updates_buf(last_update_id: i64) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&UpdatesCursor {
+            v: 1,
+            last_update_id,
+        })
+        .expect("updates cursor serializes"),
+    )
+}
+
+fn standard_message_view(state: &AppState, message: &Value) -> Value {
+    let room = room_view(state, message);
+    let body = message_body(message);
+    let text = text_body(&body).unwrap_or_else(|| body.to_string());
+    let created_time_ms = message_time_millis(message);
+    let external_id = external_message_id(message);
+    json!({
+        "msgid": external_id,
+        "client_id": external_id,
+        "from_user_id": sender_id(message),
+        "to_user_id": state.provider_account_id,
+        "ilink_user_id": sender_id(message),
+        "create_time": created_time_ms / 1000,
+        "create_time_ms": created_time_ms,
+        "message_type": 1,
+        "message_state": 2,
+        "context_token": context_token_for_room(&room),
+        "text": text,
+        "item_list": [{
+            "type": TEXT_ITEM_TYPE,
+            "text_item": { "text": text },
+        }],
+        "wechat_msgtype": message_type(message),
+    })
+}
+
+fn outbound_target(message: &OutboundMessage) -> Result<Option<String>, ApiError> {
+    if let Some(token) = message.context_token.as_deref().and_then(non_empty) {
+        let context = decode_context_token(&token)
+            .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
+        return Ok(
+            non_empty(&context.outbound_target).or_else(|| non_empty(&context.external_room_id))
+        );
+    }
+    Ok(message.to_user_id.as_deref().and_then(non_empty))
+}
+
+fn outbound_text(message: &OutboundMessage) -> Option<String> {
+    message.text.as_deref().and_then(non_empty).or_else(|| {
+        message
+            .item_list
+            .iter()
+            .find_map(|item| item_text(item).and_then(|value| non_empty(&value)))
+    })
+}
+
+fn item_text(item: &Value) -> Option<String> {
+    item.get("text")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("text_item")
+                .and_then(|value| value.get("text"))
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string)
 }
 
 fn room_view(state: &AppState, message: &Value) -> Value {
@@ -460,6 +409,22 @@ fn message_body(message: &Value) -> Value {
         .unwrap_or_else(|| json!({ "raw": message }))
 }
 
+fn text_body(body: &Value) -> Option<String> {
+    match body {
+        Value::String(value) => non_empty(value),
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(non_empty)
+            .or_else(|| {
+                map.get("content")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty)
+            }),
+        _ => None,
+    }
+}
+
 fn message_type(message: &Value) -> String {
     message
         .get("msgtype")
@@ -468,37 +433,24 @@ fn message_type(message: &Value) -> String {
         .to_string()
 }
 
-fn message_time(message: &Value) -> String {
-    let millis = message
+fn message_time_millis(message: &Value) -> i64 {
+    message
         .get("msgtime")
         .and_then(Value::as_i64)
-        .unwrap_or_default();
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-        .to_rfc3339()
+        .unwrap_or_default()
 }
 
 fn external_message_id(message: &Value) -> String {
-    value_str(message, "msgid").to_string()
+    let value = value_str(message, "msgid");
+    if value.is_empty() {
+        message_update_id(message).to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn sender_id(message: &Value) -> String {
     value_str(message, "from").to_string()
-}
-
-fn sender_name(message: &Value) -> String {
-    sender_id(message)
-}
-
-fn provider_actor_id(state: &AppState) -> i64 {
-    stable_positive_id(&format!(
-        "{PROVIDER_ACTOR_ID_SEED}:{}",
-        state.provider_account_id
-    ))
-}
-
-fn now_rfc3339() -> String {
-    DateTime::<Utc>::from(SystemTime::now()).to_rfc3339()
 }
 
 fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -522,17 +474,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_text_body() {
-        assert_eq!(text_body(&json!("hello")).as_deref(), Some("hello"));
-        assert_eq!(
-            text_body(&json!({ "text": "hello" })).as_deref(),
-            Some("hello")
-        );
-        assert_eq!(
-            text_body(&json!({ "content": "hello" })).as_deref(),
-            Some("hello")
-        );
-        assert_eq!(text_body(&json!({ "text": "" })), None);
+    fn updates_cursor_round_trips() {
+        let encoded = encode_updates_buf(42);
+
+        assert_eq!(decode_updates_buf(Some(&encoded)).unwrap(), 42);
+        assert_eq!(decode_updates_buf(Some("")).unwrap(), 0);
+    }
+
+    #[test]
+    fn outbound_text_accepts_standard_text_item() {
+        let message = OutboundMessage {
+            to_user_id: Some("alice".to_string()),
+            context_token: None,
+            text: None,
+            item_list: vec![json!({ "type": 1, "text_item": { "text": "hello" } })],
+        };
+
+        assert_eq!(outbound_text(&message).as_deref(), Some("hello"));
     }
 
     #[test]
@@ -547,22 +505,19 @@ mod tests {
             "outbound_target": "alice",
         });
         let token = context_token_for_room(&room);
-        let request = SendMessageRequest {
+        let message = OutboundMessage {
+            to_user_id: None,
             context_token: Some(token),
-            room: RoomInput::default(),
-            external_message_id: None,
-            sender_id: None,
-            sender_name: None,
-            message_time: None,
-            message_type: Some("text".to_string()),
-            body: json!({ "text": "hello" }),
+            text: Some("hello".to_string()),
+            item_list: Vec::new(),
         };
 
-        assert_eq!(send_target(&request).unwrap().as_deref(), Some("alice"));
+        assert_eq!(outbound_target(&message).unwrap().as_deref(), Some("alice"));
     }
 
     #[test]
-    fn maps_wechat_message_to_ilink_body() {
+    fn maps_wechat_message_to_standard_ilink_message() {
+        let state = test_state();
         let message = json!({
             "msgid": "m1",
             "from": "wxid_a",
@@ -572,47 +527,15 @@ mod tests {
             "text": { "content": "hello" },
         });
 
-        assert_eq!(message_body(&message), json!({ "text": "hello" }));
-        assert_eq!(message_time(&message), "2026-06-17T13:35:56+00:00");
-    }
+        let view = standard_message_view(&state, &message);
 
-    #[test]
-    fn send_task_view_uses_ilink_task_shape() {
-        let state = test_state();
-        let request = SendMessageRequest {
-            context_token: None,
-            room: RoomInput {
-                external_room_id: Some("alice".to_string()),
-                outbound_target: None,
-            },
-            external_message_id: None,
-            sender_id: None,
-            sender_name: None,
-            message_time: None,
-            message_type: Some("text".to_string()),
-            body: json!({ "text": "hello" }),
-        };
-        let receipt = crate::ui_sender::SendReceipt {
-            accepted: true,
-            client_msg_id: "client-1".to_string(),
-            target: crate::ui_sender::SendTargetView {
-                id: "alice".to_string(),
-                query: "Alice".to_string(),
-                is_group: false,
-            },
-        };
-
-        let task = send_task_view(&state, &request, &receipt);
-
-        assert_eq!(task.id, stable_positive_id("client-1"));
-        assert_eq!(task.room_id, stable_positive_id("alice"));
-        assert_eq!(task.task_type, "send_message");
-        assert_eq!(task.status, "acked");
-        assert_eq!(
-            task.payload,
-            json!({ "message_type": "text", "body": { "text": "hello" } })
-        );
-        assert!(task.acked_at.is_some());
+        assert_eq!(view["client_id"], "m1");
+        assert_eq!(view["from_user_id"], "wxid_a");
+        assert_eq!(view["to_user_id"], "wx");
+        assert_eq!(view["create_time_ms"], 1781703356000_i64);
+        assert_eq!(view["create_time"], 1781703356_i64);
+        assert_eq!(view["text"], "hello");
+        assert_eq!(view["item_list"][0]["text_item"]["text"], "hello");
     }
 
     fn test_state() -> AppState {
@@ -621,6 +544,7 @@ mod tests {
             api_token: "token".to_string(),
             tenant_id: "default".to_string(),
             provider_account_id: "wx".to_string(),
+            public_base_url: Some("http://127.0.0.1:8080/ilink/bot".to_string()),
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
             wechat,

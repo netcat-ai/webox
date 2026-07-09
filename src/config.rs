@@ -7,6 +7,7 @@ pub struct Config {
     pub api_token: String,
     pub tenant_id: String,
     pub provider_account_id: String,
+    pub public_base_url: Option<String>,
     pub agentgateway_api_base: String,
     pub agentgateway_log_path: Option<PathBuf>,
     pub qr_match_terms: Vec<String>,
@@ -20,6 +21,10 @@ impl Config {
             api_token: env_or("WEBOX_API_TOKEN", "webox"),
             tenant_id: env_or("WEBOX_TENANT_ID", "default"),
             provider_account_id: env_or("WEBOX_PROVIDER_ACCOUNT_ID", "default"),
+            public_base_url: optional_string(
+                &env::var("WEBOX_PUBLIC_BASE_URL").unwrap_or_default(),
+            )
+            .map(|value| value.trim_end_matches('/').to_string()),
             agentgateway_api_base: trim_base_url(&env_or(
                 "WEBOX_AGENTGATEWAY_API_BASE",
                 "http://127.0.0.1:15000",
@@ -61,6 +66,11 @@ fn trim_base_url(raw: &str) -> String {
 fn optional_path(raw: &str) -> Option<PathBuf> {
     let value = raw.trim();
     (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+fn optional_string(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn parse_terms(raw: &str) -> Vec<String> {

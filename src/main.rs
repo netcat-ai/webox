@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         api_token: config.api_token.clone(),
         tenant_id: config.tenant_id.clone(),
         provider_account_id: config.provider_account_id.clone(),
+        public_base_url: config.public_base_url.clone(),
         sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
         qr_source: QrSource::new(
             config.agentgateway_api_base.clone(),
@@ -65,11 +66,23 @@ async fn main() -> anyhow::Result<()> {
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(ilink::health))
-        .route("/ilink/sendmessage", post(ilink::send_message))
-        .route("/ilink/getupdates", post(ilink::get_updates))
-        .route("/ilink/ack", post(ilink::ack))
-        .route("/ilink/login/qrcode/latest", get(ilink::latest_qrcode))
-        .route("/ilink/login/qrcode/events", get(ilink::qrcode_events))
+        .route(
+            "/get_bot_qrcode",
+            get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
+        )
+        .route("/get_qrcode_status", get(ilink::get_qrcode_status))
+        .route("/getupdates", post(ilink::get_updates))
+        .route("/sendmessage", post(ilink::send_message))
+        .route(
+            "/ilink/bot/get_bot_qrcode",
+            get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
+        )
+        .route(
+            "/ilink/bot/get_qrcode_status",
+            get(ilink::get_qrcode_status),
+        )
+        .route("/ilink/bot/getupdates", post(ilink::get_updates))
+        .route("/ilink/bot/sendmessage", post(ilink::send_message))
         .fallback(ilink::not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -85,6 +98,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
+    use std::fs;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -114,7 +128,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/login/qrcode/latest")
+                    .uri("/ilink/login/qrcode/latest")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -125,13 +139,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ilink_login_qrcode_route_is_exposed() {
+    async fn standard_login_qrcode_route_is_exposed_without_auth() {
         let app = build_router(test_state());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ilink/login/qrcode/latest")
+                    .uri("/ilink/bot/get_bot_qrcode?bot_type=3")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["qrcode"], "");
+        assert_eq!(body["qrcode_img_content"], "");
+    }
+
+    #[tokio::test]
+    async fn standard_login_status_reports_waiting_state() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ilink/bot/get_qrcode_status?qrcode=qrc_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["status"], "wait");
+        assert!(body.get("bot_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn standard_login_status_confirms_with_key_material() {
+        let state_dir =
+            std::env::temp_dir().join(format!("webox-router-login-{}", uuid::Uuid::new_v4()));
+        let db_dir = state_dir.join("db_storage");
+        fs::create_dir_all(&db_dir).unwrap();
+        fs::write(
+            state_dir.join("wechat.key"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "wxid": "wxid_test",
+                "key": "webox-weagent",
+                "source": "test",
+                "keysFile": null,
+                "dbDir": db_dir.to_string_lossy(),
+                "keys": { "message/msg_0.db": "00".repeat(32) },
+                "createdAt": 1,
+                "updatedAt": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = build_router(test_state_with_dir(
+            state_dir.clone(),
+            Some("https://public.example/ilink/bot".to_string()),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ilink/bot/get_qrcode_status?qrcode=qrc_test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        fs::remove_dir_all(state_dir).ok();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["status"], "confirmed");
+        assert_eq!(body["bot_token"], "token");
+        assert_eq!(body["baseurl"], "https://public.example/ilink/bot");
+    }
+
+    #[tokio::test]
+    async fn standard_getupdates_requires_bearer_token() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getupdates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"get_updates_buf":""}"#))
                     .unwrap(),
             )
             .await
@@ -140,13 +245,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn old_custom_updates_route_is_not_exposed() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/getupdates")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"after_id":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     fn test_state() -> Arc<AppState> {
         let state_dir = std::env::temp_dir().join(format!("webox-router-{}", uuid::Uuid::new_v4()));
+        test_state_with_dir(
+            state_dir,
+            Some("http://127.0.0.1:8080/ilink/bot".to_string()),
+        )
+    }
+
+    fn test_state_with_dir(
+        state_dir: std::path::PathBuf,
+        public_base_url: Option<String>,
+    ) -> Arc<AppState> {
         let wechat = WechatState::new(state_dir);
         Arc::new(AppState {
             api_token: "token".to_string(),
             tenant_id: "default".to_string(),
             provider_account_id: "wx".to_string(),
+            public_base_url,
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
             wechat,
