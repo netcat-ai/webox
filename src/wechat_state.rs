@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_POLL_LIMIT: usize = 500;
+const UPDATE_ID_SCALE: i64 = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct WechatState {
@@ -41,12 +42,6 @@ struct DbCursor {
     v: u8,
     source: String,
     sessions: HashMap<String, i64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacySpoolCursor {
-    v: u8,
-    pos: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,13 +84,39 @@ impl WechatState {
         }
     }
 
-    pub fn poll_messages(&self, cursor: Option<&str>, limit: usize) -> Result<PollResult> {
+    pub fn poll_messages_after_id(&self, after_id: i64, limit: usize) -> Result<PollResult> {
         let (db_dir, keys) = self.ensure_db_material()?;
-        let cursor_state = decode_db_cursor(cursor)?;
         let limit = limit.clamp(1, MAX_POLL_LIMIT);
-        let data =
-            wechat_db::poll_new_messages(db_dir, keys, cursor_state, limit, self.cache_dir())
-                .context("poll wechat local db")?;
+        let cursor_state = if after_id > 0 {
+            let since_ts = update_id_seconds(after_id).saturating_sub(1);
+            Some(
+                wechat_db::current_session_state(db_dir.clone(), keys.clone(), self.cache_dir())?
+                    .into_keys()
+                    .map(|room| (room, since_ts))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let internal_limit = if after_id > 0 {
+            limit.saturating_mul(20).clamp(limit, MAX_POLL_LIMIT)
+        } else {
+            limit
+        };
+        let mut data = wechat_db::poll_new_messages(
+            db_dir,
+            keys,
+            cursor_state,
+            internal_limit,
+            self.cache_dir(),
+        )
+        .context("poll wechat local db")?;
+        if after_id > 0 {
+            data.messages
+                .retain(|message| message_update_id(message) > after_id);
+        }
+        data.messages.sort_by_key(message_update_id);
+        data.messages.truncate(limit);
         let cursor = encode_db_cursor(&data.new_state);
         Ok(PollResult {
             cursor,
@@ -222,26 +243,45 @@ fn encode_db_cursor(sessions: &HashMap<String, i64>) -> String {
     )
 }
 
-fn decode_db_cursor(raw: Option<&str>) -> Result<Option<HashMap<String, i64>>> {
-    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(raw)
-        .context("cursor is not base64url")?;
-    let value: Value = serde_json::from_slice(&bytes).context("cursor is not json")?;
-    match value.get("v").and_then(Value::as_u64) {
-        Some(2) => {
-            let cursor: DbCursor = serde_json::from_value(value).context("cursor is invalid")?;
-            Ok(Some(cursor.sessions))
-        }
-        Some(1) => {
-            let _: LegacySpoolCursor =
-                serde_json::from_value(value).context("legacy cursor is invalid")?;
-            Ok(None)
-        }
-        _ => bail!("cursor version is unsupported"),
+pub fn message_update_id(message: &Value) -> i64 {
+    let ts_ms = message
+        .get("msgtime")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            message
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .map(|ts| ts.saturating_mul(1000))
+        })
+        .unwrap_or_default();
+    let ts = ts_ms.saturating_div(1000).max(0);
+    ts.saturating_mul(UPDATE_ID_SCALE)
+        .saturating_add(stable_sequence(message) % UPDATE_ID_SCALE)
+}
+
+fn update_id_seconds(update_id: i64) -> i64 {
+    update_id.saturating_div(UPDATE_ID_SCALE).max(0)
+}
+
+fn stable_sequence(message: &Value) -> i64 {
+    if let Some(local_id) = message.get("local_id").and_then(Value::as_i64) {
+        return (local_id.unsigned_abs() % UPDATE_ID_SCALE as u64) as i64;
     }
+    let seed = message
+        .get("msgid")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| message.get("server_id").and_then(Value::as_str))
+        .unwrap_or_else(|| {
+            message
+                .get("from")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        });
+    let digest = md5::compute(seed.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest.0[..8]);
+    i64::from_be_bytes(bytes) & i64::MAX
 }
 
 #[cfg(test)]
@@ -249,17 +289,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn db_cursor_round_trips_session_state() {
-        let sessions = HashMap::from([("wxid_test".to_string(), 123_i64)]);
-        let encoded = encode_db_cursor(&sessions);
-        assert_eq!(decode_db_cursor(Some(&encoded)).unwrap().unwrap(), sessions);
-        assert!(decode_db_cursor(None).unwrap().is_none());
-    }
+    fn message_update_id_keeps_timestamp_prefix() {
+        let message = json!({
+            "msgtime": 1781703356000_i64,
+            "local_id": 42,
+            "msgid": "7318462845630259071",
+        });
 
-    #[test]
-    fn legacy_cursor_is_treated_as_empty_db_state() {
-        let encoded = URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&LegacySpoolCursor { v: 1, pos: 42 }).unwrap());
-        assert!(decode_db_cursor(Some(&encoded)).unwrap().is_none());
+        assert_eq!(message_update_id(&message) / UPDATE_ID_SCALE, 1781703356);
+        assert_eq!(message_update_id(&message) % UPDATE_ID_SCALE, 42);
     }
 }

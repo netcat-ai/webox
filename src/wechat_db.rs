@@ -719,11 +719,8 @@ impl DbCache {
     }
 
     fn db_path(&self, rel_key: &str) -> PathBuf {
-        self.db_dir.join(
-            rel_key
-                .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        )
+        self.db_dir
+            .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR))
     }
 
     fn get(&mut self, rel_key: &str) -> Result<Option<PathBuf>> {
@@ -1078,6 +1075,7 @@ fn query_new_table(
         let msgtype = msgtype_for_message(local_type, &content, is_group, quote.is_some());
         let mut msg = json!({
             "msgid": server_id.to_string(),
+            "local_id": local_id,
             "action": "send",
             "from": from,
             "tolist": [],
@@ -1213,7 +1211,7 @@ fn download_binary_media(
 ) -> Result<Option<MediaFile>> {
     let tmp = std::env::temp_dir();
     let id = uuid::Uuid::new_v4();
-    let output_path = tmp.join(format!("woc-media-{id}.bin"));
+    let output_path = tmp.join(format!("webox-media-{id}.bin"));
     let output_path_str = output_path.to_string_lossy().into_owned();
     let max_bytes_arg = max_bytes.to_string();
     let output = Command::new("curl")
@@ -1626,8 +1624,8 @@ fn convert_wxgf_to_jpeg(data: &[u8]) -> Result<Vec<u8>> {
 
     let tmp = std::env::temp_dir();
     let id = uuid::Uuid::new_v4();
-    let input_path = tmp.join(format!("woc-wxgf-{id}.h265"));
-    let output_path = tmp.join(format!("woc-wxgf-{id}.jpg"));
+    let input_path = tmp.join(format!("webox-wxgf-{id}.h265"));
+    let output_path = tmp.join(format!("webox-wxgf-{id}.jpg"));
     fs::write(&input_path, hevc_payload)
         .with_context(|| format!("写入 wxgf 临时输入失败: {}", input_path.display()))?;
 
@@ -1715,7 +1713,7 @@ fn decode_v2_image(file_bytes: &[u8], aes_key: &[u8; 16], xor_key: u8) -> Result
 }
 
 fn aes_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
-    if cipher.is_empty() || cipher.len() % 16 != 0 {
+    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
         bail!("AES 输入长度不是 16 的倍数");
     }
     let aes = Aes128::new(key.into());
@@ -1740,7 +1738,7 @@ fn aes_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn aes128_cbc_decrypt_pkcs7_with_key_iv(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
-    if cipher.is_empty() || cipher.len() % 16 != 0 {
+    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
         bail!("AES-CBC 输入长度不是 16 的倍数");
     }
     Aes128CbcDec::new(key.into(), key.into())
@@ -2278,7 +2276,7 @@ fn sender_label(
             return sender_display(&sender_uname, names, group_nicknames);
         }
         if content.contains(":\n") {
-            let raw = content.splitn(2, ":\n").next().unwrap_or("");
+            let raw = content.split(":\n").next().unwrap_or("");
             return sender_display(raw, names, group_nicknames);
         }
         return String::new();
@@ -2302,7 +2300,7 @@ fn sender_username(
             return sender_uname;
         }
         if content.contains(":\n") {
-            return content.splitn(2, ":\n").next().unwrap_or("").to_string();
+            return content.split(":\n").next().unwrap_or("").to_string();
         }
         return String::new();
     }
@@ -2393,7 +2391,10 @@ fn fmt_content(_local_id: i64, local_type: i64, content: &str, is_group: bool) -
 
 fn strip_group_prefix(content: &str, is_group: bool) -> &str {
     if is_group && content.contains(":\n") {
-        content.splitn(2, ":\n").nth(1).unwrap_or(content)
+        content
+            .split_once(":\n")
+            .map(|(_, value)| value)
+            .unwrap_or(content)
     } else {
         content
     }
@@ -2869,7 +2870,7 @@ fn decrypt_page(enc_key: &[u8; 32], page_data: &[u8], pgno: u32) -> Result<Vec<u
 }
 
 fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         bail!("密文长度不是 AES 块大小的倍数: {}", data.len());
     }
     let mut blocks: Vec<Block> = data.chunks_exact(16).map(Block::clone_from_slice).collect();
@@ -2977,7 +2978,7 @@ mod tests {
 
     #[test]
     fn finds_local_video_by_xml_md5() {
-        let root = std::env::temp_dir().join(format!("woc-video-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("webox-video-test-{}", uuid::Uuid::new_v4()));
         let account_dir = root.join("account");
         let video_dir = account_dir.join("msg").join("video").join("2026-06");
         fs::create_dir_all(&video_dir).unwrap();

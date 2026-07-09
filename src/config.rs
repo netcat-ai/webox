@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub listen_addr: String,
     pub api_token: String,
+    pub tenant_id: String,
+    pub provider_account_id: String,
     pub agentgateway_api_base: String,
     pub qr_match_terms: Vec<String>,
     pub state_dir: PathBuf,
@@ -15,6 +17,8 @@ impl Config {
         Self {
             listen_addr: normalize_listen_addr(&env_or("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
             api_token: env_or("WEBOX_API_TOKEN", "webox"),
+            tenant_id: env_or("WEBOX_TENANT_ID", "default"),
+            provider_account_id: env_or("WEBOX_PROVIDER_ACCOUNT_ID", "default"),
             agentgateway_api_base: trim_base_url(&env_or(
                 "WEBOX_AGENTGATEWAY_API_BASE",
                 "http://127.0.0.1:15000",

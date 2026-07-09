@@ -51,6 +51,7 @@ flowchart LR
 - `weagent` 接收 iLink 发送请求，串行调用 UI sender 操作 WeChat 客户端。
 - `agentgateway` 只代理 WeChat 登录相关流量并捕获请求/响应。
 - Docker entrypoint 只负责启动依赖进程：Display、agentgateway、WeChat、weagent。
+- Docker entrypoint 做最小进程监督，关键进程退出时让容器失败，由 Docker restart policy 重启。
 - WeChat 客户端在镜像构建期内置，容器运行期不下载或更新客户端。
 
 ## 非目标
@@ -87,13 +88,15 @@ WeChat login request/response
 ```text
 WeChat local DB
   -> wechat_db scanner decrypts and polls new rows
-  -> normalize to iLink update shape
+  -> normalize to iLink message.received updates
   -> client pulls through iLink getupdates
 ```
 
 游标原则：
 
-- 优先使用 WeChat 消息自身稳定 id / 时间戳作为 `after_id` 或 cursor。
+- 对外只接受 iLink `after_id`，不暴露内部 cursor。
+- `update.id` 使用 WeChat 消息时间戳和消息 id 派生的稳定整数，保证第三方 agent 可以按 `after_id` 继续拉取。
+- payload 包含 `room`、`message` 和无状态 `context_token`，agent 回复时可以直接把 `context_token` 传给 `/ilink/sendmessage`。
 - 服务端不维护独立 ack 状态。
 - 如果标准 iLink 明确要求服务端 ack 状态，再增加最小状态；不能预先引入 msghub-style mailbox。
 
@@ -102,7 +105,7 @@ WeChat local DB
 ```text
 iLink sendmessage
   -> validate target and payload
-  -> enqueue in-process send job
+  -> execute in-process serial send job
   -> ui_sender activates WeChat window
   -> search/open conversation
   -> paste content
@@ -113,6 +116,7 @@ iLink sendmessage
 初版发送策略：
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
+- 优先使用 `context_token` 中的 room target；没有 token 时接受显式 `room.outbound_target` 或 `room.external_room_id`。
 - 文本优先；图片和文件在文本链路跑通后接入。
 - 群聊目标必须使用可唯一定位的备注或会话名，否则拒绝发送。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
@@ -141,3 +145,4 @@ weagent
 
 - 标准 iLink 的准确字段和 ack 语义。
 - Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
+- 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `after_id` 投影是否覆盖同秒多消息边界。

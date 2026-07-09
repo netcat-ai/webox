@@ -7,9 +7,11 @@
 ```bash
 cp .env.example .env
 mkdir -p data/agentgateway data/state data/logs
-cp docker/agentgateway/config.example.yaml data/agentgateway/config.yaml
 docker compose up -d --build
 ```
+
+如果 `data/agentgateway/config.yaml` 不存在，entrypoint 会自动复制镜像内置的默认配置。已经验证过的
+自定义配置仍然可以挂载到这个路径覆盖默认值。
 
 构建镜像前需要把微信 Linux deb 放到 `docker/wechat/`：
 
@@ -38,7 +40,10 @@ APT_DEBIAN_SECURITY_MIRROR=
 - `GET /ilink/login/qrcode/latest`
 - `GET /ilink/login/qrcode/events`
 
-登录二维码也通过 iLink 相关接口暴露，具体字段以标准 iLink 契约为准。
+`/ilink/getupdates` 使用 `after_id` + `limit`，响应只返回 `updates`。每个收到的微信消息会被投影为
+`message.received` update，payload 中包含 `room`、`message` 和可直接用于回复的 `context_token`。
+`/ilink/sendmessage` 支持 `context_token`，也支持显式传 `room.outbound_target` 或 `room.external_room_id`。
+登录二维码通过 iLink login 相关接口暴露。
 
 ## 核心边界
 
@@ -48,6 +53,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 - 登录二维码来自 agentgateway 的 MITM 捕获结果。
 - 不保留 WOC `/agent/*` API。
 - 不内置 msghub-style actor/message/task 数据库。
+- 不把 WeChat DB 的内部 cursor、scanner meta 作为 iLink 响应字段暴露。
 
 ## 运行边界
 
@@ -59,6 +65,9 @@ APT_DEBIAN_SECURITY_MIRROR=
 4. 启动镜像内置的 Linux 微信。
 5. 通过代理环境变量启动微信。
 6. 启动 Rust `weagent`。
+
+entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agentgateway`、`weagent` 或 WeChat
+循环任一关键进程退出时，容器退出；Compose 的 `restart: unless-stopped` 负责重启容器。
 
 容器内工作目录统一在 `/webox` 下：
 

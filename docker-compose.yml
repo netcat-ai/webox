@@ -14,6 +14,7 @@ services:
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - WEBOX_API_TOKEN=${WEBOX_API_TOKEN:-webox}
+      - WEBOX_TENANT_ID=${WEBOX_TENANT_ID:-default}
       - WEBOX_TERMINAL_TOKEN=${WEBOX_TERMINAL_TOKEN:-terminal-token}
       - WEBOX_CLIENT_TOKEN=${WEBOX_CLIENT_TOKEN:-client-token}
       - WEBOX_PROVIDER_ACCOUNT_ID=${WEBOX_PROVIDER_ACCOUNT_ID:-default}

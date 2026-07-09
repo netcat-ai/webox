@@ -31,8 +31,49 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 "${WEBOX_ROOT}/weagent/bin/webox-identity.sh"
 
+critical_pids=()
+critical_names=()
+
 log_path() {
   echo "${WEBOX_LOG_DIR}/$1.log"
+}
+
+register_critical() {
+  critical_names+=("$1")
+  critical_pids+=("$2")
+}
+
+stop_children() {
+  trap - TERM INT EXIT
+  for pid in "${critical_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+}
+
+terminate() {
+  echo "[entrypoint] stopping"
+  stop_children
+  exit 143
+}
+
+wait_critical() {
+  trap terminate TERM INT
+  trap stop_children EXIT
+  while true; do
+    set +e
+    wait -n
+    local status=$?
+    set -e
+    for i in "${!critical_pids[@]}"; do
+      local pid="${critical_pids[$i]}"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "[entrypoint] critical process exited: ${critical_names[$i]} pid=$pid status=$status" >&2
+        stop_children
+        exit "$status"
+      fi
+    done
+  done
 }
 
 start_agent() {
@@ -41,13 +82,16 @@ start_agent() {
     cmd="${WEBOX_ROOT}/weagent/bin/weagent"
   fi
   echo "[entrypoint] starting agent: $cmd"
-  $cmd >"$(log_path weagent)" 2>&1 &
+  gosu webox bash -lc "exec $cmd" >"$(log_path weagent)" 2>&1 &
+  register_critical weagent "$!"
 }
 
 start_display() {
   Xvfb "$DISPLAY" -screen 0 "${WEBOX_SCREEN:-1280x800x24}" -nolisten tcp >"$(log_path xvfb)" 2>&1 &
+  register_critical xvfb "$!"
   sleep 1
   openbox >"$(log_path openbox)" 2>&1 &
+  register_critical openbox "$!"
   local xsettings="${WEBOX_STATE_DIR}/xsettingsd.conf"
   cat > "$xsettings" <<'EOF'
 Xft/Antialias 1
@@ -92,6 +136,31 @@ agentgateway_config_path() {
   echo "${config_dir}/$(basename "$config")"
 }
 
+ensure_agentgateway_config() {
+  if [ "${WEBOX_AGENTGATEWAY_ENABLED:-1}" = "0" ] || [ -n "${WEBOX_AGENTGATEWAY_CMD:-}" ]; then
+    return
+  fi
+
+  local config default_config
+  config="$(agentgateway_config)"
+  if [ -f "$config" ]; then
+    return
+  fi
+
+  default_config="${WEBOX_ROOT}/weagent/share/agentgateway/config.example.yaml"
+  if [ "$config" = "${AGENTGATEWAY_DIR}/config.yaml" ] && [ -f "$default_config" ]; then
+    echo "[entrypoint] installing default agentgateway config: $config"
+    mkdir -p "$(dirname "$config")"
+    cp "$default_config" "$config"
+    chown webox:webox "$config"
+    return
+  fi
+
+  echo "[entrypoint] missing agentgateway MITM config: $config" >&2
+  echo "[entrypoint] copy /webox/weagent/share/agentgateway/config.example.yaml to /webox/agentgateway/config.yaml" >&2
+  exit 1
+}
+
 ensure_agentgateway_ca() {
   if [ "${WEBOX_AGENTGATEWAY_ENABLED:-1}" = "0" ]; then
     return
@@ -131,6 +200,7 @@ start_agentgateway() {
   if [ -n "$cmd" ]; then
     echo "[entrypoint] starting agentgateway command: $cmd"
     gosu webox bash -lc "$cmd" >"$(log_path agentgateway)" 2>&1 &
+    register_critical agentgateway "$!"
     return
   fi
 
@@ -151,6 +221,15 @@ start_agentgateway() {
   config_path="$(agentgateway_config_path)"
   echo "[entrypoint] starting agentgateway from $config_dir: $bin -f $config_path"
   gosu webox sh -c 'cd "$1" && exec "$2" -f "$3"' sh "$config_dir" "$bin" "$config_path" >"$(log_path agentgateway)" 2>&1 &
+  register_critical agentgateway "$!"
+}
+
+install_nss_ca() {
+  local ca="$1"
+  local nssdb="$2"
+  gosu webox mkdir -p "$nssdb"
+  gosu webox certutil -d "sql:${nssdb}" -N --empty-password >/dev/null 2>&1 || true
+  gosu webox certutil -d "sql:${nssdb}" -A -t "C,," -n webox-agentgateway -i "$ca" >/dev/null 2>&1 || true
 }
 
 trust_agentgateway_ca() {
@@ -201,10 +280,8 @@ trust_agentgateway_ca() {
   cp "$ca" /usr/local/share/ca-certificates/webox-agentgateway.crt
   update-ca-certificates >"$(log_path update-ca-certificates)" 2>&1 || true
 
-  local nssdb="${WEBOX_STATE_DIR}/nssdb"
-  gosu webox mkdir -p "$nssdb"
-  gosu webox certutil -d "sql:${nssdb}" -N --empty-password >/dev/null 2>&1 || true
-  gosu webox certutil -d "sql:${nssdb}" -A -t "C,," -n webox-agentgateway -i "$ca" >/dev/null 2>&1 || true
+  install_nss_ca "$ca" "${WEBOX_STATE_DIR}/nssdb"
+  install_nss_ca "$ca" "${HOME}/.pki/nssdb"
 }
 
 start_wechat_loop() {
@@ -219,9 +296,12 @@ start_wechat_loop() {
   done
 }
 
-start_agent
 start_display
+ensure_agentgateway_config
 ensure_agentgateway_ca
 start_agentgateway
 trust_agentgateway_ca
-start_wechat_loop
+start_agent
+start_wechat_loop &
+register_critical wechat "$!"
+wait_critical

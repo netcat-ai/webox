@@ -39,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
     wechat.ensure_state_dir()?;
     let state = Arc::new(AppState {
         api_token: config.api_token.clone(),
+        tenant_id: config.tenant_id.clone(),
+        provider_account_id: config.provider_account_id.clone(),
         sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
         qr_source: QrSource::new(
             config.agentgateway_api_base.clone(),
