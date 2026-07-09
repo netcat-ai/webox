@@ -208,7 +208,7 @@ start_agentgateway() {
   config_dir="$(agentgateway_config_dir)"
   config_path="$(agentgateway_config_path)"
   echo "[entrypoint] starting agentgateway from $config_dir: $bin -f $config_path"
-  gosu webox sh -c 'cd "$1" && exec "$2" -f "$3"' sh "$config_dir" "$bin" "$config_path" >"$(log_path agentgateway)" 2>&1 &
+  gosu webox env RUST_LOG="${WEBOX_AGENTGATEWAY_RUST_LOG:-info}" sh -c 'cd "$1" && exec "$2" -f "$3"' sh "$config_dir" "$bin" "$config_path" >"$(log_path agentgateway)" 2>&1 &
   register_critical agentgateway "$!"
 }
 

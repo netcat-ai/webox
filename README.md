@@ -18,6 +18,9 @@ docker compose up -d --build
 - `docker/wechat/WeChatLinux_x86_64.deb`
 - `docker/wechat/WeChatLinux_arm64.deb`
 
+从微信官方 Linux 页面下载：https://linux.weixin.qq.com/ 。镜像构建会把 deb 内置进去；容器启动后不会动态下载或更新微信。
+本地 deb 已被 `.gitignore` 忽略，不提交到仓库。
+
 缺少 WeChat deb 时，可以先验证 Rust、运行时依赖和 agentgateway 安装：
 
 ```bash
@@ -54,6 +57,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 如果代理不可用，再把 `.env` 切到 `docs/docker-mirrors.md` 里的国内镜像 fallback。
 
 ## 目标接口
+
+协议标准以 https://www.wechatbot.dev/zh/protocol 为准。
 
 - `GET /healthz`
 - `GET|POST /ilink/bot/get_bot_qrcode?bot_type=3`
@@ -103,7 +108,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
-响应包含 `ret`、`msgs` 和新的 `get_updates_buf`。每条消息包含 `context_token`，回复时必须原样放进
+响应会按 iLink 语义长轮询最多 35 秒，包含 `ret`、`msgs` 和新的 `get_updates_buf`。每条消息包含 `context_token`，回复时必须原样放进
 `/ilink/bot/sendmessage` 的 `msg.context_token`。
 
 ```json
@@ -122,6 +127,13 @@ APT_DEBIAN_SECURITY_MIRROR=
 `http://host`。为兼容旧配置，末尾的 `/ilink/bot` 会被自动去掉。
 
 媒体相关路径：
+
+业务 POST 请求必须带标准 iLink 请求头：
+
+```http
+AuthorizationType: ilink_bot_token
+Authorization: Bearer <bot_token>
+```
 
 - `WEBOX_MEDIA_STORE_DIR`：本地 CDN shim 保存待上传 metadata 和加密媒体，默认 `/webox/state/weagent/media`。
 - `WEBOX_MEDIA_TRANSFER_DIR`：发送前解密出的临时文件目录，默认 `/webox/state/weagent/transfer`。
@@ -177,6 +189,8 @@ entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agen
 Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bind mount 覆盖掉。
 
 `agentgateway` 配置默认从 `/webox/agentgateway/config.yaml` 读取；也可以用 `WEBOX_AGENTGATEWAY_CMD` 直接指定你验证过的启动命令。
+默认启动会给 `agentgateway` 单独设置 `RUST_LOG=${WEBOX_AGENTGATEWAY_RUST_LOG:-info}`，避免全局 `RUST_LOG`
+把 access log 过滤掉。
 
 默认配置仍让 `agentgateway` 自己维护 `/webox/agentgateway/request-log.sqlite`，但 `weagent` 不直接读取
 这个 SQLite。二维码捕获默认读取 `agentgateway` JSON access log，路径是

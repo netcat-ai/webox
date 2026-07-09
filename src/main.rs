@@ -254,6 +254,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/getupdates")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"get_updates_buf":""}"#))
                     .unwrap(),
@@ -265,6 +266,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_posts_require_authorization_type() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getupdates")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"get_updates_buf":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "unauthorized");
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|value| value.contains("AuthorizationType")));
+    }
+
+    #[tokio::test]
     async fn standard_getconfig_returns_typing_ticket() {
         let app = build_router(test_state());
         let response = app
@@ -272,6 +299,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/getconfig")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -301,6 +329,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/getconfig")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"ilink_user_id":"alice"}"#))
@@ -318,6 +347,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/sendtyping")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(format!(
@@ -343,6 +373,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/getuploadurl")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(upload_url_body(16)))
@@ -373,6 +404,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/ilink/bot/getuploadurl")
+                    .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(upload_url_body(16)))
@@ -434,6 +466,7 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri(path)
+                        .header("AuthorizationType", "ilink_bot_token")
                         .header("authorization", "Bearer token")
                         .header("content-type", "application/json")
                         .body(Body::from(r#"{"base_info":{"channel_version":"2.0.0"}}"#))

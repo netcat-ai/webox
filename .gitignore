@@ -3,3 +3,7 @@ bin/
 target/
 *.log
 .DS_Store
+docker/wechat/*.deb
+docker/wechat/*.rpm
+docker/wechat/*.AppImage
+!docker/wechat/README.md

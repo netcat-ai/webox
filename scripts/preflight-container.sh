@@ -56,6 +56,8 @@ check_runtime_base() {
     for cmd in Xvfb openbox xdotool xclip certutil gosu tini curl openssl; do
       command -v "$cmd" >/dev/null
     done
+    ldconfig -p | grep -q "libpulse\\.so\\.0"
+    ldconfig -p | grep -q "libpulse-simple\\.so\\.0"
     agentgateway --version >/dev/null
   '
   echo "[preflight] runtime-base image has required process and UI dependencies: $runtime_image"

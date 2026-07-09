@@ -13,9 +13,13 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::time::{sleep, Duration, Instant};
 
 const ILINK_BASE_PATH: &str = "/ilink/bot";
 const TEXT_ITEM_TYPE: i64 = 1;
+const GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(35);
+const GET_UPDATES_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const GET_UPDATES_TIMEOUT_MS: i64 = 35_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -98,8 +102,6 @@ pub struct CdnDownloadQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct OutboundMessage {
-    #[serde(default)]
-    pub to_user_id: Option<String>,
     #[serde(default)]
     pub context_token: Option<String>,
     #[serde(default)]
@@ -201,7 +203,16 @@ pub async fn get_updates(
     authenticate(&state, &headers)?;
     let _base_info = request.base_info.as_ref();
     let after_id = decode_updates_buf(request.get_updates_buf.as_deref())?;
-    let result = match state.wechat.poll_messages_after_id(after_id, 100) {
+    let deadline = Instant::now() + GET_UPDATES_TIMEOUT;
+    let result = loop {
+        match state.wechat.poll_messages_after_id(after_id, 100) {
+            Ok(result) if !result.messages.is_empty() => break Ok(result),
+            Ok(result) if Instant::now() >= deadline => break Ok(result),
+            Ok(_) => sleep(GET_UPDATES_POLL_INTERVAL).await,
+            Err(err) => break Err(err),
+        }
+    };
+    let result = match result {
         Ok(result) => result,
         Err(err) => {
             return Ok(Json(json!({
@@ -227,6 +238,7 @@ pub async fn get_updates(
         "ret": 0,
         "msgs": msgs,
         "get_updates_buf": encode_updates_buf(last_update_id),
+        "longpolling_timeout_ms": GET_UPDATES_TIMEOUT_MS,
     })))
 }
 
@@ -237,8 +249,7 @@ pub async fn send_message(
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
     let _base_info = request.base_info.as_ref();
-    let target = outbound_target(&request.msg)?
-        .ok_or_else(|| ApiError::bad_request("msg.context_token or msg.to_user_id is required"))?;
+    let target = outbound_target(&request.msg)?;
     let text = outbound_text(&request.msg);
     let media_items = outbound_media_items(&state.media_store, &request.msg)?;
     if text.is_none() && media_items.is_empty() {
@@ -416,6 +427,15 @@ pub async fn not_found() -> impl IntoResponse {
 }
 
 fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let auth_type = headers
+        .get("authorizationtype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if !auth_type.is_some_and(|value| value.eq_ignore_ascii_case("ilink_bot_token")) {
+        return Err(ApiError::Unauthorized(
+            "missing or invalid AuthorizationType".to_string(),
+        ));
+    }
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -540,15 +560,17 @@ fn standard_message_view(state: &AppState, message: &Value) -> Value {
     })
 }
 
-fn outbound_target(message: &OutboundMessage) -> Result<Option<String>, ApiError> {
-    if let Some(token) = message.context_token.as_deref().and_then(non_empty) {
-        let context = decode_context_token(&token)
-            .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
-        return Ok(
-            non_empty(&context.outbound_target).or_else(|| non_empty(&context.external_room_id))
-        );
-    }
-    Ok(message.to_user_id.as_deref().and_then(non_empty))
+fn outbound_target(message: &OutboundMessage) -> Result<String, ApiError> {
+    let token = message
+        .context_token
+        .as_deref()
+        .and_then(non_empty)
+        .ok_or_else(|| ApiError::bad_request("msg.context_token is required"))?;
+    let context = decode_context_token(&token)
+        .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
+    non_empty(&context.outbound_target)
+        .or_else(|| non_empty(&context.external_room_id))
+        .ok_or_else(|| ApiError::bad_request("msg.context_token has no outbound target"))
 }
 
 fn outbound_text(message: &OutboundMessage) -> Option<String> {
@@ -873,7 +895,6 @@ mod tests {
     #[test]
     fn outbound_text_accepts_standard_text_item() {
         let message = OutboundMessage {
-            to_user_id: Some("alice".to_string()),
             context_token: None,
             text: None,
             item_list: vec![json!({ "type": 1, "text_item": { "text": "hello" } })],
@@ -895,13 +916,12 @@ mod tests {
         });
         let token = context_token_for_room(&room);
         let message = OutboundMessage {
-            to_user_id: None,
             context_token: Some(token),
             text: Some("hello".to_string()),
             item_list: Vec::new(),
         };
 
-        assert_eq!(outbound_target(&message).unwrap().as_deref(), Some("alice"));
+        assert_eq!(outbound_target(&message).unwrap(), "alice");
     }
 
     #[test]

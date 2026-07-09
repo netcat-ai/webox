@@ -33,7 +33,7 @@ RUN set -eux; \
       openbox procps tini x11-utils xclip xdotool xsettingsd xvfb xz-utils \
       libnss3-tools \
       fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
-      libatomic1 libnss3 libgbm1 libasound2 libxss1 libxdamage1 libxkbcommon-x11-0 \
+      libatomic1 libnss3 libgbm1 libasound2 libpulse0 libxss1 libxdamage1 libxkbcommon-x11-0 \
       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxcb-cursor0 \
       libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 \
       libxcomposite1 libxrandr2 libxfixes3 libxtst6 libxshmfence1 libdrm2; \
