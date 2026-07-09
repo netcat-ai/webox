@@ -105,9 +105,11 @@ Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bi
 
 `agentgateway` 配置默认从 `/webox/agentgateway/config.yaml` 读取；也可以用 `WEBOX_AGENTGATEWAY_CMD` 直接指定你验证过的启动命令。
 
-默认配置使用官方 `agentgateway` v1.3.1 的 SQLite request log：
-`/webox/agentgateway/request-log.sqlite`。`weagent` 不直接读取 SQLite，而是调用 agentgateway 本地
-`/api/logs/search` 和 `/api/logs/get`，从 log attributes 中读取 `request.body` / `response.body`。
+默认配置仍让 `agentgateway` 自己维护 `/webox/agentgateway/request-log.sqlite`，但 `weagent` 不直接读取
+这个 SQLite。二维码捕获默认读取 `agentgateway` JSON access log，路径是
+`/webox/logs/agentgateway.log`。`agentgateway` 的 `/api/logs/search` 和 `/api/logs/get` 目前只作为兼容
+查询路径保留；实测 v1.3.1 普通 HTTPS MITM 请求不会进入该 API 的 log store。
+JSON access log 中的 body 字段是 base64 形式的原始字节，`weagent` 会先解码再提取登录 URL 或图片。
 
 `agentgateway` 启动时工作目录是配置文件所在目录。默认挂载到 `/webox/agentgateway/config.yaml` 时，
 YAML 里的 `sqlite://request-log.sqlite`、`certificates/webox-ca.pem` 都解析到 `/webox/agentgateway`

@@ -28,7 +28,8 @@ flowchart LR
   Client["iLink client"] --> Agent["weagent"]
 
   Agent --> QRSource["qr_source"]
-  QRSource --> AGAPI["agentgateway /api/logs/*"]
+  QRSource --> AGLOG["agentgateway JSON access log"]
+  QRSource -. compatible .-> AGAPI["agentgateway /api/logs/*"]
   AGAPI --> AGDB["agentgateway request-log.sqlite"]
 
   Agent --> DBScanner["wechat_db scanner"]
@@ -70,8 +71,7 @@ flowchart LR
 ```text
 WeChat login request/response
   -> agentgateway MITM
-  -> agentgateway request log
-  -> agentgateway /api/logs/search + /api/logs/get
+  -> agentgateway JSON access log
   -> weagent qr_source
   -> iLink login QR response
 ```
@@ -80,8 +80,9 @@ WeChat login request/response
 
 - 使用官方 `agentgateway` v1.3.1+。
 - `agentgateway` admin API 默认只监听容器内 `127.0.0.1:15000`。
-- `weagent` 只调用 `/api/logs/search` 和 `/api/logs/get`，不直接读取 agentgateway SQLite。
-- 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`。
+- `weagent` 默认读取 agentgateway JSON access log，不直接读取 agentgateway SQLite。
+- `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.3.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
+- 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
 - iLink login 接口主响应是 `qrcode` 投影；`event` 保留 agentgateway 原始捕获字段，仅用于诊断。
 - `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
 

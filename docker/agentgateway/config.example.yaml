@@ -17,6 +17,9 @@ frontendPolicies:
     mode: route
   accessLog:
     filter: "true"
+    add:
+      request.body: 'proxy.route.name == "webox-dynamic-https" ? request.body : null'
+      response.body: 'proxy.route.name == "webox-dynamic-https" ? response.body : null'
     database:
       add:
         request.body: 'proxy.route.name == "webox-dynamic-https" ? request.body : null'

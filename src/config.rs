@@ -8,6 +8,7 @@ pub struct Config {
     pub tenant_id: String,
     pub provider_account_id: String,
     pub agentgateway_api_base: String,
+    pub agentgateway_log_path: Option<PathBuf>,
     pub qr_match_terms: Vec<String>,
     pub state_dir: PathBuf,
 }
@@ -22,6 +23,10 @@ impl Config {
             agentgateway_api_base: trim_base_url(&env_or(
                 "WEBOX_AGENTGATEWAY_API_BASE",
                 "http://127.0.0.1:15000",
+            )),
+            agentgateway_log_path: optional_path(&env_or(
+                "WEBOX_AGENTGATEWAY_LOG_PATH",
+                "/webox/logs/agentgateway.log",
             )),
             qr_match_terms: parse_terms(&env::var("WEBOX_QR_MATCH_TERMS").unwrap_or_else(|_| {
                 "getloginqrcode,loginqrcode,qrcode,qr_code,qrlogin,uuid,login".to_string()
@@ -51,6 +56,11 @@ fn normalize_listen_addr(raw: &str) -> String {
 
 fn trim_base_url(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
+}
+
+fn optional_path(raw: &str) -> Option<PathBuf> {
+    let value = raw.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
 fn parse_terms(raw: &str) -> Vec<String> {

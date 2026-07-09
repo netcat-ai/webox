@@ -45,10 +45,10 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/install-agentgateway.sh /tmp/install-agentgateway.sh
 RUN chmod 755 /tmp/install-agentgateway.sh && AGENTGATEWAY_VERSION="${AGENTGATEWAY_VERSION}" AGENTGATEWAY_RELEASE_URL_BASE="${AGENTGATEWAY_RELEASE_URL_BASE}" /tmp/install-agentgateway.sh && rm -f /tmp/install-agentgateway.sh
 
+COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/wechat-ctl.sh docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 COPY docker/agentgateway/config.example.yaml /webox/weagent/share/agentgateway/config.example.yaml
 

@@ -45,7 +45,8 @@ async fn main() -> anyhow::Result<()> {
         qr_source: QrSource::new(
             config.agentgateway_api_base.clone(),
             config.qr_match_terms.clone(),
-        ),
+        )
+        .with_log_path(config.agentgateway_log_path.clone()),
         wechat,
     });
 
