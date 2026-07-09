@@ -123,6 +123,7 @@ iLink sendmessage
 - 优先使用 `msg.context_token` 中的 room target；没有 token 时接受显式 `msg.to_user_id`。
 - 不暴露 UI sender receipt；同步执行成功返回 `ret=0`。
 - 文本优先；图片和文件在文本链路跑通后接入。
+- `getconfig`/`sendtyping` 初版只做 iLink SDK 兼容：无状态 `typing_ticket` + no-op `sendtyping`。
 - 群聊目标必须使用可唯一定位的备注或会话名，否则拒绝发送。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
 

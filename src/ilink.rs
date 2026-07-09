@@ -55,6 +55,28 @@ pub struct SendMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct GetConfigRequest {
+    #[serde(default)]
+    pub ilink_user_id: Option<String>,
+    #[serde(default)]
+    pub context_token: Option<String>,
+    #[serde(default)]
+    pub base_info: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendTypingRequest {
+    #[serde(default)]
+    pub ilink_user_id: Option<String>,
+    #[serde(default)]
+    pub typing_ticket: Option<String>,
+    #[serde(default)]
+    pub status: Option<i64>,
+    #[serde(default)]
+    pub base_info: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct OutboundMessage {
     #[serde(default)]
     pub to_user_id: Option<String>,
@@ -70,6 +92,15 @@ pub struct OutboundMessage {
 struct UpdatesCursor {
     v: u8,
     last_update_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TypingTicket {
+    v: u8,
+    tenant_id: String,
+    provider_account_id: String,
+    ilink_user_id: String,
+    context_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -203,6 +234,66 @@ pub async fn send_message(
     })))
 }
 
+pub async fn get_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<GetConfigRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers)?;
+    let _base_info = request.base_info.as_ref();
+    let context_token = request.context_token.as_deref().and_then(non_empty);
+    if let Some(token) = context_token.as_deref() {
+        decode_context_token(token)
+            .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
+    }
+    let ilink_user_id = request
+        .ilink_user_id
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| {
+            context_token
+                .as_deref()
+                .and_then(|token| decode_context_token(token).ok())
+                .and_then(|context| non_empty(&context.external_room_id))
+        })
+        .ok_or_else(|| ApiError::bad_request("ilink_user_id or context_token is required"))?;
+    Ok(Json(json!({
+        "ret": 0,
+        "typing_ticket": typing_ticket_for(&state, &ilink_user_id, context_token.as_deref()),
+    })))
+}
+
+pub async fn send_typing(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<SendTypingRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers)?;
+    let _base_info = request.base_info.as_ref();
+    let status = request
+        .status
+        .ok_or_else(|| ApiError::bad_request("status is required"))?;
+    if status != 1 && status != 2 {
+        return Err(ApiError::bad_request("status must be 1 or 2"));
+    }
+    let ticket = request
+        .typing_ticket
+        .as_deref()
+        .and_then(non_empty)
+        .ok_or_else(|| ApiError::bad_request("typing_ticket is required"))?;
+    let ticket = decode_typing_ticket(&ticket)
+        .map_err(|err| ApiError::bad_request(format!("invalid typing_ticket: {err}")))?;
+    if ticket.provider_account_id != state.provider_account_id {
+        return Err(ApiError::bad_request("typing_ticket account mismatch"));
+    }
+    if let Some(ilink_user_id) = request.ilink_user_id.as_deref().and_then(non_empty) {
+        if ilink_user_id != ticket.ilink_user_id {
+            return Err(ApiError::bad_request("typing_ticket user mismatch"));
+        }
+    }
+    Ok(Json(json!({ "ret": 0 })))
+}
+
 pub async fn not_found() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -277,6 +368,28 @@ fn encode_updates_buf(last_update_id: i64) -> String {
         })
         .expect("updates cursor serializes"),
     )
+}
+
+fn typing_ticket_for(state: &AppState, ilink_user_id: &str, context_token: Option<&str>) -> String {
+    URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&TypingTicket {
+            v: 1,
+            tenant_id: state.tenant_id.clone(),
+            provider_account_id: state.provider_account_id.clone(),
+            ilink_user_id: ilink_user_id.to_string(),
+            context_token: context_token.unwrap_or_default().to_string(),
+        })
+        .expect("typing ticket serializes"),
+    )
+}
+
+fn decode_typing_ticket(ticket: &str) -> anyhow::Result<TypingTicket> {
+    let bytes = URL_SAFE_NO_PAD.decode(ticket.trim())?;
+    let ticket: TypingTicket = serde_json::from_slice(&bytes)?;
+    if ticket.v != 1 {
+        anyhow::bail!("unsupported version");
+    }
+    Ok(ticket)
 }
 
 fn standard_message_view(state: &AppState, message: &Value) -> Value {
@@ -513,6 +626,18 @@ mod tests {
         };
 
         assert_eq!(outbound_target(&message).unwrap().as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn typing_ticket_round_trips_user_and_context() {
+        let state = test_state();
+        let ticket = typing_ticket_for(&state, "alice", Some("ctx"));
+        let decoded = decode_typing_ticket(&ticket).unwrap();
+
+        assert_eq!(decoded.tenant_id, "default");
+        assert_eq!(decoded.provider_account_id, "wx");
+        assert_eq!(decoded.ilink_user_id, "alice");
+        assert_eq!(decoded.context_token, "ctx");
     }
 
     #[test]

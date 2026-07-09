@@ -73,6 +73,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/get_qrcode_status", get(ilink::get_qrcode_status))
         .route("/getupdates", post(ilink::get_updates))
         .route("/sendmessage", post(ilink::send_message))
+        .route("/getconfig", post(ilink::get_config))
+        .route("/sendtyping", post(ilink::send_typing))
         .route(
             "/ilink/bot/get_bot_qrcode",
             get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
@@ -83,6 +85,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/ilink/bot/getupdates", post(ilink::get_updates))
         .route("/ilink/bot/sendmessage", post(ilink::send_message))
+        .route("/ilink/bot/getconfig", post(ilink::get_config))
+        .route("/ilink/bot/sendtyping", post(ilink::send_typing))
         .fallback(ilink::not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -243,6 +247,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn standard_getconfig_returns_typing_ticket() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getconfig")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"ilink_user_id":"alice","base_info":{"channel_version":"2.0.0"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ret"], 0);
+        assert!(body["typing_ticket"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn standard_sendtyping_accepts_generated_ticket() {
+        let app = build_router(test_state());
+        let getconfig = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getconfig")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ilink_user_id":"alice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(getconfig.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let ticket = body["typing_ticket"].as_str().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/sendtyping")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"ilink_user_id":"alice","typing_ticket":"{ticket}","status":1}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ret"], 0);
     }
 
     #[tokio::test]

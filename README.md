@@ -44,8 +44,11 @@ APT_DEBIAN_SECURITY_MIRROR=
 - `GET /ilink/bot/get_qrcode_status?qrcode=...`
 - `POST /ilink/bot/getupdates`
 - `POST /ilink/bot/sendmessage`
+- `POST /ilink/bot/getconfig`
+- `POST /ilink/bot/sendtyping`
 
-根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`。
+根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`、
+`/getconfig`、`/sendtyping`。
 这是为了兼容把 `baseurl` 设为 `http://host/ilink/bot` 后再拼相对路径的 iLink 客户端。
 
 `/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码：
@@ -95,6 +98,9 @@ APT_DEBIAN_SECURITY_MIRROR=
 
 `WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。如果不设置，默认从请求 `Host` 派生
 `http://host/ilink/bot`。
+
+`/ilink/bot/getconfig` 和 `/ilink/bot/sendtyping` 用于兼容 iLink SDK 的输入状态流程。当前实现生成无状态
+`typing_ticket`，`sendtyping` 校验 ticket 后返回 `ret=0`；它暂不驱动 Linux WeChat 显示真实输入状态。
 
 ## 核心边界
 
