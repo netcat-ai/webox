@@ -10,6 +10,7 @@ pub struct Config {
     pub public_base_url: Option<String>,
     pub agentgateway_api_base: String,
     pub agentgateway_log_path: Option<PathBuf>,
+    pub qr_screenshot_path: Option<PathBuf>,
     pub qr_match_terms: Vec<String>,
     pub state_dir: PathBuf,
     pub media_dir: PathBuf,
@@ -33,6 +34,10 @@ impl Config {
             agentgateway_log_path: optional_path(&env_or(
                 "WEBOX_AGENTGATEWAY_LOG_PATH",
                 "/webox/logs/agentgateway.log",
+            )),
+            qr_screenshot_path: optional_path(&env_or(
+                "WEBOX_QR_SCREENSHOT_PATH",
+                "/webox/runtime/xvfb/Xvfb_screen0",
             )),
             qr_match_terms: parse_terms(&env::var("WEBOX_QR_MATCH_TERMS").unwrap_or_else(|_| {
                 "getloginqrcode,checkloginqrcode,loginqrcode,login.weixin.qq.com/l/,weixin.qq.com/x/,qrcode,qr_code,qrlogin,uuid".to_string()

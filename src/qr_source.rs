@@ -1,14 +1,21 @@
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use png::{BitDepth, ColorType, Encoder};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const MAX_ACCESS_LOG_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+const XWD_FILE_VERSION: u32 = 7;
+const XWD_Z_PIXMAP: u32 = 2;
+const XWD_MSB_FIRST: u32 = 0;
+const XWD_LSB_FIRST: u32 = 1;
+const MIN_SCREEN_QR_BLUE_PIXELS: usize = 1_500;
 
 #[derive(Clone)]
 pub struct QrSource {
@@ -16,6 +23,7 @@ pub struct QrSource {
     client: reqwest::Client,
     match_terms: Vec<String>,
     log_path: Option<PathBuf>,
+    screenshot_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -97,11 +105,17 @@ impl QrSource {
             client: reqwest::Client::new(),
             match_terms,
             log_path: None,
+            screenshot_path: None,
         }
     }
 
     pub fn with_log_path(mut self, path: Option<PathBuf>) -> Self {
         self.log_path = path;
+        self
+    }
+
+    pub fn with_screenshot_path(mut self, path: Option<PathBuf>) -> Self {
+        self.screenshot_path = path;
         self
     }
 
@@ -111,16 +125,12 @@ impl QrSource {
 
     async fn search_newest(&self, limit: usize) -> Result<Vec<QrEvent>> {
         let wanted = limit.clamp(1, 100);
+        let mut api_error = None;
         let mut out = match self.search_api_newest(wanted).await {
             Ok(events) => events,
             Err(api_err) => {
-                let mut fallback = self.search_access_log_newest(wanted)?;
-                if fallback.is_empty() {
-                    return Err(api_err);
-                }
-                fallback.sort_by(|left, right| right.captured_at.cmp(&left.captured_at));
-                fallback.truncate(wanted);
-                return Ok(fallback);
+                api_error = Some(api_err);
+                Vec::new()
             }
         };
         if out.len() >= wanted {
@@ -131,6 +141,18 @@ impl QrSource {
         for event in access_log_events {
             if !out.iter().any(|existing| existing.id == event.id) {
                 out.push(event);
+            }
+        }
+        if out.len() < wanted {
+            if let Some(event) = self.search_screenshot_newest()? {
+                if !out.iter().any(|existing| existing.id == event.id) {
+                    out.push(event);
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(api_err) = api_error {
+                return Err(api_err);
             }
         }
         out.sort_by(|left, right| right.captured_at.cmp(&left.captured_at));
@@ -202,6 +224,40 @@ impl QrSource {
             }
         }
         Ok(out)
+    }
+
+    fn search_screenshot_newest(&self) -> Result<Option<QrEvent>> {
+        let Some(path) = &self.screenshot_path else {
+            return Ok(None);
+        };
+        let Some(screen) = read_xwd_screen(path)? else {
+            return Ok(None);
+        };
+        if !looks_like_wechat_login_qr_screen(&screen) {
+            return Ok(None);
+        }
+        let png = encode_rgb_png(screen.width, screen.height, &screen.rgb)?;
+        let digest = md5::compute(&png);
+        let metadata = std::fs::metadata(path).ok();
+        let captured_at = metadata
+            .and_then(|value| value.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| format!("unix:{}", duration.as_secs()))
+            .unwrap_or_else(|| "unix:0".to_string());
+        Ok(Some(QrEvent {
+            id: format!("xvfb-screen-{digest:x}"),
+            kind: "wechat.login_qrcode".to_string(),
+            captured_at,
+            method: "SCREEN".to_string(),
+            url: "x11://wechat/login-screen".to_string(),
+            host: "wechat-ui".to_string(),
+            path: "/login-screen".to_string(),
+            request_body_base64: None,
+            response_status: None,
+            response_body_base64: Some(STANDARD.encode(png)),
+            response_text: None,
+            matched_by: vec!["screen".to_string(), "qrcode".to_string()],
+        }))
     }
 
     async fn get_log(&self, id: &str) -> Result<Option<LogEntry>> {
@@ -329,6 +385,197 @@ fn access_log_line_to_entry(line: &str, index_from_tail: usize) -> Option<LogEnt
         http_status: attr_i64(&value, "http.status"),
         attributes: Some(value),
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RgbScreen {
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct XwdHeader {
+    header_size: usize,
+    file_version: u32,
+    pixmap_format: u32,
+    width: u32,
+    height: u32,
+    byte_order: u32,
+    bits_per_pixel: u32,
+    bytes_per_line: usize,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+    ncolors: usize,
+}
+
+fn read_xwd_screen(path: &Path) -> Result<Option<RgbScreen>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    parse_xwd_screen(&bytes)
+        .map(Some)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+fn parse_xwd_screen(bytes: &[u8]) -> Result<RgbScreen> {
+    let header = parse_xwd_header(bytes)?;
+    if header.file_version != XWD_FILE_VERSION || header.pixmap_format != XWD_Z_PIXMAP {
+        anyhow::bail!("unsupported xwd header");
+    }
+    if header.width == 0 || header.height == 0 {
+        anyhow::bail!("empty xwd screen");
+    }
+    if header.bits_per_pixel != 24 && header.bits_per_pixel != 32 {
+        anyhow::bail!("unsupported xwd bits_per_pixel {}", header.bits_per_pixel);
+    }
+    if !matches!(header.byte_order, XWD_MSB_FIRST | XWD_LSB_FIRST) {
+        anyhow::bail!("unsupported xwd byte_order {}", header.byte_order);
+    }
+    let bytes_per_pixel = (header.bits_per_pixel / 8) as usize;
+    let color_table_len = header.ncolors.saturating_mul(12);
+    let offset = header
+        .header_size
+        .checked_add(color_table_len)
+        .context("xwd color table offset overflow")?;
+    let required = header
+        .bytes_per_line
+        .checked_mul(header.height as usize)
+        .and_then(|len| offset.checked_add(len))
+        .context("xwd image length overflow")?;
+    if bytes.len() < required {
+        anyhow::bail!("truncated xwd image");
+    }
+    let mut rgb = Vec::with_capacity(header.width as usize * header.height as usize * 3);
+    let image = &bytes[offset..required];
+    for y in 0..header.height as usize {
+        let row = &image[y * header.bytes_per_line..(y + 1) * header.bytes_per_line];
+        for x in 0..header.width as usize {
+            let start = x * bytes_per_pixel;
+            let pixel = read_xwd_pixel(
+                &row[start..start + bytes_per_pixel],
+                header.byte_order,
+                header.bits_per_pixel,
+            );
+            rgb.push(masked_channel(pixel, header.red_mask));
+            rgb.push(masked_channel(pixel, header.green_mask));
+            rgb.push(masked_channel(pixel, header.blue_mask));
+        }
+    }
+    Ok(RgbScreen {
+        width: header.width,
+        height: header.height,
+        rgb,
+    })
+}
+
+fn parse_xwd_header(bytes: &[u8]) -> Result<XwdHeader> {
+    if bytes.len() < 100 {
+        anyhow::bail!("truncated xwd header");
+    }
+    parse_xwd_header_with_endian(bytes, true)
+        .or_else(|_| parse_xwd_header_with_endian(bytes, false))
+}
+
+fn parse_xwd_header_with_endian(bytes: &[u8], big_endian: bool) -> Result<XwdHeader> {
+    let field = |index: usize| {
+        let start = index * 4;
+        if big_endian {
+            u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap())
+        } else {
+            u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+        }
+    };
+    let header = XwdHeader {
+        header_size: field(0) as usize,
+        file_version: field(1),
+        pixmap_format: field(2),
+        width: field(4),
+        height: field(5),
+        byte_order: field(7),
+        bits_per_pixel: field(11),
+        bytes_per_line: field(12) as usize,
+        red_mask: field(14),
+        green_mask: field(15),
+        blue_mask: field(16),
+        ncolors: field(19) as usize,
+    };
+    if header.header_size < 100 || header.header_size > bytes.len() {
+        anyhow::bail!("invalid xwd header size");
+    }
+    if header.file_version != XWD_FILE_VERSION {
+        anyhow::bail!("invalid xwd version");
+    }
+    if header.width > 16_384 || header.height > 16_384 {
+        anyhow::bail!("unreasonable xwd dimensions");
+    }
+    Ok(header)
+}
+
+fn read_xwd_pixel(bytes: &[u8], byte_order: u32, bits_per_pixel: u32) -> u32 {
+    if bits_per_pixel == 32 {
+        return if byte_order == XWD_MSB_FIRST {
+            u32::from_be_bytes(bytes.try_into().unwrap())
+        } else {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        };
+    }
+    if byte_order == XWD_MSB_FIRST {
+        bytes
+            .iter()
+            .fold(0u32, |pixel, byte| (pixel << 8) | *byte as u32)
+    } else {
+        bytes
+            .iter()
+            .rev()
+            .fold(0u32, |pixel, byte| (pixel << 8) | *byte as u32)
+    }
+}
+
+fn masked_channel(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let max = mask >> shift;
+    let value = (pixel & mask) >> shift;
+    ((value * 255 + max / 2) / max) as u8
+}
+
+fn looks_like_wechat_login_qr_screen(screen: &RgbScreen) -> bool {
+    let blue_pixels = screen
+        .rgb
+        .chunks_exact(3)
+        .filter(|pixel| is_wechat_qr_blue(pixel[0], pixel[1], pixel[2]))
+        .count();
+    blue_pixels >= MIN_SCREEN_QR_BLUE_PIXELS
+}
+
+fn is_wechat_qr_blue(red: u8, green: u8, blue: u8) -> bool {
+    blue > 145
+        && red < 130
+        && green < 150
+        && blue.saturating_sub(red) > 45
+        && blue.saturating_sub(green) > 35
+}
+
+fn encode_rgb_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
+    let expected = width as usize * height as usize * 3;
+    if rgb.len() != expected {
+        anyhow::bail!("rgb length does not match dimensions");
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut out, width, height);
+        encoder.set_color(ColorType::Rgb);
+        encoder.set_depth(BitDepth::Eight);
+        let mut writer = encoder.write_header().context("write png header")?;
+        writer.write_image_data(rgb).context("write png pixels")?;
+    }
+    Ok(out)
 }
 
 impl QrEvent {
@@ -764,6 +1011,34 @@ mod tests {
         let _ = fs::remove_file(access_log_path);
     }
 
+    #[tokio::test]
+    async fn latest_falls_back_to_xvfb_screen_when_capture_logs_are_empty() {
+        let screen_path =
+            std::env::temp_dir().join(format!("webox-qr-screen-{}.xwd", uuid::Uuid::new_v4()));
+        fs::write(&screen_path, xwd_fixture_with_blue_qr()).unwrap();
+
+        let source = QrSource::new("http://127.0.0.1:9".to_string(), vec!["qrcode".into()])
+            .with_screenshot_path(Some(screen_path.clone()));
+        let event = source.latest().await.unwrap().expect("qr event");
+        let qrcode = event.to_login_qrcode();
+
+        assert!(event.id.starts_with("xvfb-screen-"));
+        assert_eq!(event.method, "SCREEN");
+        assert_eq!(qrcode.image_content_type, Some("image/png".to_string()));
+        assert!(qrcode
+            .image_data_uri
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        let _ = fs::remove_file(screen_path);
+    }
+
+    #[test]
+    fn xwd_screen_without_qr_blue_is_ignored() {
+        let screen = parse_xwd_screen(&xwd_fixture(80, 80, |_, _| [255, 255, 255])).unwrap();
+        assert!(!looks_like_wechat_login_qr_screen(&screen));
+    }
+
     fn write_qr_access_log(path: &Path, id: &str, code: &str) {
         fs::write(
             path,
@@ -780,6 +1055,62 @@ mod tests {
                 + "\n",
         )
         .unwrap();
+    }
+
+    fn xwd_fixture_with_blue_qr() -> Vec<u8> {
+        xwd_fixture(96, 96, |x, y| {
+            if (16..80).contains(&x) && (16..80).contains(&y) {
+                [45, 65, 255]
+            } else {
+                [255, 255, 255]
+            }
+        })
+    }
+
+    fn xwd_fixture(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        let header_size = 104u32;
+        let bits_per_pixel = 32u32;
+        let bytes_per_line = width * 4;
+        let fields = [
+            header_size,
+            XWD_FILE_VERSION,
+            XWD_Z_PIXMAP,
+            24,
+            width,
+            height,
+            0,
+            XWD_MSB_FIRST,
+            32,
+            XWD_MSB_FIRST,
+            32,
+            bits_per_pixel,
+            bytes_per_line,
+            4,
+            0x00ff0000,
+            0x0000ff00,
+            0x000000ff,
+            8,
+            256,
+            0,
+            width,
+            height,
+            0,
+            0,
+            0,
+        ];
+        let mut out = Vec::new();
+        for field in fields {
+            out.extend_from_slice(&field.to_be_bytes());
+        }
+        out.extend_from_slice(b"X\0\0\0");
+        for y in 0..height {
+            for x in 0..width {
+                let [red, green, blue] = pixel(x, y);
+                let value = ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        out
     }
 
     async fn search_logs_fixture() -> Json<Value> {

@@ -56,7 +56,8 @@ last_response=""
 while [ "$SECONDS" -lt "$deadline" ]; do
   last_response="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/get_bot_qrcode?bot_type=3" || true)"
   if printf '%s' "$last_response" | grep -q '"qrcode":"[^"]'; then
-    echo "$last_response"
+    qrcode_id="$(printf '%s' "$last_response" | sed -n 's/.*"qrcode":"\([^"]*\)".*/\1/p')"
+    printf '{"qrcode":"%s","qrcode_img_content":"<omitted>"}\n' "$qrcode_id"
     echo "[verify-wechat-qrcode] captured login qrcode"
     exit 0
   fi

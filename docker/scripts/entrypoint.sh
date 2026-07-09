@@ -7,6 +7,7 @@ export AGENTGATEWAY_DIR="${WEBOX_AGENTGATEWAY_DIR:-${WEBOX_ROOT}/agentgateway}"
 export WEBOX_STATE_DIR="${WEBOX_STATE_DIR:-${WEBOX_ROOT}/state}"
 export WEBOX_LOG_DIR="${WEBOX_LOG_DIR:-${WEBOX_ROOT}/logs}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${WEBOX_ROOT}/runtime}"
+export WEBOX_XVFB_FBDIR="${WEBOX_XVFB_FBDIR:-${XDG_RUNTIME_DIR}/xvfb}"
 export WEBOX_HOME="${WEBOX_HOME:-${WEBOX_STATE_DIR}/home}"
 export HOME="$WEBOX_HOME"
 export WECHAT_BIN="${WECHAT_BIN:-${WEBOX_ROOT}/wechat/opt/wechat/wechat}"
@@ -14,8 +15,8 @@ export WEBOX_WEAGENT_STATE_DIR="${WEBOX_WEAGENT_STATE_DIR:-${WEBOX_STATE_DIR}/we
 export WEBOX_AGENTGATEWAY_API_BASE="${WEBOX_AGENTGATEWAY_API_BASE:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_ADMIN_PORT:-15000}}"
 export WEBOX_PROXYCHAINS_CONF="${WEBOX_PROXYCHAINS_CONF:-${WEBOX_STATE_DIR}/proxychains.conf}"
 
-mkdir -p "$WEBOX_ROOT" "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
-chown -R webox:webox "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
+mkdir -p "$WEBOX_ROOT" "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
+chown -R webox:webox "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
 "${WEBOX_ROOT}/weagent/bin/webox-identity.sh"
@@ -76,7 +77,7 @@ start_agent() {
 }
 
 start_display() {
-  Xvfb "$DISPLAY" -screen 0 "${WEBOX_SCREEN:-1280x800x24}" -nolisten tcp >"$(log_path xvfb)" 2>&1 &
+  Xvfb "$DISPLAY" -screen 0 "${WEBOX_SCREEN:-1280x800x24}" -fbdir "$WEBOX_XVFB_FBDIR" -nolisten tcp >"$(log_path xvfb)" 2>&1 &
   register_critical xvfb "$!"
   sleep 1
   openbox >"$(log_path openbox)" 2>&1 &

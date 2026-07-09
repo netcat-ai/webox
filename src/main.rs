@@ -50,7 +50,8 @@ async fn main() -> anyhow::Result<()> {
             config.agentgateway_api_base.clone(),
             config.qr_match_terms.clone(),
         )
-        .with_log_path(config.agentgateway_log_path.clone()),
+        .with_log_path(config.agentgateway_log_path.clone())
+        .with_screenshot_path(config.qr_screenshot_path.clone()),
         media_store: MediaStore::new(config.media_dir.clone()),
         wechat,
     });
