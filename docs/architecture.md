@@ -81,10 +81,10 @@ WeChat login request/response
 
 查询边界：
 
-- 使用官方 `agentgateway` v1.3.1+。
+- 使用官方 `agentgateway` v1.4.0-alpha.1。
 - `agentgateway` admin API 默认只监听容器内 `127.0.0.1:15000`。
 - `weagent` 默认读取 agentgateway JSON access log，不直接读取 agentgateway SQLite。
-- `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.3.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
+- `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.4.0-alpha.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
 - 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
 - `GET|POST /ilink/bot/get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
 - `GET /ilink/bot/get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${AGENTGATEWAY_VERSION:-v1.3.1}"
+version="${AGENTGATEWAY_VERSION:-v1.4.0-alpha.1}"
 install_dir="${AGENTGATEWAY_INSTALL_DIR:-/usr/local/bin}"
 release_url_base="${AGENTGATEWAY_RELEASE_URL_BASE:-https://github.com/agentgateway/agentgateway/releases/download}"
 github_api_url="${AGENTGATEWAY_GITHUB_API_URL:-https://api.github.com/repos/agentgateway/agentgateway/releases/latest}"

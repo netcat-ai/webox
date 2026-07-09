@@ -1,4 +1,4 @@
-# agentgateway v1.3.1+ config for webox.
+# agentgateway v1.4.0-alpha.1 config for webox.
 #
 # Copy this file to /webox/agentgateway/config.yaml. The entrypoint starts
 # agentgateway with /webox/agentgateway as its working directory, so relative

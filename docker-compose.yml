@@ -7,7 +7,7 @@ services:
         DEBIAN_RUNTIME_IMAGE: ${DEBIAN_RUNTIME_IMAGE:-debian:bookworm}
         APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-}
         APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-}
-        AGENTGATEWAY_VERSION: ${AGENTGATEWAY_VERSION:-v1.3.1}
+        AGENTGATEWAY_VERSION: ${AGENTGATEWAY_VERSION:-v1.4.0-alpha.1}
         AGENTGATEWAY_RELEASE_URL_BASE: ${AGENTGATEWAY_RELEASE_URL_BASE:-https://github.com/agentgateway/agentgateway/releases/download}
     image: webox:local
     container_name: webox

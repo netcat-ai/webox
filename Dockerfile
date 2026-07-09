@@ -1,6 +1,6 @@
 ARG RUST_BUILDER_IMAGE=rust:1.96-bookworm
 ARG DEBIAN_RUNTIME_IMAGE=debian:bookworm
-ARG AGENTGATEWAY_VERSION=v1.3.1
+ARG AGENTGATEWAY_VERSION=v1.4.0-alpha.1
 ARG AGENTGATEWAY_RELEASE_URL_BASE=https://github.com/agentgateway/agentgateway/releases/download
 
 FROM ${RUST_BUILDER_IMAGE} AS build
@@ -10,7 +10,7 @@ COPY src ./src
 RUN cargo build --release --locked --bin weagent && mkdir -p /out && cp target/release/weagent /out/weagent
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime-base
-ARG AGENTGATEWAY_VERSION=v1.3.1
+ARG AGENTGATEWAY_VERSION=v1.4.0-alpha.1
 ARG AGENTGATEWAY_RELEASE_URL_BASE=https://github.com/agentgateway/agentgateway/releases/download
 ARG APT_DEBIAN_MIRROR=
 ARG APT_DEBIAN_SECURITY_MIRROR=

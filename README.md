@@ -41,7 +41,7 @@ scripts/verify-agentgateway-capture.sh
 ```
 
 这个脚本用当前默认 agentgateway 配置代理一个测试 HTTPS 请求，并检查 `request.body`、`response.body`。
-它验证的是 `weagent` 默认使用的 JSON access log 路径；`/api/logs/search` 在 v1.3.1 下可能仍返回空数组。
+它验证的是 `weagent` 默认使用的 JSON access log 路径；`/api/logs/search` 在 v1.4.0-alpha.1 下可能仍返回空数组。
 
 服务默认暴露在 `http://127.0.0.1:38080`。
 
@@ -170,7 +170,7 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 
 1. 生成持久 machine-id，并默认伪装为 deepin 23。
 2. 启动 Xvfb + openbox。
-3. 启动 `agentgateway` v1.3.1，本地 admin API 默认监听 `127.0.0.1:15000`，并把它的 CA 写入系统和 NSS 信任库。
+3. 启动 `agentgateway` v1.4.0-alpha.1，本地 admin API 默认监听 `127.0.0.1:15000`，并把它的 CA 写入系统和 NSS 信任库。
 4. 启动镜像内置的 Linux 微信。
 5. 只给微信进程注入代理环境变量，让登录流量经过 agentgateway。
 6. 启动 Rust `weagent`。
@@ -195,7 +195,7 @@ Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bi
 默认配置仍让 `agentgateway` 自己维护 `/webox/agentgateway/request-log.sqlite`，但 `weagent` 不直接读取
 这个 SQLite。二维码捕获默认读取 `agentgateway` JSON access log，路径是
 `/webox/logs/agentgateway.log`。`agentgateway` 的 `/api/logs/search` 和 `/api/logs/get` 目前只作为兼容
-查询路径保留；实测 v1.3.1 普通 HTTPS MITM 请求不会进入该 API 的 log store。
+查询路径保留；实测 v1.4.0-alpha.1 普通 HTTPS MITM 请求不会进入该 API 的 log store。
 JSON access log 中的 body 字段是 base64 形式的原始字节，`weagent` 会先解码再提取登录 URL 或图片。
 
 `agentgateway` 启动时工作目录是配置文件所在目录。默认挂载到 `/webox/agentgateway/config.yaml` 时，
