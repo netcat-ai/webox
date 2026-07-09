@@ -12,6 +12,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::SystemTime;
+
+const TASK_TYPE_SEND_MESSAGE: &str = "send_message";
+const TASK_STATUS_ACKED: &str = "acked";
+const TASK_STATUS_FAILED: &str = "failed";
+const PROVIDER_ACTOR_ID_SEED: &str = "webox:provider:wechat";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,6 +36,14 @@ pub struct SendMessageRequest {
     #[serde(default)]
     pub room: RoomInput,
     #[serde(default)]
+    pub external_message_id: Option<String>,
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub sender_name: Option<String>,
+    #[serde(default)]
+    pub message_time: Option<String>,
+    #[serde(default)]
     pub message_type: Option<String>,
     #[serde(default)]
     pub body: Value,
@@ -46,7 +60,24 @@ pub struct RoomInput {
 #[derive(Debug, Serialize)]
 pub struct SendMessageResponse {
     pub accepted: bool,
-    pub message: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
+    pub task: ActorTaskView,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActorTaskView {
+    pub id: i64,
+    pub room_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_actor_id: Option<i64>,
+    pub assignee_actor_id: i64,
+    pub task_type: String,
+    pub payload: Value,
+    pub status: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,10 +164,11 @@ pub async fn send_message(
         .send_text(target, text)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let task = send_task_view(&state, &request, &receipt);
     Ok(Json(SendMessageResponse {
         accepted: true,
-        message: serde_json::to_value(receipt)
-            .map_err(|err| ApiError::internal(err.to_string()))?,
+        duplicate: None,
+        task,
     }))
 }
 
@@ -169,6 +201,7 @@ pub async fn get_updates(
                     "message": {
                         "id": id,
                         "room_id": room["id"],
+                        "source_actor_id": provider_actor_id(&state),
                         "external_message_id": external_message_id(message),
                         "sender_id": sender_id(message),
                         "sender_name": sender_name(message),
@@ -194,12 +227,20 @@ pub async fn ack(
     let tasks = request
         .task_results
         .into_iter()
-        .map(|task| AckTaskView {
-            id: task.task_id,
-            status: task.status,
-            error: task.error,
+        .map(|task| {
+            let status = task.status.trim().to_string();
+            if status != TASK_STATUS_ACKED && status != TASK_STATUS_FAILED {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported task status {status:?}"
+                )));
+            }
+            Ok(AckTaskView {
+                id: task.task_id,
+                status,
+                error: task.error,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(json!({
         "acked_update_ids": request.update_ids,
         "tasks": tasks,
@@ -298,25 +339,84 @@ fn send_target(request: &SendMessageRequest) -> Result<Option<String>, ApiError>
     Ok(non_empty(&context.outbound_target).or_else(|| non_empty(&context.external_room_id)))
 }
 
+fn send_task_view(
+    state: &AppState,
+    request: &SendMessageRequest,
+    receipt: &crate::ui_sender::SendReceipt,
+) -> ActorTaskView {
+    let room = room_view_from_target(
+        state,
+        &receipt.target.id,
+        Some(&receipt.target.query),
+        receipt.target.is_group,
+    );
+    let now = now_rfc3339();
+    ActorTaskView {
+        id: stable_positive_id(&receipt.client_msg_id),
+        room_id: room["id"].as_i64().unwrap_or_default(),
+        requester_actor_id: None,
+        assignee_actor_id: provider_actor_id(state),
+        task_type: TASK_TYPE_SEND_MESSAGE.to_string(),
+        payload: send_task_payload(request),
+        status: TASK_STATUS_ACKED.to_string(),
+        created_at: now.clone(),
+        acked_at: Some(now),
+    }
+}
+
+fn send_task_payload(request: &SendMessageRequest) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "message_type".to_string(),
+        json!(request.message_type.as_deref().unwrap_or("text")),
+    );
+    payload.insert("body".to_string(), request.body.clone());
+    insert_optional(
+        &mut payload,
+        "external_message_id",
+        &request.external_message_id,
+    );
+    insert_optional(&mut payload, "sender_id", &request.sender_id);
+    insert_optional(&mut payload, "sender_name", &request.sender_name);
+    insert_optional(&mut payload, "message_time", &request.message_time);
+    Value::Object(payload)
+}
+
+fn insert_optional(map: &mut serde_json::Map<String, Value>, key: &str, value: &Option<String>) {
+    if let Some(value) = value.as_deref().and_then(non_empty) {
+        map.insert(key.to_string(), json!(value));
+    }
+}
+
 fn room_view(state: &AppState, message: &Value) -> Value {
     let external_room_id = message
         .get("roomid")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let room_type = if external_room_id.ends_with("@chatroom") {
-        "group"
-    } else {
-        "direct"
-    };
+    room_view_from_target(
+        state,
+        &external_room_id,
+        None,
+        external_room_id.ends_with("@chatroom"),
+    )
+}
+
+fn room_view_from_target(
+    state: &AppState,
+    external_room_id: &str,
+    display_name: Option<&str>,
+    is_group: bool,
+) -> Value {
+    let room_type = if is_group { "group" } else { "direct" };
     json!({
-        "id": stable_positive_id(&external_room_id),
+        "id": stable_positive_id(external_room_id),
         "tenant_id": state.tenant_id,
         "channel": "wechat",
         "provider_account_id": state.provider_account_id,
         "external_room_id": external_room_id,
         "room_type": room_type,
-        "display_name": external_room_id,
+        "display_name": display_name.unwrap_or(external_room_id),
         "outbound_target": external_room_id,
     })
 }
@@ -391,6 +491,17 @@ fn sender_name(message: &Value) -> String {
     sender_id(message)
 }
 
+fn provider_actor_id(state: &AppState) -> i64 {
+    stable_positive_id(&format!(
+        "{PROVIDER_ACTOR_ID_SEED}:{}",
+        state.provider_account_id
+    ))
+}
+
+fn now_rfc3339() -> String {
+    DateTime::<Utc>::from(SystemTime::now()).to_rfc3339()
+}
+
 fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -440,6 +551,10 @@ mod tests {
         let request = SendMessageRequest {
             context_token: Some(token),
             room: RoomInput::default(),
+            external_message_id: None,
+            sender_id: None,
+            sender_name: None,
+            message_time: None,
             message_type: Some("text".to_string()),
             body: json!({ "text": "hello" }),
         };
@@ -460,5 +575,56 @@ mod tests {
 
         assert_eq!(message_body(&message), json!({ "text": "hello" }));
         assert_eq!(message_time(&message), "2026-06-17T13:35:56+00:00");
+    }
+
+    #[test]
+    fn send_task_view_uses_ilink_task_shape() {
+        let state = test_state();
+        let request = SendMessageRequest {
+            context_token: None,
+            room: RoomInput {
+                external_room_id: Some("alice".to_string()),
+                outbound_target: None,
+            },
+            external_message_id: None,
+            sender_id: None,
+            sender_name: None,
+            message_time: None,
+            message_type: Some("text".to_string()),
+            body: json!({ "text": "hello" }),
+        };
+        let receipt = crate::ui_sender::SendReceipt {
+            accepted: true,
+            client_msg_id: "client-1".to_string(),
+            target: crate::ui_sender::SendTargetView {
+                id: "alice".to_string(),
+                query: "Alice".to_string(),
+                is_group: false,
+            },
+        };
+
+        let task = send_task_view(&state, &request, &receipt);
+
+        assert_eq!(task.id, stable_positive_id("client-1"));
+        assert_eq!(task.room_id, stable_positive_id("alice"));
+        assert_eq!(task.task_type, "send_message");
+        assert_eq!(task.status, "acked");
+        assert_eq!(
+            task.payload,
+            json!({ "message_type": "text", "body": { "text": "hello" } })
+        );
+        assert!(task.acked_at.is_some());
+    }
+
+    fn test_state() -> AppState {
+        let wechat = WechatState::new(std::env::temp_dir().join("webox-ilink-test"));
+        AppState {
+            api_token: "token".to_string(),
+            tenant_id: "default".to_string(),
+            provider_account_id: "wx".to_string(),
+            sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
+            qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            wechat,
+        }
     }
 }

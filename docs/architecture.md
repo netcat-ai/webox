@@ -111,13 +111,14 @@ iLink sendmessage
   -> search/open conversation
   -> paste content
   -> click/send
-  -> return accepted or execution result according to iLink contract
+  -> return iLink task view with status=acked
 ```
 
 初版发送策略：
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
 - 优先使用 `context_token` 中的 room target；没有 token 时接受显式 `room.outbound_target` 或 `room.external_room_id`。
+- 不暴露 UI sender receipt；同步执行结果投影成 `send_message` task。
 - 文本优先；图片和文件在文本链路跑通后接入。
 - 群聊目标必须使用可唯一定位的备注或会话名，否则拒绝发送。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
@@ -144,6 +145,7 @@ weagent
 
 ## 当前硬缺口
 
-- 标准 iLink 的准确字段和 ack 语义。
+- 真实第三方 iLink 客户端兼容性验证。
+- 如果第三方客户端要求服务端持久 ack 状态，需要补最小 ack 状态；当前只支持 `after_id` 拉取和无状态 ack 回显。
 - Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
 - 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `after_id` 投影是否覆盖同秒多消息边界。

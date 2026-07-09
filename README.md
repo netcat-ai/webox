@@ -43,7 +43,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 `/ilink/getupdates` 使用 `after_id` + `limit`，响应只返回 `updates`。每个收到的微信消息会被投影为
 `message.received` update，payload 中包含 `room`、`message` 和可直接用于回复的 `context_token`。
 `/ilink/sendmessage` 支持 `context_token`，也支持显式传 `room.outbound_target` 或 `room.external_room_id`。
-登录二维码通过 iLink login 相关接口暴露。
+发送请求通过 UI 自动化同步执行，响应返回 iLink `task` 视图；成功时 `task_type=send_message`、
+`status=acked`。登录二维码通过 iLink login 相关接口暴露。
 
 `/ilink/login/qrcode/latest` 返回最新捕获的登录二维码投影：
 

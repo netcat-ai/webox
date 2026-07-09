@@ -19,10 +19,6 @@ impl ApiError {
     pub fn bad_request(value: impl Into<String>) -> Self {
         Self::BadRequest(value.into())
     }
-
-    pub fn internal(value: impl Into<String>) -> Self {
-        Self::Internal(value.into())
-    }
 }
 
 impl IntoResponse for ApiError {
