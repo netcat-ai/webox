@@ -22,6 +22,13 @@ docker compose up -d --build
 
 ```bash
 docker build --target runtime-base -t webox:runtime-base-check .
+WEBOX_PREFLIGHT_SKIP_WECHAT_DEB=1 scripts/preflight-container.sh
+```
+
+完整构建前检查当前 Docker 架构需要的内置 WeChat deb 和运行时依赖：
+
+```bash
+scripts/preflight-container.sh
 ```
 
 验证 agentgateway MITM 能把 HTTPS 请求/响应 body 写入 JSON access log：
