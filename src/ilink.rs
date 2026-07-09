@@ -394,8 +394,7 @@ fn decode_typing_ticket(ticket: &str) -> anyhow::Result<TypingTicket> {
 
 fn standard_message_view(state: &AppState, message: &Value) -> Value {
     let room = room_view(state, message);
-    let body = message_body(message);
-    let text = text_body(&body).unwrap_or_else(|| body.to_string());
+    let text = message_display_text(message);
     let created_time_ms = message_time_millis(message);
     let external_id = external_message_id(message);
     json!({
@@ -522,6 +521,39 @@ fn message_body(message: &Value) -> Value {
         .unwrap_or_else(|| json!({ "raw": message }))
 }
 
+fn message_display_text(message: &Value) -> String {
+    let msg_type = message_type(message);
+    let body = message_body(message);
+    if let Some(text) = text_body(&body) {
+        return text;
+    }
+    if let Some(text) = typed_body_text(message, &msg_type) {
+        return text;
+    }
+    match msg_type.as_str() {
+        "image" => "[图片]".to_string(),
+        "voice" => "[语音]".to_string(),
+        "video" => "[视频]".to_string(),
+        "emotion" => "[表情]".to_string(),
+        "location" => "[位置]".to_string(),
+        "voip" => "[通话]".to_string(),
+        "system" => "[系统消息]".to_string(),
+        "revoke" => "[撤回了一条消息]".to_string(),
+        "link" => link_display_text(message),
+        "sphfeed" => sphfeed_display_text(message),
+        "unknown" => "[消息]".to_string(),
+        _ => format!("[{msg_type}]"),
+    }
+}
+
+fn typed_body_text(message: &Value, msg_type: &str) -> Option<String> {
+    message
+        .get(msg_type)
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_str)
+        .and_then(non_empty)
+}
+
 fn text_body(body: &Value) -> Option<String> {
     match body {
         Value::String(value) => non_empty(value),
@@ -535,6 +567,57 @@ fn text_body(body: &Value) -> Option<String> {
                     .and_then(non_empty)
             }),
         _ => None,
+    }
+}
+
+fn link_display_text(message: &Value) -> String {
+    let Some(link) = message.get("link").and_then(Value::as_object) else {
+        return "[链接]".to_string();
+    };
+    let title = link
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    let description = link
+        .get("description")
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    let url = link
+        .get("link_url")
+        .or_else(|| link.get("url"))
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    display_join(
+        "[链接]",
+        [title.as_deref(), description.as_deref(), url.as_deref()],
+    )
+}
+
+fn sphfeed_display_text(message: &Value) -> String {
+    let Some(feed) = message.get("sphfeed").and_then(Value::as_object) else {
+        return "[视频号]".to_string();
+    };
+    let name = feed
+        .get("sph_name")
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    let desc = feed
+        .get("feed_desc")
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    let url = feed.get("url").and_then(Value::as_str).and_then(non_empty);
+    display_join(
+        "[视频号]",
+        [name.as_deref(), desc.as_deref(), url.as_deref()],
+    )
+}
+
+fn display_join<const N: usize>(fallback: &str, parts: [Option<&str>; N]) -> String {
+    let values = parts.into_iter().flatten().collect::<Vec<_>>();
+    if values.is_empty() {
+        fallback.to_string()
+    } else {
+        format!("{} {}", fallback, values.join("\n"))
     }
 }
 
@@ -661,6 +744,53 @@ mod tests {
         assert_eq!(view["create_time"], 1781703356_i64);
         assert_eq!(view["text"], "hello");
         assert_eq!(view["item_list"][0]["text_item"]["text"], "hello");
+    }
+
+    #[test]
+    fn maps_non_text_wechat_message_to_readable_ilink_text() {
+        let state = test_state();
+        let message = json!({
+            "msgid": "m2",
+            "from": "wxid_a",
+            "roomid": "alice",
+            "msgtime": 1781703356000_i64,
+            "msgtype": "image",
+            "image": { "content": "[图片]" },
+        });
+
+        let view = standard_message_view(&state, &message);
+
+        assert_eq!(view["text"], "[图片]");
+        assert_eq!(view["item_list"][0]["text_item"]["text"], "[图片]");
+        assert_eq!(view["wechat_msgtype"], "image");
+    }
+
+    #[test]
+    fn maps_link_wechat_message_to_readable_ilink_text() {
+        let state = test_state();
+        let message = json!({
+            "msgid": "m3",
+            "from": "wxid_a",
+            "roomid": "alice",
+            "msgtime": 1781703356000_i64,
+            "msgtype": "link",
+            "link": {
+                "title": "Protocol",
+                "description": "iLink docs",
+                "link_url": "https://www.wechatbot.dev/zh/protocol"
+            },
+        });
+
+        let view = standard_message_view(&state, &message);
+
+        assert_eq!(
+            view["text"],
+            "[链接] Protocol\niLink docs\nhttps://www.wechatbot.dev/zh/protocol"
+        );
+        assert_eq!(
+            view["item_list"][0]["text_item"]["text"],
+            "[链接] Protocol\niLink docs\nhttps://www.wechatbot.dev/zh/protocol"
+        );
     }
 
     fn test_state() -> AppState {
