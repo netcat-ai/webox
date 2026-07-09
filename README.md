@@ -45,6 +45,23 @@ APT_DEBIAN_SECURITY_MIRROR=
 `/ilink/sendmessage` 支持 `context_token`，也支持显式传 `room.outbound_target` 或 `room.external_room_id`。
 登录二维码通过 iLink login 相关接口暴露。
 
+`/ilink/login/qrcode/latest` 返回最新捕获的登录二维码投影：
+
+```json
+{
+  "found": true,
+  "qrcode": {
+    "type": "wechat.login_qrcode",
+    "status": "captured",
+    "login_url": "https://login.weixin.qq.com/...",
+    "image_data_uri": "data:image/png;base64,..."
+  },
+  "event": {}
+}
+```
+
+其中 `qrcode` 是给第三方 agent 消费的稳定字段，`event` 是 agentgateway 原始捕获事件，仅用于诊断。
+
 ## 核心边界
 
 - `weagent` 对外只提供标准 iLink 协议和健康检查。

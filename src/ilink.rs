@@ -216,7 +216,12 @@ pub async fn latest_qrcode(
         .latest()
         .await
         .map_err(|err| ApiError::Upstream(err.to_string()))?;
-    Ok(Json(json!({ "found": event.is_some(), "event": event })))
+    let qrcode = event.as_ref().map(|event| event.to_login_qrcode());
+    Ok(Json(json!({
+        "found": qrcode.is_some(),
+        "qrcode": qrcode,
+        "event": event,
+    })))
 }
 
 pub async fn qrcode_events(
@@ -230,7 +235,11 @@ pub async fn qrcode_events(
         .recent(query.limit.unwrap_or(50))
         .await
         .map_err(|err| ApiError::Upstream(err.to_string()))?;
-    Ok(Json(json!({ "events": events })))
+    let qrcodes = events
+        .iter()
+        .map(|event| event.to_login_qrcode())
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "qrcodes": qrcodes, "events": events })))
 }
 
 pub async fn not_found() -> impl IntoResponse {

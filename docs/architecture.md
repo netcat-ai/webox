@@ -81,6 +81,7 @@ WeChat login request/response
 - `agentgateway` admin API 默认只监听容器内 `127.0.0.1:15000`。
 - `weagent` 只调用 `/api/logs/search` 和 `/api/logs/get`，不直接读取 agentgateway SQLite。
 - 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`。
+- iLink login 接口主响应是 `qrcode` 投影；`event` 保留 agentgateway 原始捕获字段，仅用于诊断。
 - `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
 
 ### 收消息
