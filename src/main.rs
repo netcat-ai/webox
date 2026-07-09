@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod ilink;
+mod media_store;
 mod qr_source;
 mod ui_sender;
 #[allow(dead_code)]
@@ -9,10 +10,12 @@ mod wechat_state;
 
 use crate::config::Config;
 use crate::ilink::AppState;
+use crate::media_store::{MediaStore, MAX_MEDIA_UPLOAD_BYTES};
 use crate::qr_source::QrSource;
 use crate::ui_sender::UiSender;
 use crate::wechat_state::WechatState;
 use anyhow::Context;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
@@ -48,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
             config.qr_match_terms.clone(),
         )
         .with_log_path(config.agentgateway_log_path.clone()),
+        media_store: MediaStore::new(config.media_dir.clone()),
         wechat,
     });
 
@@ -77,6 +81,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/sendtyping", post(ilink::send_typing))
         .route("/msg/notifystart", post(ilink::notify_start))
         .route("/msg/notifystop", post(ilink::notify_stop))
+        .route("/getuploadurl", post(ilink::get_upload_url))
+        .route(
+            "/c2c/upload",
+            post(ilink::cdn_upload).layer(DefaultBodyLimit::max(MAX_MEDIA_UPLOAD_BYTES)),
+        )
+        .route("/c2c/download", get(ilink::cdn_download))
         .route(
             "/ilink/bot/get_bot_qrcode",
             get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
@@ -91,6 +101,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ilink/bot/sendtyping", post(ilink::send_typing))
         .route("/ilink/bot/msg/notifystart", post(ilink::notify_start))
         .route("/ilink/bot/msg/notifystop", post(ilink::notify_stop))
+        .route("/ilink/bot/getuploadurl", post(ilink::get_upload_url))
         .fallback(ilink::not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -325,6 +336,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_getuploadurl_returns_local_upload_url() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getuploadurl")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(upload_url_body(16)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ret"], 0);
+        assert!(body["upload_param"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(body["upload_full_url"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("http://127.0.0.1:8080/c2c/upload?")));
+    }
+
+    #[tokio::test]
+    async fn local_cdn_upload_and_download_round_trips_encrypted_bytes() {
+        let app = build_router(test_state());
+        let getupload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/getuploadurl")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(upload_url_body(16)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(getupload.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let upload_param = body["upload_param"].as_str().unwrap();
+        let encrypted = vec![9_u8; 16];
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/c2c/upload?encrypted_query_param={upload_param}&filekey=filekey123"
+                    ))
+                    .body(Body::from(encrypted.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        let download_param = upload
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let download = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/c2c/download?encrypted_query_param={download_param}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(download.into_body(), usize::MAX).await.unwrap(),
+            encrypted
+        );
+    }
+
+    #[tokio::test]
     async fn standard_lifecycle_notifications_accept_bearer_token() {
         let app = build_router(test_state());
         for path in ["/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop"] {
@@ -368,6 +468,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    fn upload_url_body(filesize: u64) -> String {
+        format!(
+            r#"{{
+                "filekey":"filekey123",
+                "media_type":1,
+                "to_user_id":"alice",
+                "rawsize":11,
+                "rawfilemd5":"5eb63bbbe01eeed093cb22bb8f5acdc3",
+                "filesize":{filesize},
+                "no_need_thumb":true,
+                "aeskey":"11111111111111111111111111111111",
+                "base_info":{{"channel_version":"2.0.0"}}
+            }}"#
+        )
+    }
+
     fn test_state() -> Arc<AppState> {
         let state_dir = std::env::temp_dir().join(format!("webox-router-{}", uuid::Uuid::new_v4()));
         test_state_with_dir(
@@ -388,6 +504,9 @@ mod tests {
             public_base_url,
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            media_store: MediaStore::new(
+                std::env::temp_dir().join(format!("webox-router-media-{}", uuid::Uuid::new_v4())),
+            ),
             wechat,
         })
     }

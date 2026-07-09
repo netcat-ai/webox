@@ -48,9 +48,12 @@ APT_DEBIAN_SECURITY_MIRROR=
 - `POST /ilink/bot/sendtyping`
 - `POST /ilink/bot/msg/notifystart`
 - `POST /ilink/bot/msg/notifystop`
+- `POST /ilink/bot/getuploadurl`
+- `POST /c2c/upload`
+- `GET /c2c/download`
 
 根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`、
-`/getconfig`、`/sendtyping`、`/msg/notifystart`、`/msg/notifystop`。
+`/getconfig`、`/sendtyping`、`/msg/notifystart`、`/msg/notifystop`、`/getuploadurl`。
 这是为了兼容把 `baseurl` 当服务根地址后再拼相对路径的 iLink 客户端。
 
 `/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码：
@@ -102,9 +105,26 @@ APT_DEBIAN_SECURITY_MIRROR=
 所以这里应配置服务根地址，例如 `https://webox.example.com`。如果不设置，默认从请求 `Host` 派生
 `http://host`。为兼容旧配置，末尾的 `/ilink/bot` 会被自动去掉。
 
+媒体相关路径：
+
+- `WEBOX_MEDIA_STORE_DIR`：本地 CDN shim 保存待上传 metadata 和加密媒体，默认 `/webox/state/weagent/media`。
+- `WEBOX_MEDIA_TRANSFER_DIR`：发送前解密出的临时文件目录，默认 `/webox/state/weagent/transfer`。
+
 `/ilink/bot/getconfig` 和 `/ilink/bot/sendtyping` 用于兼容 iLink SDK 的输入状态流程。当前实现生成无状态
 `typing_ticket`，`sendtyping` 校验 ticket 后返回 `ret=0`；它暂不驱动 Linux WeChat 显示真实输入状态。
 `/ilink/bot/msg/notifystart` 和 `/ilink/bot/msg/notifystop` 接收标准 SDK 启停通知，当前返回 `ret=0`。
+
+媒体发送走标准 iLink 上传链路：
+
+1. 客户端调用 `/ilink/bot/getuploadurl`，传 `filekey`、`media_type`、`rawsize`、`rawfilemd5`、`filesize`、`aeskey`。
+2. `weagent` 返回 `upload_param` 和本地 `upload_full_url`。
+3. 客户端把 AES-128-ECB + PKCS7 加密后的媒体字节上传到 `upload_full_url`。
+4. `weagent` 在响应头返回 `x-encrypted-param`。
+5. 客户端把 `media.encrypt_query_param` 和 `media.aes_key` 放进 `/ilink/bot/sendmessage`。
+
+`/c2c/download` 会按 `encrypt_query_param` 原样返回加密字节；`sendmessage` 会解密并校验 `rawfilemd5` 后通过
+Linux WeChat 文件选择器发送图片、视频、语音或文件。Node.js SDK 可直接使用 `upload_full_url`；其他 SDK 如果只拼固定
+CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL。
 
 ## 核心边界
 

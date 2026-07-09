@@ -12,6 +12,7 @@ pub struct Config {
     pub agentgateway_log_path: Option<PathBuf>,
     pub qr_match_terms: Vec<String>,
     pub state_dir: PathBuf,
+    pub media_dir: PathBuf,
 }
 
 impl Config {
@@ -39,6 +40,9 @@ impl Config {
             state_dir: env::var("WEBOX_WEAGENT_STATE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/webox/state/weagent")),
+            media_dir: env::var("WEBOX_MEDIA_STORE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/webox/state/weagent/media")),
         }
     }
 }

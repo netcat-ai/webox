@@ -1,9 +1,11 @@
 use crate::error::ApiError;
+use crate::media_store::{GetUploadUrlRequest, MediaKind, MediaStore, PlainMedia};
 use crate::qr_source::{LoginQrCode, QrSource};
 use crate::ui_sender::UiSender;
 use crate::wechat_state::{message_update_id, LoginStatusKind, WechatState};
+use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -24,6 +26,7 @@ pub struct AppState {
     pub wechat: WechatState,
     pub sender: Arc<tokio::sync::Mutex<UiSender>>,
     pub qr_source: QrSource,
+    pub media_store: MediaStore,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +83,17 @@ pub struct SendTypingRequest {
 pub struct LifecycleRequest {
     #[serde(default)]
     pub base_info: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CdnUploadQuery {
+    pub encrypted_query_param: String,
+    pub filekey: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CdnDownloadQuery {
+    pub encrypted_query_param: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,18 +239,37 @@ pub async fn send_message(
     let _base_info = request.base_info.as_ref();
     let target = outbound_target(&request.msg)?
         .ok_or_else(|| ApiError::bad_request("msg.context_token or msg.to_user_id is required"))?;
-    let text = outbound_text(&request.msg)
-        .ok_or_else(|| ApiError::bad_request("msg.text or text item is required"))?;
-    let receipt = state
-        .sender
-        .lock()
-        .await
-        .send_text(target, text)
-        .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let text = outbound_text(&request.msg);
+    let media_items = outbound_media_items(&state.media_store, &request.msg)?;
+    if text.is_none() && media_items.is_empty() {
+        return Err(ApiError::bad_request(
+            "msg.text, text item, or media item is required",
+        ));
+    }
+    let mut client_msg_id = None;
+    if let Some(text) = text {
+        let receipt = state
+            .sender
+            .lock()
+            .await
+            .send_text(target.clone(), text)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        client_msg_id = Some(receipt.client_msg_id);
+    }
+    for media in media_items {
+        let receipt = state
+            .sender
+            .lock()
+            .await
+            .send_file(target.clone(), media.filename, media.data)
+            .await
+            .map_err(|err| ApiError::Internal(err.to_string()))?;
+        client_msg_id = Some(receipt.client_msg_id);
+    }
     Ok(Json(json!({
         "ret": 0,
-        "client_msg_id": receipt.client_msg_id,
+        "client_msg_id": client_msg_id.unwrap_or_default(),
     })))
 }
 
@@ -318,6 +351,61 @@ pub async fn notify_stop(
     authenticate(&state, &headers)?;
     let _base_info = request.base_info.as_ref();
     Ok(Json(json!({ "ret": 0 })))
+}
+
+pub async fn get_upload_url(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<GetUploadUrlRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authenticate(&state, &headers)?;
+    let _base_info = request.base_info.as_ref();
+    let upload = state
+        .media_store
+        .prepare_upload(&request)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let baseurl = ilink_base_url(&state, &headers);
+    Ok(Json(json!({
+        "ret": 0,
+        "upload_param": upload.upload_param,
+        "upload_full_url": format!(
+            "{}/c2c/upload?encrypted_query_param={}&filekey={}",
+            baseurl, upload.upload_param, upload.filekey
+        ),
+    })))
+}
+
+pub async fn cdn_upload(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CdnUploadQuery>,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let stored = state
+        .media_store
+        .store_upload(&query.encrypted_query_param, &query.filekey, &body)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-encrypted-param",
+        HeaderValue::from_str(&stored.token).map_err(|err| ApiError::Internal(err.to_string()))?,
+    );
+    Ok((headers, Json(json!({ "ret": 0 }))))
+}
+
+pub async fn cdn_download(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<CdnDownloadQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (_meta, data) = state
+        .media_store
+        .read_encrypted(&query.encrypted_query_param)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok((headers, data))
 }
 
 pub async fn not_found() -> impl IntoResponse {
@@ -470,6 +558,76 @@ fn outbound_text(message: &OutboundMessage) -> Option<String> {
             .iter()
             .find_map(|item| item_text(item).and_then(|value| non_empty(&value)))
     })
+}
+
+fn outbound_media_items(
+    media_store: &MediaStore,
+    message: &OutboundMessage,
+) -> Result<Vec<PlainMedia>, ApiError> {
+    let mut out = Vec::new();
+    for item in &message.item_list {
+        if let Some(media) = item_media(item, "image_item", "aeskey")? {
+            out.push(
+                media_store
+                    .read_plain_media(&media, MediaKind::Image, None)
+                    .map_err(|err| ApiError::bad_request(format!("invalid image media: {err}")))?,
+            );
+        }
+        if let Some(media) = item_media(item, "voice_item", "aeskey")? {
+            out.push(
+                media_store
+                    .read_plain_media(&media, MediaKind::Voice, None)
+                    .map_err(|err| ApiError::bad_request(format!("invalid voice media: {err}")))?,
+            );
+        }
+        if let Some((media, filename)) = item_file_media(item)? {
+            out.push(
+                media_store
+                    .read_plain_media(&media, MediaKind::File, filename.as_deref())
+                    .map_err(|err| ApiError::bad_request(format!("invalid file media: {err}")))?,
+            );
+        }
+        if let Some(media) = item_media(item, "video_item", "aeskey")? {
+            out.push(
+                media_store
+                    .read_plain_media(&media, MediaKind::Video, None)
+                    .map_err(|err| ApiError::bad_request(format!("invalid video media: {err}")))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn item_media(item: &Value, item_key: &str, key_override: &str) -> Result<Option<Value>, ApiError> {
+    let Some(body) = item.get(item_key) else {
+        return Ok(None);
+    };
+    let Some(media) = body.get("media") else {
+        return Err(ApiError::bad_request(format!(
+            "{item_key}.media is required"
+        )));
+    };
+    let mut media = media.clone();
+    if media.get("aes_key").is_none() {
+        if let Some(aeskey) = body.get(key_override) {
+            media["aes_key"] = aeskey.clone();
+        }
+    }
+    Ok(Some(media))
+}
+
+fn item_file_media(item: &Value) -> Result<Option<(Value, Option<String>)>, ApiError> {
+    let Some(body) = item.get("file_item") else {
+        return Ok(None);
+    };
+    let Some(media) = body.get("media") else {
+        return Err(ApiError::bad_request("file_item.media is required"));
+    };
+    let filename = body
+        .get("file_name")
+        .and_then(Value::as_str)
+        .and_then(non_empty);
+    Ok(Some((media.clone(), filename)))
 }
 
 fn item_text(item: &Value) -> Option<String> {
@@ -853,6 +1011,9 @@ mod tests {
             public_base_url: Some("http://127.0.0.1:8080/ilink/bot".to_string()),
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            media_store: MediaStore::new(
+                std::env::temp_dir().join(format!("webox-ilink-media-{}", uuid::Uuid::new_v4())),
+            ),
             wechat,
         }
     }
