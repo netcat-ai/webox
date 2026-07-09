@@ -16,7 +16,7 @@
    它不是业务消息通道，也不参与收发消息语义。
 
 4. `weagent` 不维护独立消息事实库。
-   消息事实源是 WeChat DB；二维码事实源是 agentgateway JSON access log；发送任务初版只需要进程内串行执行。
+   消息事实源是 WeChat DB；二维码事实源是 agentgateway 捕获结果；发送任务初版只需要进程内串行执行。
 
 5. 参考项目只提供证据，不决定架构。
    `woc-agent-rs` 参考 WeChat DB 与 UI 自动化能力；`tinyclaw/msghub` 只参考 iLink 交互形状；`aicat` 不进入核心设计。
@@ -28,9 +28,9 @@ flowchart LR
   Client["iLink client"] --> Agent["weagent"]
 
   Agent --> QRSource["qr_source"]
-  QRSource --> AGLOG["agentgateway JSON access log"]
-  QRSource -. compatible .-> AGAPI["agentgateway /api/logs/*"]
-  AGAPI --> AGDB["agentgateway request-log.sqlite"]
+  QRSource --> AGAPI["agentgateway /api/logs/*"]
+  QRSource -. fallback .-> AGLOG["agentgateway JSON access log"]
+  AGAPI -. internal .-> AGDB["agentgateway request-log.sqlite"]
 
   Agent --> DBScanner["wechat_db scanner"]
   DBScanner --> WXDB["WeChat local DB"]
@@ -55,6 +55,7 @@ flowchart LR
 - `agentgateway` 只代理 WeChat 登录相关流量并捕获请求/响应。
 - Docker entrypoint 只负责启动依赖进程：Display、agentgateway、WeChat、weagent。
 - Docker entrypoint 默认用 `proxychains4` 包住 WeChat 网络进程，避免 Linux WeChat 子进程丢掉普通代理环境变量。
+- 已验证 Linux WeChat 登录页存在“网络代理设置”UI；它暂不作为默认链路，除非能稳定自动化或预置配置，并证明覆盖登录二维码短链路。
 - Docker entrypoint 做最小进程监督，关键进程退出时让容器失败，由 Docker restart policy 重启。
 - WeChat 客户端在镜像构建期内置，容器运行期不下载或更新客户端。
 
@@ -74,7 +75,7 @@ flowchart LR
 ```text
 WeChat login request/response
   -> agentgateway MITM
-  -> agentgateway JSON access log
+  -> agentgateway /api/logs/search or JSON access log
   -> weagent qr_source
   -> iLink login QR response
 ```
@@ -83,9 +84,10 @@ WeChat login request/response
 
 - 使用官方 `agentgateway` v1.4.0-alpha.1。
 - `agentgateway` admin API 默认只监听容器内 `127.0.0.1:15000`。
-- `weagent` 默认读取 agentgateway JSON access log，不直接读取 agentgateway SQLite。
-- `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.4.0-alpha.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
-- 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
+- `weagent` 优先读取 agentgateway admin API，不直接读取 agentgateway SQLite。
+- 当前官方版本对普通 HTTPS MITM 流量不会稳定写入 `/api/logs/search`/`/api/logs/get`；这些 API 有数据时直接使用。
+- `/webox/logs/agentgateway.log` 的 JSON access log 是当前已验证可工作的降级来源。
+- 请求/响应 body 是 base64 原始字节。
 - 二维码候选必须来自微信域名里的 `getloginqrcode`/`checkloginqrcode` 等登录 CGI，或响应体包含微信登录二维码 URL；普通代理探针不能成为 iLink 二维码。
 - `GET|POST /get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
 - `POST /get_bot_qrcode` 接受部分 SDK 的 `local_token_list`，但不因此引入独立登录状态表。
@@ -180,7 +182,9 @@ weagent
 ## 当前硬缺口
 
 - 真实第三方 iLink 客户端兼容性验证。
-- agentgateway 已验证能捕获普通 HTTPS body，proxychains 已验证能把 Linux WeChat 的短链路流量导入 agentgateway；仍需确认目标 WeChat 版本的登录二维码响应是否是可被 dynamic CA 解开的标准 HTTPS，而不是微信自有二进制长/短链路。
+- agentgateway JSON access log 已验证能捕获普通 HTTPS body；admin API 对普通 HTTPS MITM 目前可能为空，需要上游支持或自定义 agentgateway 才能作为唯一来源。
+- proxychains 已验证能把 Linux WeChat 的短链路流量导入 agentgateway；仍需确认目标 WeChat 版本的登录二维码响应是否是可被 dynamic CA 解开的标准 HTTPS，而不是微信自有二进制长/短链路。
+- 微信登录页“网络代理设置”已验证存在；仍需确认它的配置存储和是否比 proxychains 更适合二维码登录链路。
 - 如果第三方客户端要求服务端持久上下文状态，需要补最小状态；当前只支持 `get_updates_buf` 拉取。
 - Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
 - 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `get_updates_buf` 投影是否覆盖同秒多消息边界。

@@ -111,13 +111,24 @@ impl QrSource {
 
     async fn search_newest(&self, limit: usize) -> Result<Vec<QrEvent>> {
         let wanted = limit.clamp(1, 100);
-        let mut out = self.search_access_log_newest(wanted)?;
+        let mut out = match self.search_api_newest(wanted).await {
+            Ok(events) => events,
+            Err(api_err) => {
+                let mut fallback = self.search_access_log_newest(wanted)?;
+                if fallback.is_empty() {
+                    return Err(api_err);
+                }
+                fallback.sort_by(|left, right| right.captured_at.cmp(&left.captured_at));
+                fallback.truncate(wanted);
+                return Ok(fallback);
+            }
+        };
         if out.len() >= wanted {
             out.truncate(wanted);
             return Ok(out);
         }
-        let api_events = self.search_api_newest(wanted - out.len()).await?;
-        for event in api_events {
+        let access_log_events = self.search_access_log_newest(wanted - out.len())?;
+        for event in access_log_events {
             if !out.iter().any(|existing| existing.id == event.id) {
                 out.push(event);
             }
@@ -148,12 +159,19 @@ impl QrSource {
 
         let mut out = Vec::with_capacity(wanted);
         for entry in response.logs {
-            let Some(candidate) = self.entry_to_event(&entry) else {
-                continue;
-            };
-            let event = match self.get_log(&entry.id).await {
-                Ok(Some(full)) => self.entry_to_event(&full).unwrap_or(candidate),
-                Ok(None) | Err(_) => candidate,
+            let event = if let Some(candidate) = self.entry_to_event(&entry) {
+                match self.get_log(&entry.id).await {
+                    Ok(Some(full)) => self.entry_to_event(&full).unwrap_or(candidate),
+                    Ok(None) | Err(_) => candidate,
+                }
+            } else {
+                let Some(full) = self.get_log(&entry.id).await.ok().flatten() else {
+                    continue;
+                };
+                let Some(event) = self.entry_to_event(&full) else {
+                    continue;
+                };
+                event
             };
             out.push(event);
             if out.len() >= wanted {
@@ -694,8 +712,111 @@ fn build_url(host: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use serde_json::json;
     use std::fs;
+
+    #[tokio::test]
+    async fn latest_prefers_agentgateway_api_over_access_log_fallback() {
+        let access_log_path =
+            std::env::temp_dir().join(format!("webox-qr-access-{}.log", uuid::Uuid::new_v4()));
+        write_qr_access_log(&access_log_path, "access-log", "access");
+
+        let app = Router::new()
+            .route("/api/logs/search", post(search_logs_fixture))
+            .route("/api/logs/get", post(get_log_fixture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let source = QrSource::new(format!("http://{addr}"), vec!["qrcode".into()])
+            .with_log_path(Some(access_log_path.clone()));
+        let event = source.latest().await.unwrap().expect("qr event");
+
+        assert_eq!(event.id, "api-log");
+        assert_eq!(
+            event.response_text.as_deref(),
+            Some("{\"qr\":\"https://login.weixin.qq.com/l/api\"}")
+        );
+        let _ = fs::remove_file(access_log_path);
+    }
+
+    #[tokio::test]
+    async fn latest_falls_back_to_access_log_when_api_is_unavailable() {
+        let access_log_path = std::env::temp_dir().join(format!(
+            "webox-qr-access-fallback-{}.log",
+            uuid::Uuid::new_v4()
+        ));
+        write_qr_access_log(&access_log_path, "access-log", "access");
+
+        let source = QrSource::new("http://127.0.0.1:9".to_string(), vec!["qrcode".into()])
+            .with_log_path(Some(access_log_path.clone()));
+        let event = source.latest().await.unwrap().expect("qr event");
+
+        assert_eq!(event.id, "access-log");
+        assert_eq!(
+            event.response_text.as_deref(),
+            Some("{\"qr\":\"https://login.weixin.qq.com/l/access\"}")
+        );
+        let _ = fs::remove_file(access_log_path);
+    }
+
+    fn write_qr_access_log(path: &Path, id: &str, code: &str) {
+        fs::write(
+            path,
+            json!({
+                "scope": "request",
+                "time": "2026-07-09T00:00:00Z",
+                "id": id,
+                "http.method": "POST",
+                "http.host": "login.weixin.qq.com",
+                "http.path": "/cgi-bin/micromsg-bin/getloginqrcode",
+                "response.body": format!("{{\"qr\":\"https://login.weixin.qq.com/l/{code}\"}}")
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+    }
+
+    async fn search_logs_fixture() -> Json<Value> {
+        Json(json!({
+            "logs": [api_log_fixture()],
+            "nextCursor": null
+        }))
+    }
+
+    async fn get_log_fixture() -> Json<Value> {
+        Json(json!({
+            "log": api_log_fixture()
+        }))
+    }
+
+    fn api_log_fixture() -> Value {
+        json!({
+            "id": "api-log",
+            "startedAt": "2026-07-09T00:00:00Z",
+            "completedAt": "2026-07-09T00:00:01Z",
+            "durationMs": 1000,
+            "traceId": null,
+            "spanId": null,
+            "httpStatus": 200,
+            "error": null,
+            "genAi": {},
+            "usage": {},
+            "cost": null,
+            "hasPayload": false,
+            "attributes": {
+                "http.method": "POST",
+                "http.host": "login.weixin.qq.com",
+                "http.path": "/cgi-bin/micromsg-bin/getloginqrcode",
+                "response.body": "{\"qr\":\"https://login.weixin.qq.com/l/api\"}"
+            }
+        })
+    }
 
     #[test]
     fn event_matches_flat_agentgateway_attributes() {
