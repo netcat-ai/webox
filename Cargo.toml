@@ -1,0 +1,27 @@
+[package]
+name = "webox"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "weagent"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc"] }
+md5 = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
