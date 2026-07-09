@@ -47,18 +47,15 @@ check_runtime_base() {
 
   docker run --rm "$runtime_image" bash -lc '
     set -euo pipefail
-    test -x /usr/local/bin/agentgateway
     test -x /webox/weagent/bin/weagent
     test -x /webox/weagent/bin/entrypoint.sh
     test -x /webox/weagent/bin/wechat-ctl.sh
     test -x /webox/weagent/bin/webox-identity.sh
-    test -f /webox/weagent/share/agentgateway/config.example.yaml
-    for cmd in Xvfb openbox xdotool xclip certutil gosu tini curl openssl; do
+    for cmd in Xvfb openbox xdotool xclip gosu tini curl; do
       command -v "$cmd" >/dev/null
     done
     ldconfig -p | grep -q "libpulse\\.so\\.0"
     ldconfig -p | grep -q "libpulse-simple\\.so\\.0"
-    agentgateway --version >/dev/null
   '
   echo "[preflight] runtime-base image has required process and UI dependencies: $runtime_image"
 }

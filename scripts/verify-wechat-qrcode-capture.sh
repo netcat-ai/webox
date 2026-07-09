@@ -25,13 +25,12 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$tmp_dir/agentgateway" "$tmp_dir/state" "$tmp_dir/logs"
+mkdir -p "$tmp_dir/state" "$tmp_dir/logs"
 
 docker run -d \
   --name "$container" \
   -p "127.0.0.1:${port}:8080" \
   -e RUST_LOG="${RUST_LOG:-webox=debug,tower_http=info}" \
-  -v "$tmp_dir/agentgateway:/webox/agentgateway" \
   -v "$tmp_dir/state:/webox/state" \
   -v "$tmp_dir/logs:/webox/logs" \
   "$image" >/dev/null
@@ -47,24 +46,27 @@ done
 if [ "$ready" != "1" ]; then
   echo "[verify-wechat-qrcode] weagent did not become ready" >&2
   tail -n 120 "$tmp_dir/logs/weagent.log" 2>/dev/null || true
-  tail -n 120 "$tmp_dir/logs/agentgateway.log" 2>/dev/null || true
   exit 3
 fi
 
 deadline=$((SECONDS + timeout_seconds))
 last_response=""
+qrcode_id=""
 while [ "$SECONDS" -lt "$deadline" ]; do
   last_response="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/get_bot_qrcode?bot_type=3" || true)"
-  if printf '%s' "$last_response" | grep -q '"qrcode":"[^"]'; then
+  if printf '%s' "$last_response" | grep -q '"qrcode":"xvfb-qr-[^"]*"' \
+    && printf '%s' "$last_response" | grep -q '"qrcode_img_content":"data:image/png;base64,'; then
     qrcode_id="$(printf '%s' "$last_response" | sed -n 's/.*"qrcode":"\([^"]*\)".*/\1/p')"
     printf '{"qrcode":"%s","qrcode_img_content":"<omitted>"}\n' "$qrcode_id"
-    echo "[verify-wechat-qrcode] captured login qrcode"
+    echo "[verify-wechat-qrcode] decoded and cropped login qrcode"
     exit 0
   fi
   sleep 2
 done
 
-echo "[verify-wechat-qrcode] qrcode was not captured within ${timeout_seconds}s" >&2
+echo "[verify-wechat-qrcode] verification timed out after ${timeout_seconds}s" >&2
+echo "[verify-wechat-qrcode] qrcode id: ${qrcode_id:-<missing>}" >&2
 echo "[verify-wechat-qrcode] last response: ${last_response:-<empty>}" >&2
-grep -n "getloginqrcode\\|checkloginqrcode\\|response.body\\|failed to terminate TLS" "$tmp_dir/logs/agentgateway.log" 2>/dev/null | tail -n 80 >&2 || true
+tail -n 120 "$tmp_dir/logs/weagent.log" 2>/dev/null || true
+tail -n 120 "$tmp_dir/logs/wechat.log" 2>/dev/null || true
 exit 4

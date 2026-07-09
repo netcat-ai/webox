@@ -32,18 +32,6 @@ APT_DEBIAN_MIRROR=http://mirrors.aliyun.com/debian
 APT_DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ```
 
-agentgateway release 下载源也可以替换：
-
-```dotenv
-AGENTGATEWAY_RELEASE_URL_BASE=https://github.com/agentgateway/agentgateway/releases/download
-```
-
-如果 GitHub Release 不稳定，把它指向自建缓存或代理，路径规则保持为：
-
-```text
-${AGENTGATEWAY_RELEASE_URL_BASE}/${AGENTGATEWAY_VERSION}/agentgateway-linux-${arch}
-```
-
 先验证镜像是否可用：
 
 ```bash

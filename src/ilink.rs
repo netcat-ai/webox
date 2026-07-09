@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 
-const ILINK_BASE_PATH: &str = "/ilink/bot";
 const TEXT_ITEM_TYPE: i64 = 1;
 const GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(35);
 const GET_UPDATES_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -156,7 +155,7 @@ pub async fn get_bot_qrcode(
             None
         }
     };
-    let qrcode = event.map(|event| event.to_login_qrcode());
+    let qrcode = event;
     Ok(Json(json!({
         "qrcode": qrcode.as_ref().map(|value| value.id.as_str()).unwrap_or_default(),
         "qrcode_img_content": qrcode.as_ref().and_then(qrcode_content).unwrap_or_default(),
@@ -457,12 +456,9 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
 }
 
 fn qrcode_content(qrcode: &LoginQrCode) -> Option<String> {
-    qrcode
-        .image_data_uri
-        .as_ref()
-        .or(qrcode.login_url.as_ref())
-        .or(Some(&qrcode.source_url))
-        .and_then(|value| non_empty(value))
+    non_empty(&qrcode.image_data_uri)
+        .or_else(|| qrcode.login_url.as_deref().and_then(non_empty))
+        .or_else(|| non_empty(&qrcode.source_url))
 }
 
 fn ilink_base_url(state: &AppState, headers: &HeaderMap) -> String {
@@ -477,12 +473,7 @@ fn ilink_base_url(state: &AppState, headers: &HeaderMap) -> String {
 }
 
 fn normalize_base_url(value: &str) -> String {
-    let value = value.trim().trim_end_matches('/');
-    value
-        .strip_suffix(ILINK_BASE_PATH)
-        .unwrap_or(value)
-        .trim_end_matches('/')
-        .to_string()
+    value.trim().trim_end_matches('/').to_string()
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -944,18 +935,14 @@ mod tests {
     }
 
     #[test]
-    fn baseurl_normalization_returns_service_root() {
-        assert_eq!(
-            normalize_base_url("https://public.example/ilink/bot/"),
-            "https://public.example"
-        );
-        assert_eq!(
-            normalize_base_url("https://public.example/proxy/ilink/bot"),
-            "https://public.example/proxy"
-        );
+    fn baseurl_normalization_preserves_reverse_proxy_prefix() {
         assert_eq!(
             normalize_base_url("https://public.example"),
             "https://public.example"
+        );
+        assert_eq!(
+            normalize_base_url("https://public.example/webox/"),
+            "https://public.example/webox"
         );
     }
 
@@ -1035,9 +1022,9 @@ mod tests {
             api_token: "token".to_string(),
             tenant_id: "default".to_string(),
             provider_account_id: "wx".to_string(),
-            public_base_url: Some("http://127.0.0.1:8080/ilink/bot".to_string()),
+            public_base_url: Some("http://127.0.0.1:8080".to_string()),
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
-            qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            qr_source: QrSource::new(None),
             media_store: MediaStore::new(
                 std::env::temp_dir().join(format!("webox-ilink-media-{}", uuid::Uuid::new_v4())),
             ),

@@ -15,6 +15,7 @@ base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc"] }
 md5 = "0.7"
 png = "0.17"
+quircs = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,4 +29,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"
 
 [dev-dependencies]
+qrcode = { version = "0.14", default-features = false }
 tower = { version = "0.5", features = ["util"] }

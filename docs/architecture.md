@@ -12,13 +12,10 @@
 2. WeChat Linux 客户端是真实终端。
    发消息通过 UI 自动化驱动客户端；收消息从 WeChat 本地 DB 解密读取。
 
-3. agentgateway 只负责登录二维码 MITM 捕获。
-   它不是业务消息通道，也不参与收发消息语义。
+3. `weagent` 不维护独立消息事实库。
+   消息事实源是 WeChat DB；二维码图像事实源是 WeChat 登录窗口；发送任务初版只需要进程内串行执行。
 
-4. `weagent` 不维护独立消息事实库。
-   消息事实源是 WeChat DB；二维码事实源是 agentgateway 捕获结果；发送任务初版只需要进程内串行执行。
-
-5. 参考项目只提供证据，不决定架构。
+4. 参考项目只提供证据，不决定架构。
    `woc-agent-rs` 参考 WeChat DB 与 UI 自动化能力；`tinyclaw/msghub` 只参考 iLink 交互形状；`aicat` 不进入核心设计。
 
 ## 目标态组件
@@ -28,10 +25,7 @@ flowchart LR
   Client["iLink client"] --> Agent["weagent"]
 
   Agent --> QRSource["qr_source"]
-  QRSource --> AGAPI["agentgateway /api/logs/*"]
-  QRSource -. fallback .-> AGLOG["agentgateway JSON access log"]
-  QRSource -. display fallback .-> Display
-  AGAPI -. internal .-> AGDB["agentgateway request-log.sqlite"]
+  QRSource --> Display
 
   Agent --> DBScanner["wechat_db scanner"]
   DBScanner --> WXDB["WeChat local DB"]
@@ -42,23 +36,17 @@ flowchart LR
   UISender --> Display["Xvfb + window manager"]
   Display --> WeChat["Linux WeChat"]
 
-  WeChat --> AGW["agentgateway MITM"]
-  AGW --> WXNet["WeChat upstream"]
-  AGW --> AGDB
+  WeChat --> WXNet["WeChat upstream"]
 ```
 
 ## 运行边界
 
 - `weagent` 暴露 iLink HTTP API。
-- `weagent` 查询 agentgateway capture 数据，返回登录二维码。
-- 当 agentgateway 没有可解码二维码时，`weagent` 可以把 Xvfb 登录页截图作为 iLink 二维码展示降级。
+- `weagent` 从 Xvfb framebuffer 定位、解码并裁剪 WeChat 登录二维码。
 - `weagent` 解密并轮询 WeChat 本地 DB，把消息投影成 iLink updates。
 - `weagent` 接收 iLink 发送请求，文本直接串行调用 UI sender，媒体先走本地 CDN shim 上传和解密。
-- `agentgateway` 只代理 WeChat 登录相关流量并捕获请求/响应。
-- agentgateway CONNECT 路由按 aicat 模式拆分：明确主机进入 dynamic CA MITM，其他 CONNECT 走动态转发隧道。
-- Docker entrypoint 只负责启动依赖进程：Display、agentgateway、WeChat、weagent。
-- Docker entrypoint 默认用 `proxychains4` 包住 WeChat 网络进程，避免 Linux WeChat 子进程丢掉普通代理环境变量。
-- 已验证 Linux WeChat 登录页存在“网络代理设置”UI；它暂不作为默认链路，除非能稳定自动化或预置配置，并证明覆盖登录二维码短链路。
+- Docker entrypoint 只负责启动 Display、WeChat 和 weagent。
+- WeChat 直接连接上游，不安装 CA、不修改客户端二进制、不注入代理。
 - Docker entrypoint 做最小进程监督，关键进程退出时让容器失败，由 Docker restart policy 重启。
 - WeChat 客户端在镜像构建期内置，容器运行期不下载或更新客户端。
 
@@ -66,8 +54,7 @@ flowchart LR
 
 - 不保留 WOC `/agent/init`、`/agent/poll`、`/agent/send` 作为对外 API。
 - 不复制 msghub 的 actor/room/message/task 数据库。
-- 不把 agentgateway 捕获内容二次写入 weagent 自己的数据库。
-- 不从 agentgateway 流量解析普通聊天消息。
+- 不从 WeChat 网络流量解析登录或聊天消息。
 - 不把本地媒体上传缓存扩展成通用对象存储或消息附件库。
 - 不引入控制面、租户系统、通用消息中台或 AI runner。
 
@@ -76,32 +63,19 @@ flowchart LR
 ### 登录二维码
 
 ```text
-WeChat login request/response
-  -> agentgateway MITM
-  -> agentgateway /api/logs/search or JSON access log
-  -> optional Xvfb login-screen screenshot fallback
-  -> weagent qr_source
+WeChat login window
+  -> Xvfb framebuffer
+  -> weagent detects, decodes and crops QR
   -> iLink login QR response
 ```
 
-查询边界：
-
-- 使用官方 `agentgateway` v1.4.0-alpha.1。
-- `agentgateway` admin API 默认只监听容器内 `127.0.0.1:15000`。
-- `weagent` 优先读取 agentgateway admin API，不直接读取 agentgateway SQLite。
-- 当前官方版本对普通 HTTPS MITM 流量不会稳定写入 `/api/logs/search`/`/api/logs/get`；这些 API 有数据时直接使用。
-- `/webox/logs/agentgateway.log` 的 JSON access log 是当前已验证可工作的降级来源。
-- 请求/响应 body 是 base64 原始字节。
-- 二维码候选必须来自微信域名里的 `getloginqrcode`/`checkloginqrcode` 等登录 CGI，或响应体包含微信登录二维码 URL；普通代理探针不能成为 iLink 二维码。
-- 最后降级可以读取 `WEBOX_QR_SCREENSHOT_PATH` 的 Xvfb framebuffer；只有检测到微信登录页二维码蓝色块时才返回屏幕 PNG。
-- 截图降级只保证 iLink 登录展示可用，不代表 MITM request/response 捕获已经完成。
-- `GET|POST /get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
-- `POST /get_bot_qrcode` 接受部分 SDK 的 `local_token_list`，但不因此引入独立登录状态表。
+- `WEBOX_QR_SCREENSHOT_PATH` 指向 Xvfb framebuffer。只有同时检测到 WeChat 蓝色二维码并由 QR 解码器识别成功时才返回裁剪后的 PNG。
+- `GET /get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
 - `GET /get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。
 - 状态只从本机 WeChat 推导；`binded_redirect`、`need_verifycode` 等远端 iLink 状态不做伪造。
 - `confirmed.baseurl` 返回服务根地址，客户端按标准协议拼根路径端点。
-- `/ilink/bot/*` 只作为兼容旧 SDK 或旧逆向资料的别名。
-- `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
+- 只暴露标准根路径端点，不保留 `/ilink/bot/*` 或项目早期的自定义 API。
+- `weagent` 不保存二维码历史；二维码变化直接反映当前 WeChat 登录窗口。
 
 ### 收消息
 
@@ -168,12 +142,13 @@ iLink getuploadurl
 
 ```text
 weagent
+  config       environment configuration
   ilink        HTTP wire protocol and response mapping
-  qr_source    query agentgateway capture source
+  qr_source    decode and crop QR from Xvfb framebuffer
+  wechat_state derive login state and coordinate DB access
   wechat_db    decrypt and poll WeChat local DB
   media_store  local iLink CDN upload/download shim
   ui_sender    xdotool/xclip based send executor
-  runtime      startup checks, background loops, graceful shutdown
 ```
 
 ## 实施顺序
@@ -182,16 +157,13 @@ weagent
 2. 用 Rust 实现 iLink HTTP 外壳，只暴露标准 iLink 和健康检查。
 3. 把 WeChat DB scanner 的消息投影成 iLink `msgs`。
 4. 把 iLink send 请求接到 UI sender。
-5. 接入 agentgateway capture 查询登录二维码。
-6. 整理 Dockerfile 和 entrypoint，保证内置 WeChat、权限、Display、代理和 CA 顺序正确。
+5. 从 Xvfb framebuffer 解码并裁剪登录二维码。
+6. 整理 Dockerfile 和 entrypoint，保证内置 WeChat、权限和 Display 启动顺序正确。
 
 ## 当前硬缺口
 
 - 真实第三方 iLink 客户端兼容性验证。
-- agentgateway JSON access log 已验证能捕获普通 HTTPS body；admin API 对普通 HTTPS MITM 目前可能为空，需要上游支持或自定义 agentgateway 才能作为唯一来源。
-- proxychains 已验证能把 Linux WeChat 流量导入 agentgateway；不加范围地把所有 CONNECT 送入 dynamic CA 会打断微信登录网络。当前按 aicat 模式只对明确主机做 MITM，兜底 CONNECT 直通。
-- Xvfb 登录页截图降级可让 iLink 先拿到可展示二维码；仍需继续解决 agentgateway 抓取微信二维码 request/response 的主目标。
-- 微信登录页“网络代理设置”已验证存在；仍需确认它的配置存储和是否比 proxychains 更适合二维码登录链路。
+- Xvfb 二维码定位、解码与裁剪已完成单元测试和真实容器回归。
 - 如果第三方客户端要求服务端持久上下文状态，需要补最小状态；当前只支持 `get_updates_buf` 拉取。
 - Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
 - 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `get_updates_buf` 投影是否覆盖同秒多消息边界。

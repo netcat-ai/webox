@@ -1,17 +1,14 @@
 # webox
 
-单容器运行 Linux 微信、虚拟 Display、`agentgateway` MITM 网关和 `weagent`。
+单容器运行 Linux 微信、虚拟 Display 和 Rust `weagent`，把真实客户端投影成标准 iLink 接口。
 
 ## 启动
 
 ```bash
 cp .env.example .env
-mkdir -p data/agentgateway data/state data/logs
+mkdir -p data/state data/logs
 docker compose up -d --build
 ```
-
-如果 `data/agentgateway/config.yaml` 不存在，entrypoint 会自动复制镜像内置的默认配置。已经验证过的
-自定义配置仍然可以挂载到这个路径覆盖默认值。
 
 构建镜像前需要把微信 Linux deb 放到 `docker/wechat/`：
 
@@ -21,7 +18,7 @@ docker compose up -d --build
 从微信官方 Linux 页面下载：https://linux.weixin.qq.com/ 。镜像构建会把 deb 内置进去；容器启动后不会动态下载或更新微信。
 本地 deb 已被 `.gitignore` 忽略，不提交到仓库。
 
-缺少 WeChat deb 时，可以先验证 Rust、运行时依赖和 agentgateway 安装：
+缺少 WeChat deb 时，可以先验证 Rust 和运行时依赖：
 
 ```bash
 docker build --target runtime-base -t webox:runtime-base-check .
@@ -34,21 +31,7 @@ WEBOX_PREFLIGHT_SKIP_WECHAT_DEB=1 scripts/preflight-container.sh
 scripts/preflight-container.sh
 ```
 
-验证 agentgateway MITM 能捕获 HTTPS 请求/响应 body：
-
-```bash
-scripts/verify-agentgateway-capture.sh
-```
-
-这个脚本用当前默认 agentgateway 配置代理一个测试 HTTPS 请求，并检查 JSON access log 里的
-`request.body`、`response.body`。脚本也会探测 `/api/logs/search`、`/api/logs/get`，但当前官方
-`agentgateway` v1.4.0-alpha.1 对普通 HTTPS MITM 流量不会稳定写入 admin API 日志；需要强制验证 API 时设置：
-
-```bash
-WEBOX_VERIFY_REQUIRE_AGENTGATEWAY_API=1 scripts/verify-agentgateway-capture.sh
-```
-
-验证真实 Linux WeChat 启动后是否能捕获登录二维码：
+验证真实 Linux WeChat 登录二维码提取：
 
 ```bash
 docker build -t webox:local .
@@ -73,7 +56,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 协议标准以 https://www.wechatbot.dev/zh/protocol 为准。
 
 - `GET /healthz`
-- `GET|POST /get_bot_qrcode?bot_type=3`
+- `GET /get_bot_qrcode?bot_type=3`
 - `GET /get_qrcode_status?qrcode=...`
 - `POST /getupdates`
 - `POST /sendmessage`
@@ -85,20 +68,12 @@ APT_DEBIAN_SECURITY_MIRROR=
 - `POST /c2c/upload`
 - `GET /c2c/download`
 
-`/ilink/bot/*` 也暴露同义端点，只作为兼容旧版 SDK 或旧逆向资料的别名；新的对接方应使用协议文档里的根路径端点。
-
-`/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码。协议主路径是 `GET`，weagent 也接受部分 SDK
-会发出的 `POST` 和 `local_token_list`，但不把历史 token 复制成独立登录状态：
+`/get_bot_qrcode` 返回从当前 WeChat 登录窗口解码并裁剪出的二维码。weagent 只暴露协议文档定义的根路径端点，
+不保留 `/ilink/bot/*` 或项目早期的自定义 API。
 
 ```json
 {
-  "local_token_list": ["<bot_token>"]
-}
-```
-
-```json
-{
-  "qrcode": "access-log-...",
+  "qrcode": "xvfb-qr-...",
   "qrcode_img_content": "data:image/png;base64,..."
 }
 ```
@@ -143,8 +118,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 `to_user_id` 是标准 SDK 会携带的兼容字段，weagent 发送路由只信任 `context_token`，避免第三方绕开入站会话上下文直发。
 
 `WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。这里应配置服务根地址，例如
-`https://webox.example.com`。如果不设置，默认从请求 `Host` 派生 `http://host`。为兼容旧配置，末尾的
-`/ilink/bot` 会被自动去掉。
+`https://webox.example.com`。如果通过带路径前缀的反向代理暴露服务，这里应包含该前缀。如果不设置，默认从请求
+`Host` 派生 `http://host`。
 
 媒体相关路径：
 
@@ -180,7 +155,7 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 - `weagent` 对外只提供标准 iLink 协议和健康检查。
 - 收消息来自 WeChat 本地 DB 解密读取。
 - 发消息通过 UI 自动化操作 Linux WeChat 客户端。
-- 登录二维码优先来自 agentgateway 的 MITM 捕获结果；如果当前 WeChat 登录链路无法被解密，则用 Xvfb 登录页截图作为 iLink 展示降级。
+- 登录二维码图像从 Xvfb 中定位、解码并裁剪。
 - 不保留 WOC `/agent/*` API。
 - 不内置 msghub-style actor/message/task 数据库。
 - 不把 WeChat DB 的内部 cursor、scanner meta 作为 iLink 响应字段暴露。
@@ -191,17 +166,14 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 
 1. 生成持久 machine-id，并默认伪装为 deepin 23。
 2. 启动 Xvfb + openbox，并把 framebuffer 写到 `/webox/runtime/xvfb/Xvfb_screen0`。
-3. 启动 `agentgateway` v1.4.0-alpha.1，本地 admin API 默认监听 `127.0.0.1:15000`，并把它的 CA 写入系统和 NSS 信任库。
-4. 启动镜像内置的 Linux 微信。
-5. 默认用 `proxychains4` 包住 WeChat 网络进程，让登录流量经过 agentgateway。
-6. 启动 Rust `weagent`。
+3. 启动 Rust `weagent`。
+4. 启动镜像内置的 Linux 微信并直接连接上游。
 
-entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agentgateway`、`weagent` 或 WeChat
+entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`weagent` 或 WeChat
 循环任一关键进程退出时，容器退出；Compose 的 `restart: unless-stopped` 负责重启容器。
 
 容器内工作目录统一在 `/webox` 下：
 
-- `/webox/agentgateway`：agentgateway 配置、SQLite request log、CA。
 - `/webox/wechat`：镜像内置 Linux WeChat 安装目录，不挂载覆盖。
 - `/webox/weagent`：weagent 二进制和启动脚本。
 - `/webox/state`：machine-id、NSS DB、WeChat HOME 和运行状态。
@@ -209,36 +181,6 @@ entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agen
 
 Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bind mount 覆盖掉。
 
-`agentgateway` 配置默认从 `/webox/agentgateway/config.yaml` 读取；也可以用 `WEBOX_AGENTGATEWAY_CMD` 直接指定你验证过的启动命令。
-默认启动会给 `agentgateway` 单独设置 `RUST_LOG=${WEBOX_AGENTGATEWAY_RUST_LOG:-info}`，避免全局 `RUST_LOG`
-把 access log 过滤掉。
-
-默认 CONNECT 路由参考 aicat 的 agentgateway 配置：`webox-mitm-connect` 只匹配明确列出的主机，并转入
-dynamic CA HTTPS listener；`webox-dynamic-connect` 作为兜底，把其他 CONNECT 原样动态转发。当前内置配置只把
-`httpbingo.org` 放进 MITM route，用于验证普通 HTTPS request/response body 捕获。不要把所有 WeChat CONNECT
-默认送进 dynamic CA；实测这会把微信的非标准/私有链路打断，登录页会变成网络断开。
-
-默认配置仍让 `agentgateway` 自己维护 `/webox/agentgateway/request-log.sqlite`，但 `weagent` 不直接读取
-这个 SQLite。二维码捕获会先尝试 `agentgateway` admin API 的 `/api/logs/search` 和 `/api/logs/get`；
-如果当前版本没有把普通 HTTPS MITM 流量写入 API 日志，则降级读取 `/webox/logs/agentgateway.log` 的 JSON access log。
-body 字段是 base64 形式的原始字节，`weagent` 会先解码再提取登录 URL 或图片。
-二维码匹配只接受微信域名里的登录二维码 CGI/响应特征，或响应体里明确出现微信登录二维码 URL，避免把代理探针请求误报成二维码。
-
-如果 agentgateway API 和 JSON access log 都没有可用登录二维码，`weagent` 会读取
-`WEBOX_QR_SCREENSHOT_PATH` 指向的 Xvfb framebuffer。只有检测到类似微信登录页二维码的蓝色像素块时，才把当前屏幕编码成
-`data:image/png;base64,...` 返回给 `qrcode_img_content`。这是让 iLink 登录流程可用的降级，不等同于完成 MITM
-request/response 捕获。
-
-`agentgateway` 启动时工作目录是配置文件所在目录。默认挂载到 `/webox/agentgateway/config.yaml` 时，
-YAML 里的 `sqlite://request-log.sqlite`、`certificates/webox-ca.pem` 都解析到 `/webox/agentgateway`
-下面。
-
-`WEBOX_WECHAT_PROXY_MODE` 支持：
-
-- `proxychains`：默认值。包住主 `wechat` 和 `RadiumWMPF/runtime/WeChatAppEx`，因为 Linux WeChat 会在子进程里丢掉普通代理环境变量。
-- `env`：只注入 `HTTP_PROXY`/`HTTPS_PROXY` 等环境变量，用于对比验证。
-- `none`：不代理 WeChat 流量。
-
-实测 Linux WeChat 登录页有齿轮入口，进入后是“网络代理设置”，包含“使用代理”开关和保存按钮。这个 UI
-设置暂不作为默认链路：它需要可重复自动化或可预置配置文件，并且仍要验证是否覆盖登录二维码的短链路流量。默认链路继续使用
-`proxychains` 强制代理进程网络，但 agentgateway 只对明确配置的 CONNECT 主机做 MITM，其余 CONNECT 直通。
+`weagent` 从 `WEBOX_QR_SCREENSHOT_PATH` 指向的 Xvfb framebuffer 读取登录窗口。它先检测 WeChat 蓝色二维码，
+再用 QR 解码器确认、提取登录 URL并按二维码边界裁剪，只把裁剪后的 `data:image/png;base64,...` 返回给
+`qrcode_img_content`。WeChat 直接联网，不安装额外 CA，也不修改客户端网络进程。

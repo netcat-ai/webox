@@ -7,8 +7,6 @@ services:
         DEBIAN_RUNTIME_IMAGE: ${DEBIAN_RUNTIME_IMAGE:-debian:bookworm}
         APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-}
         APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-}
-        AGENTGATEWAY_VERSION: ${AGENTGATEWAY_VERSION:-v1.4.0-alpha.1}
-        AGENTGATEWAY_RELEASE_URL_BASE: ${AGENTGATEWAY_RELEASE_URL_BASE:-https://github.com/agentgateway/agentgateway/releases/download}
     image: webox:local
     container_name: webox
     environment:
@@ -24,15 +22,7 @@ services:
       - WEBOX_MEDIA_STORE_DIR=${WEBOX_MEDIA_STORE_DIR:-/webox/state/weagent/media}
       - WEBOX_MEDIA_TRANSFER_DIR=${WEBOX_MEDIA_TRANSFER_DIR:-/webox/state/weagent/transfer}
       - WEBOX_QR_SCREENSHOT_PATH=${WEBOX_QR_SCREENSHOT_PATH:-/webox/runtime/xvfb/Xvfb_screen0}
-      - WEBOX_AGENTGATEWAY_ENABLED=${WEBOX_AGENTGATEWAY_ENABLED:-1}
-      - WEBOX_AGENTGATEWAY_PORT=${WEBOX_AGENTGATEWAY_PORT:-18080}
-      - WEBOX_AGENTGATEWAY_ADMIN_PORT=${WEBOX_AGENTGATEWAY_ADMIN_PORT:-15000}
-      - WEBOX_AGENTGATEWAY_API_BASE=${WEBOX_AGENTGATEWAY_API_BASE:-http://127.0.0.1:15000}
-      - WEBOX_AGENTGATEWAY_CONFIG=${WEBOX_AGENTGATEWAY_CONFIG:-/webox/agentgateway/config.yaml}
-      - WEBOX_AGENTGATEWAY_CA_PATH=${WEBOX_AGENTGATEWAY_CA_PATH:-}
-      - WEBOX_WECHAT_PROXY_URL=${WEBOX_WECHAT_PROXY_URL:-http://127.0.0.1:18080}
     volumes:
-      - ./data/agentgateway:/webox/agentgateway
       - ./data/state:/webox/state
       - ./data/logs:/webox/logs
     ports:

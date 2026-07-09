@@ -46,12 +46,7 @@ async fn main() -> anyhow::Result<()> {
         provider_account_id: config.provider_account_id.clone(),
         public_base_url: config.public_base_url.clone(),
         sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
-        qr_source: QrSource::new(
-            config.agentgateway_api_base.clone(),
-            config.qr_match_terms.clone(),
-        )
-        .with_log_path(config.agentgateway_log_path.clone())
-        .with_screenshot_path(config.qr_screenshot_path.clone()),
+        qr_source: QrSource::new(config.qr_screenshot_path.clone()),
         media_store: MediaStore::new(config.media_dir.clone()),
         wechat,
     });
@@ -71,10 +66,7 @@ async fn main() -> anyhow::Result<()> {
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(ilink::health))
-        .route(
-            "/get_bot_qrcode",
-            get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
-        )
+        .route("/get_bot_qrcode", get(ilink::get_bot_qrcode))
         .route("/get_qrcode_status", get(ilink::get_qrcode_status))
         .route("/getupdates", post(ilink::get_updates))
         .route("/sendmessage", post(ilink::send_message))
@@ -88,21 +80,6 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(ilink::cdn_upload).layer(DefaultBodyLimit::max(MAX_MEDIA_UPLOAD_BYTES)),
         )
         .route("/c2c/download", get(ilink::cdn_download))
-        .route(
-            "/ilink/bot/get_bot_qrcode",
-            get(ilink::get_bot_qrcode).post(ilink::get_bot_qrcode),
-        )
-        .route(
-            "/ilink/bot/get_qrcode_status",
-            get(ilink::get_qrcode_status),
-        )
-        .route("/ilink/bot/getupdates", post(ilink::get_updates))
-        .route("/ilink/bot/sendmessage", post(ilink::send_message))
-        .route("/ilink/bot/getconfig", post(ilink::get_config))
-        .route("/ilink/bot/sendtyping", post(ilink::send_typing))
-        .route("/ilink/bot/msg/notifystart", post(ilink::notify_start))
-        .route("/ilink/bot/msg/notifystop", post(ilink::notify_stop))
-        .route("/ilink/bot/getuploadurl", post(ilink::get_upload_url))
         .fallback(ilink::not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -180,7 +157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_ilink_bot_login_qrcode_route_remains_compatible() {
+    async fn legacy_ilink_bot_routes_are_not_exposed() {
         let app = build_router(test_state());
         let response = app
             .oneshot(
@@ -192,17 +169,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn standard_login_qrcode_accepts_sdk_post_body() {
+    async fn standard_login_qrcode_rejects_post() {
         let app = build_router(test_state());
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/get_bot_qrcode?bot_type=3")
+                    .uri("/get_bot_qrcode?bot_type=3")
                     .header("iLink-App-Id", "bot")
                     .header("iLink-App-ClientVersion", "131072")
                     .header("content-type", "application/json")
@@ -212,12 +189,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert_eq!(body["qrcode"], "");
-        assert_eq!(body["qrcode_img_content"], "");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
@@ -226,7 +198,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ilink/bot/get_qrcode_status?qrcode=qrc_test")
+                    .uri("/get_qrcode_status?qrcode=qrc_test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -265,13 +237,13 @@ mod tests {
         .unwrap();
         let app = build_router(test_state_with_dir(
             state_dir.clone(),
-            Some("https://public.example/ilink/bot".to_string()),
+            Some("https://public.example".to_string()),
         ));
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ilink/bot/get_qrcode_status?qrcode=qrc_test")
+                    .uri("/get_qrcode_status?qrcode=qrc_test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -295,7 +267,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getupdates")
+                    .uri("/getupdates")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("content-type", "application/json")
@@ -315,7 +287,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getupdates")
+                    .uri("/getupdates")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"get_updates_buf":""}"#))
@@ -341,7 +313,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getupdates")
+                    .uri("/getupdates")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("authorization", "Bearer token")
                     .header("content-type", "application/json")
@@ -368,7 +340,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getconfig")
+                    .uri("/getconfig")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("authorization", "Bearer token")
@@ -399,7 +371,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getconfig")
+                    .uri("/getconfig")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("authorization", "Bearer token")
@@ -418,7 +390,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/sendtyping")
+                    .uri("/sendtyping")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("authorization", "Bearer token")
@@ -445,7 +417,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getuploadurl")
+                    .uri("/getuploadurl")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("authorization", "Bearer token")
@@ -477,7 +449,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/ilink/bot/getuploadurl")
+                    .uri("/getuploadurl")
                     .header("AuthorizationType", "ilink_bot_token")
                     .header("X-WECHAT-UIN", "default")
                     .header("authorization", "Bearer token")
@@ -534,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn standard_lifecycle_notifications_accept_bearer_token() {
         let app = build_router(test_state());
-        for path in ["/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop"] {
+        for path in ["/msg/notifystart", "/msg/notifystop"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -595,10 +567,7 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         let state_dir = std::env::temp_dir().join(format!("webox-router-{}", uuid::Uuid::new_v4()));
-        test_state_with_dir(
-            state_dir,
-            Some("http://127.0.0.1:8080/ilink/bot".to_string()),
-        )
+        test_state_with_dir(state_dir, Some("http://127.0.0.1:8080".to_string()))
     }
 
     fn test_state_with_dir(
@@ -612,7 +581,7 @@ mod tests {
             provider_account_id: "wx".to_string(),
             public_base_url,
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
-            qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            qr_source: QrSource::new(None),
             media_store: MediaStore::new(
                 std::env::temp_dir().join(format!("webox-router-media-{}", uuid::Uuid::new_v4())),
             ),
