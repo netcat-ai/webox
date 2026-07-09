@@ -214,25 +214,30 @@ impl QrSource {
         let response_body = attr_string(attributes, "response.body");
         let request_payload = request_body.as_deref().map(body_payload_from_attribute);
         let response_payload = response_body.as_deref().map(body_payload_from_attribute);
+        let request_text = request_payload
+            .as_ref()
+            .and_then(|body| body.text.as_deref())
+            .or(request_body.as_deref())
+            .unwrap_or_default();
+        let response_text = response_payload
+            .as_ref()
+            .and_then(|body| body.text.as_deref())
+            .or(response_body.as_deref())
+            .unwrap_or_default();
         let response_status = entry
             .http_status
             .or_else(|| attr_i64(attributes, "http.status"));
         let url = build_url(&host, &path);
+        if !is_wechat_login_qr_candidate(&host, &path, request_text, response_text) {
+            return None;
+        }
         let haystack = [
             method.as_str(),
             host.as_str(),
             path.as_str(),
             url.as_str(),
-            request_payload
-                .as_ref()
-                .and_then(|body| body.text.as_deref())
-                .or(request_body.as_deref())
-                .unwrap_or_default(),
-            response_payload
-                .as_ref()
-                .and_then(|body| body.text.as_deref())
-                .or(response_body.as_deref())
-                .unwrap_or_default(),
+            request_text,
+            response_text,
         ]
         .join("\n")
         .to_ascii_lowercase();
@@ -483,6 +488,52 @@ fn printable_text(body: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn is_wechat_login_qr_candidate(
+    host: &str,
+    path: &str,
+    request_text: &str,
+    response_text: &str,
+) -> bool {
+    if contains_wechat_login_url(request_text) || contains_wechat_login_url(response_text) {
+        return true;
+    }
+    if !is_wechat_host(host) {
+        return false;
+    }
+    let value = [path, request_text, response_text]
+        .join("\n")
+        .to_ascii_lowercase();
+    [
+        "getloginqrcode",
+        "checkloginqrcode",
+        "loginqrcode",
+        "qrcode",
+        "qr_code",
+        "qrlogin",
+        "uuid",
+    ]
+    .iter()
+    .any(|term| value.contains(term))
+}
+
+fn contains_wechat_login_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("login.weixin.qq.com/l/") || lower.contains("weixin.qq.com/x/")
+}
+
+fn is_wechat_host(host: &str) -> bool {
+    let lower = host
+        .split(':')
+        .next()
+        .unwrap_or(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    lower == "weixin.qq.com"
+        || lower.ends_with(".weixin.qq.com")
+        || lower == "wechat.com"
+        || lower.ends_with(".wechat.com")
+}
+
 fn login_url_from_text(body: &str) -> Option<String> {
     let urls = urls_in_text(body);
     urls.iter()
@@ -687,6 +738,25 @@ mod tests {
         let event = source.entry_to_event(&entry).expect("qr event");
         assert_eq!(event.response_status, None);
         assert_eq!(event.matched_by, vec!["uuid"]);
+    }
+
+    #[test]
+    fn probe_qrcode_request_without_wechat_signal_is_ignored() {
+        let source = QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]);
+        let entry = LogEntry {
+            id: "log-probe".to_string(),
+            completed_at: "2026-07-09T00:00:00Z".to_string(),
+            http_status: Some(200),
+            attributes: Some(json!({
+                "http.method": "POST",
+                "http.host": "httpbingo.org",
+                "http.path": "/anything/proxychains-qrcode",
+                "request.body": "{\"probe\":\"qrcode\"}",
+                "response.body": "{\"url\":\"https://httpbingo.org/anything/proxychains-qrcode\"}"
+            })),
+        };
+
+        assert!(source.entry_to_event(&entry).is_none());
     }
 
     #[test]

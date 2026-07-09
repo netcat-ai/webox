@@ -163,7 +163,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ilink/bot/get_bot_qrcode?bot_type=3")
+                    .uri("/get_bot_qrcode?bot_type=3")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -176,6 +176,22 @@ mod tests {
                 .unwrap();
         assert_eq!(body["qrcode"], "");
         assert_eq!(body["qrcode_img_content"], "");
+    }
+
+    #[tokio::test]
+    async fn legacy_ilink_bot_login_qrcode_route_remains_compatible() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ilink/bot/get_bot_qrcode?bot_type=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

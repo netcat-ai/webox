@@ -35,7 +35,7 @@ impl Config {
                 "/webox/logs/agentgateway.log",
             )),
             qr_match_terms: parse_terms(&env::var("WEBOX_QR_MATCH_TERMS").unwrap_or_else(|_| {
-                "getloginqrcode,loginqrcode,qrcode,qr_code,qrlogin,uuid,login".to_string()
+                "getloginqrcode,checkloginqrcode,loginqrcode,login.weixin.qq.com/l/,weixin.qq.com/x/,qrcode,qr_code,qrlogin,uuid".to_string()
             })),
             state_dir: env::var("WEBOX_WEAGENT_STATE_DIR")
                 .map(PathBuf::from)

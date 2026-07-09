@@ -43,6 +43,13 @@ scripts/verify-agentgateway-capture.sh
 这个脚本用当前默认 agentgateway 配置代理一个测试 HTTPS 请求，并检查 `request.body`、`response.body`。
 它验证的是 `weagent` 默认使用的 JSON access log 路径；`/api/logs/search` 在 v1.4.0-alpha.1 下可能仍返回空数组。
 
+验证真实 Linux WeChat 启动后是否能捕获登录二维码：
+
+```bash
+docker build -t webox:local .
+scripts/verify-wechat-qrcode-capture.sh
+```
+
 服务默认暴露在 `http://127.0.0.1:38080`。
 
 默认 Compose 配置使用官方 base image 和 Debian apt 源，依赖 Docker daemon 的全局代理：
@@ -61,24 +68,22 @@ APT_DEBIAN_SECURITY_MIRROR=
 协议标准以 https://www.wechatbot.dev/zh/protocol 为准。
 
 - `GET /healthz`
-- `GET|POST /ilink/bot/get_bot_qrcode?bot_type=3`
-- `GET /ilink/bot/get_qrcode_status?qrcode=...`
-- `POST /ilink/bot/getupdates`
-- `POST /ilink/bot/sendmessage`
-- `POST /ilink/bot/getconfig`
-- `POST /ilink/bot/sendtyping`
-- `POST /ilink/bot/msg/notifystart`
-- `POST /ilink/bot/msg/notifystop`
-- `POST /ilink/bot/getuploadurl`
+- `GET|POST /get_bot_qrcode?bot_type=3`
+- `GET /get_qrcode_status?qrcode=...`
+- `POST /getupdates`
+- `POST /sendmessage`
+- `POST /getconfig`
+- `POST /sendtyping`
+- `POST /msg/notifystart`
+- `POST /msg/notifystop`
+- `POST /getuploadurl`
 - `POST /c2c/upload`
 - `GET /c2c/download`
 
-根路径也暴露同义标准端点：`/get_bot_qrcode`、`/get_qrcode_status`、`/getupdates`、`/sendmessage`、
-`/getconfig`、`/sendtyping`、`/msg/notifystart`、`/msg/notifystop`、`/getuploadurl`。
-这是为了兼容把 `baseurl` 当服务根地址后再拼相对路径的 iLink 客户端。
+`/ilink/bot/*` 也暴露同义端点，只作为兼容旧版 SDK 或旧逆向资料的别名；新的对接方应使用协议文档里的根路径端点。
 
-`/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码。标准 SDK 会用 `POST` 并传
-`local_token_list`，weagent 当前只接受该请求形态，不把历史 token 复制成独立登录状态：
+`/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码。协议主路径是 `GET`，weagent 也接受部分 SDK
+会发出的 `POST` 和 `local_token_list`，但不把历史 token 复制成独立登录状态：
 
 ```json
 {
@@ -93,7 +98,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
-`/ilink/bot/get_qrcode_status` 轮询本地 WeChat 登录状态。扫码后会主动尝试提取 DB key；能读取消息时返回
+`/get_qrcode_status` 轮询本地 WeChat 登录状态。扫码后会主动尝试提取 DB key；能读取消息时返回
 `confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`。当前只从本机 WeChat 状态推导
 `wait`、`scaned`、`confirmed`，不伪造 `binded_redirect`、`need_verifycode` 这类远端 iLink 状态：
 
@@ -107,7 +112,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
-`/ilink/bot/getupdates` 使用标准 `get_updates_buf` 不透明游标：
+`/getupdates` 使用标准 `get_updates_buf` 不透明游标：
 
 ```json
 {
@@ -117,7 +122,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 ```
 
 响应会按 iLink 语义长轮询最多 35 秒，包含 `ret`、`msgs` 和新的 `get_updates_buf`。每条消息包含 `context_token`，回复时必须原样放进
-`/ilink/bot/sendmessage` 的 `msg.context_token`。
+`/sendmessage` 的 `msg.context_token`。
 
 ```json
 {
@@ -132,9 +137,9 @@ APT_DEBIAN_SECURITY_MIRROR=
 
 `to_user_id` 是标准 SDK 会携带的兼容字段，weagent 发送路由只信任 `context_token`，避免第三方绕开入站会话上下文直发。
 
-`WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。标准 iLink SDK 会自己拼 `/ilink/bot/...`，
-所以这里应配置服务根地址，例如 `https://webox.example.com`。如果不设置，默认从请求 `Host` 派生
-`http://host`。为兼容旧配置，末尾的 `/ilink/bot` 会被自动去掉。
+`WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。这里应配置服务根地址，例如
+`https://webox.example.com`。如果不设置，默认从请求 `Host` 派生 `http://host`。为兼容旧配置，末尾的
+`/ilink/bot` 会被自动去掉。
 
 媒体相关路径：
 
@@ -149,17 +154,17 @@ X-WECHAT-UIN: <base64(String(random_uint32))>
 - `WEBOX_MEDIA_STORE_DIR`：本地 CDN shim 保存待上传 metadata 和加密媒体，默认 `/webox/state/weagent/media`。
 - `WEBOX_MEDIA_TRANSFER_DIR`：发送前解密出的临时文件目录，默认 `/webox/state/weagent/transfer`。
 
-`/ilink/bot/getconfig` 和 `/ilink/bot/sendtyping` 用于兼容 iLink SDK 的输入状态流程。当前实现生成无状态
+`/getconfig` 和 `/sendtyping` 用于兼容 iLink SDK 的输入状态流程。当前实现生成无状态
 `typing_ticket`，`sendtyping` 校验 ticket 后返回 `ret=0`；它暂不驱动 Linux WeChat 显示真实输入状态。
-`/ilink/bot/msg/notifystart` 和 `/ilink/bot/msg/notifystop` 接收标准 SDK 启停通知，当前返回 `ret=0`。
+`/msg/notifystart` 和 `/msg/notifystop` 接收标准 SDK 启停通知，当前返回 `ret=0`。
 
 媒体发送走标准 iLink 上传链路：
 
-1. 客户端调用 `/ilink/bot/getuploadurl`，传 `filekey`、`media_type`、`rawsize`、`rawfilemd5`、`filesize`、`aeskey`。
+1. 客户端调用 `/getuploadurl`，传 `filekey`、`media_type`、`rawsize`、`rawfilemd5`、`filesize`、`aeskey`。
 2. `weagent` 返回 `upload_param` 和本地 `upload_full_url`。
 3. 客户端把 AES-128-ECB + PKCS7 加密后的媒体字节上传到 `upload_full_url`。
 4. `weagent` 在响应头返回 `x-encrypted-param`。
-5. 客户端把 `media.encrypt_query_param` 和 `media.aes_key` 放进 `/ilink/bot/sendmessage`。
+5. 客户端把 `media.encrypt_query_param` 和 `media.aes_key` 放进 `/sendmessage`。
 
 `/c2c/download` 会按 `encrypt_query_param` 原样返回加密字节；`sendmessage` 会解密并校验 `rawfilemd5` 后通过
 Linux WeChat 文件选择器发送图片、视频、语音或文件。Node.js SDK 可直接使用 `upload_full_url`；其他 SDK 如果只拼固定
@@ -183,7 +188,7 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 2. 启动 Xvfb + openbox。
 3. 启动 `agentgateway` v1.4.0-alpha.1，本地 admin API 默认监听 `127.0.0.1:15000`，并把它的 CA 写入系统和 NSS 信任库。
 4. 启动镜像内置的 Linux 微信。
-5. 只给微信进程注入代理环境变量，让登录流量经过 agentgateway。
+5. 默认用 `proxychains4` 包住 WeChat 网络进程，让登录流量经过 agentgateway。
 6. 启动 Rust `weagent`。
 
 entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agentgateway`、`weagent` 或 WeChat
@@ -208,7 +213,14 @@ Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bi
 `/webox/logs/agentgateway.log`。`agentgateway` 的 `/api/logs/search` 和 `/api/logs/get` 目前只作为兼容
 查询路径保留；实测 v1.4.0-alpha.1 普通 HTTPS MITM 请求不会进入该 API 的 log store。
 JSON access log 中的 body 字段是 base64 形式的原始字节，`weagent` 会先解码再提取登录 URL 或图片。
+二维码匹配只接受微信域名里的登录二维码 CGI/响应特征，或响应体里明确出现微信登录二维码 URL，避免把代理探针请求误报成二维码。
 
 `agentgateway` 启动时工作目录是配置文件所在目录。默认挂载到 `/webox/agentgateway/config.yaml` 时，
 YAML 里的 `sqlite://request-log.sqlite`、`certificates/webox-ca.pem` 都解析到 `/webox/agentgateway`
 下面。
+
+`WEBOX_WECHAT_PROXY_MODE` 支持：
+
+- `proxychains`：默认值。包住主 `wechat` 和 `RadiumWMPF/runtime/WeChatAppEx`，因为 Linux WeChat 会在子进程里丢掉普通代理环境变量。
+- `env`：只注入 `HTTP_PROXY`/`HTTPS_PROXY` 等环境变量，用于对比验证。
+- `none`：不代理 WeChat 流量。

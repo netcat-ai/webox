@@ -29,7 +29,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl dbus dbus-x11 dpkg gosu locales openssl \
+      ca-certificates curl dbus dbus-x11 dpkg gosu locales openssl proxychains4 \
       openbox procps tini x11-utils xclip xdotool xsettingsd xvfb xz-utils \
       libnss3-tools \
       fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \

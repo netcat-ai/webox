@@ -12,6 +12,7 @@ export HOME="$WEBOX_HOME"
 export WECHAT_BIN="${WECHAT_BIN:-${WEBOX_ROOT}/wechat/opt/wechat/wechat}"
 export WEBOX_WEAGENT_STATE_DIR="${WEBOX_WEAGENT_STATE_DIR:-${WEBOX_STATE_DIR}/weagent}"
 export WEBOX_AGENTGATEWAY_API_BASE="${WEBOX_AGENTGATEWAY_API_BASE:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_ADMIN_PORT:-15000}}"
+export WEBOX_PROXYCHAINS_CONF="${WEBOX_PROXYCHAINS_CONF:-${WEBOX_STATE_DIR}/proxychains.conf}"
 
 mkdir -p "$WEBOX_ROOT" "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
 chown -R webox:webox "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
@@ -272,8 +273,96 @@ trust_agentgateway_ca() {
   install_nss_ca "$ca" "${HOME}/.pki/nssdb"
 }
 
+wechat_proxy_mode() {
+  if [ -n "${WEBOX_WECHAT_PROXY_MODE:-}" ]; then
+    echo "$WEBOX_WECHAT_PROXY_MODE"
+  elif [ "${WEBOX_AGENTGATEWAY_ENABLED:-1}" = "0" ]; then
+    echo "none"
+  else
+    echo "proxychains"
+  fi
+}
+
+proxychains_target_from_url() {
+  local proxy_url proxy_addr proxy_host proxy_port
+  proxy_url="${WEBOX_WECHAT_PROXY_URL:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_PORT:-18080}}"
+  proxy_addr="${proxy_url#http://}"
+  proxy_addr="${proxy_addr#https://}"
+  proxy_addr="${proxy_addr%%/*}"
+  proxy_host="${proxy_addr%:*}"
+  proxy_port="${proxy_addr##*:}"
+  if [ -z "$proxy_host" ] || [ "$proxy_host" = "$proxy_port" ]; then
+    proxy_host="${WEBOX_WECHAT_PROXY_HOST:-127.0.0.1}"
+    proxy_port="${WEBOX_AGENTGATEWAY_PORT:-18080}"
+  fi
+  printf '%s %s\n' "$proxy_host" "$proxy_port"
+}
+
+ensure_proxychains_config() {
+  if [ "$(wechat_proxy_mode)" != "proxychains" ]; then
+    return
+  fi
+  if ! command -v proxychains4 >/dev/null 2>&1; then
+    echo "[entrypoint] proxychains4 is required for WEBOX_WECHAT_PROXY_MODE=proxychains" >&2
+    exit 1
+  fi
+
+  local proxy_host proxy_port
+  read -r proxy_host proxy_port < <(proxychains_target_from_url)
+  cat > "$WEBOX_PROXYCHAINS_CONF" <<EOF
+strict_chain
+proxy_dns
+remote_dns_subnet 224
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+localnet 127.0.0.0/255.0.0.0
+
+[ProxyList]
+http ${proxy_host} ${proxy_port}
+EOF
+  chown webox:webox "$WEBOX_PROXYCHAINS_CONF"
+  chmod 0644 "$WEBOX_PROXYCHAINS_CONF"
+}
+
+wechat_app_ex_bin() {
+  echo "${WEBOX_WECHAT_APP_EX_BIN:-${WEBOX_ROOT}/wechat/opt/wechat/RadiumWMPF/runtime/WeChatAppEx}"
+}
+
+ensure_wechat_network_wrapper() {
+  if [ "$(wechat_proxy_mode)" != "proxychains" ]; then
+    return
+  fi
+
+  local app real
+  app="$(wechat_app_ex_bin)"
+  real="${app}.webox-real"
+  if [ ! -e "$app" ] && [ ! -e "$real" ]; then
+    echo "[entrypoint] WeChatAppEx binary is missing: $app" >&2
+    exit 1
+  fi
+  if [ ! -e "$real" ]; then
+    if grep -q "WEBOX_PROXYCHAINS_WRAPPER" "$app" 2>/dev/null; then
+      echo "[entrypoint] WeChatAppEx wrapper exists but real binary is missing: $real" >&2
+      exit 1
+    fi
+    mv "$app" "$real"
+  fi
+
+  cat > "$app" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# WEBOX_PROXYCHAINS_WRAPPER
+# WeChatAppEx owns network sockets and drops the parent proxy env.
+conf="\${WEBOX_PROXYCHAINS_CONF:-${WEBOX_PROXYCHAINS_CONF}}"
+export PROXYCHAINS_CONF_FILE="\${PROXYCHAINS_CONF_FILE:-\$conf}"
+exec proxychains4 -q -f "\$PROXYCHAINS_CONF_FILE" "$real" "\$@"
+EOF
+  chmod 0755 "$app"
+}
+
 start_wechat_loop() {
-  local proxy_url no_proxy
+  local mode proxy_url no_proxy
+  mode="$(wechat_proxy_mode)"
   proxy_url="${WEBOX_WECHAT_PROXY_URL:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_PORT:-18080}}"
   no_proxy="${NO_PROXY:-127.0.0.1,localhost}"
   while true; do
@@ -281,8 +370,13 @@ start_wechat_loop() {
       echo "[entrypoint] bundled wechat binary is missing: $WECHAT_BIN" >&2
       exit 1
     fi
-    echo "[entrypoint] starting wechat"
-    if [ -n "$proxy_url" ]; then
+    echo "[entrypoint] starting wechat proxy_mode=$mode"
+    if [ "$mode" = "proxychains" ]; then
+      gosu webox env \
+        WEBOX_PROXYCHAINS_CONF="$WEBOX_PROXYCHAINS_CONF" \
+        PROXYCHAINS_CONF_FILE="$WEBOX_PROXYCHAINS_CONF" \
+        dbus-run-session -- proxychains4 -q -f "$WEBOX_PROXYCHAINS_CONF" "$WECHAT_BIN" || true
+    elif [ "$mode" = "env" ] && [ -n "$proxy_url" ]; then
       gosu webox env \
         HTTP_PROXY="$proxy_url" \
         HTTPS_PROXY="$proxy_url" \
@@ -293,8 +387,11 @@ start_wechat_loop() {
         NO_PROXY="$no_proxy" \
         no_proxy="$no_proxy" \
         dbus-run-session -- "$WECHAT_BIN" || true
-    else
+    elif [ "$mode" = "none" ]; then
       gosu webox dbus-run-session -- "$WECHAT_BIN" || true
+    else
+      echo "[entrypoint] unsupported WEBOX_WECHAT_PROXY_MODE: $mode" >&2
+      exit 1
     fi
     sleep 2
   done
@@ -305,6 +402,8 @@ ensure_agentgateway_config
 ensure_agentgateway_ca
 start_agentgateway
 trust_agentgateway_ca
+ensure_proxychains_config
+ensure_wechat_network_wrapper
 start_agent
 start_wechat_loop &
 register_critical wechat "$!"
