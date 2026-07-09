@@ -436,6 +436,13 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
             "missing or invalid AuthorizationType".to_string(),
         ));
     }
+    let uin = headers
+        .get("x-wechat-uin")
+        .and_then(|value| value.to_str().ok())
+        .and_then(non_empty);
+    if uin.is_none() {
+        return Err(ApiError::Unauthorized("missing X-WECHAT-UIN".to_string()));
+    }
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

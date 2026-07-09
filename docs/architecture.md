@@ -113,7 +113,7 @@ WeChat local DB
 
 ```text
 iLink sendmessage
-  -> validate msg.context_token/msg.to_user_id and text/media payload
+  -> validate msg.context_token and text/media payload
   -> media references are decrypted from local CDN shim when present
   -> execute in-process serial send job
   -> ui_sender activates WeChat window
@@ -126,7 +126,7 @@ iLink sendmessage
 初版发送策略：
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
-- 优先使用 `msg.context_token` 中的 room target；没有 token 时接受显式 `msg.to_user_id`。
+- 只使用 `msg.context_token` 中的 room target；不接受显式 `msg.to_user_id` 直发，避免绕开 iLink 上下文。
 - 不暴露 UI sender receipt；同步执行成功返回 `ret=0`。
 - 文本、图片、视频、语音和文件都通过同一个 `sendmessage` 入口；媒体最终落到 Linux WeChat 文件选择器。
 - `getconfig`/`sendtyping` 初版只做 iLink SDK 兼容：无状态 `typing_ticket` + no-op `sendtyping`。

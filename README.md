@@ -133,6 +133,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 ```http
 AuthorizationType: ilink_bot_token
 Authorization: Bearer <bot_token>
+X-WECHAT-UIN: <ilink_user_id>
 ```
 
 - `WEBOX_MEDIA_STORE_DIR`：本地 CDN shim 保存待上传 metadata 和加密媒体，默认 `/webox/state/weagent/media`。
