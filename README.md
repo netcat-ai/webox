@@ -24,6 +24,15 @@ docker compose up -d --build
 docker build --target runtime-base -t webox:runtime-base-check .
 ```
 
+验证 agentgateway MITM 能把 HTTPS 请求/响应 body 写入 JSON access log：
+
+```bash
+scripts/verify-agentgateway-capture.sh
+```
+
+这个脚本用当前默认 agentgateway 配置代理一个测试 HTTPS 请求，并检查 `request.body`、`response.body`。
+它验证的是 `weagent` 默认使用的 JSON access log 路径；`/api/logs/search` 在 v1.3.1 下可能仍返回空数组。
+
 服务默认暴露在 `http://127.0.0.1:38080`。
 
 默认 Compose 配置使用官方 base image 和 Debian apt 源，依赖 Docker daemon 的全局代理：
