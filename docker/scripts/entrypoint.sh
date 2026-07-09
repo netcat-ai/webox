@@ -13,18 +13,6 @@ export WECHAT_BIN="${WECHAT_BIN:-${WEBOX_ROOT}/wechat/opt/wechat/wechat}"
 export WEBOX_WEAGENT_STATE_DIR="${WEBOX_WEAGENT_STATE_DIR:-${WEBOX_STATE_DIR}/weagent}"
 export WEBOX_AGENTGATEWAY_API_BASE="${WEBOX_AGENTGATEWAY_API_BASE:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_ADMIN_PORT:-15000}}"
 
-proxy_url="${WEBOX_WECHAT_PROXY_URL:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_PORT:-18080}}"
-if [ -n "$proxy_url" ]; then
-  export HTTP_PROXY="$proxy_url"
-  export HTTPS_PROXY="$proxy_url"
-  export http_proxy="$proxy_url"
-  export https_proxy="$proxy_url"
-  export ALL_PROXY="$proxy_url"
-  export all_proxy="$proxy_url"
-  export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}"
-  export no_proxy="$NO_PROXY"
-fi
-
 mkdir -p "$WEBOX_ROOT" "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
 chown -R webox:webox "$AGENTGATEWAY_DIR" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
@@ -285,13 +273,29 @@ trust_agentgateway_ca() {
 }
 
 start_wechat_loop() {
+  local proxy_url no_proxy
+  proxy_url="${WEBOX_WECHAT_PROXY_URL:-http://127.0.0.1:${WEBOX_AGENTGATEWAY_PORT:-18080}}"
+  no_proxy="${NO_PROXY:-127.0.0.1,localhost}"
   while true; do
     if [ ! -x "$WECHAT_BIN" ]; then
       echo "[entrypoint] bundled wechat binary is missing: $WECHAT_BIN" >&2
       exit 1
     fi
     echo "[entrypoint] starting wechat"
-    gosu webox dbus-run-session -- "$WECHAT_BIN" || true
+    if [ -n "$proxy_url" ]; then
+      gosu webox env \
+        HTTP_PROXY="$proxy_url" \
+        HTTPS_PROXY="$proxy_url" \
+        http_proxy="$proxy_url" \
+        https_proxy="$proxy_url" \
+        ALL_PROXY="$proxy_url" \
+        all_proxy="$proxy_url" \
+        NO_PROXY="$no_proxy" \
+        no_proxy="$no_proxy" \
+        dbus-run-session -- "$WECHAT_BIN" || true
+    else
+      gosu webox dbus-run-session -- "$WECHAT_BIN" || true
+    fi
     sleep 2
   done
 }

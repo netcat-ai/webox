@@ -51,6 +51,7 @@ flowchart LR
 - `weagent` 接收 iLink 发送请求，串行调用 UI sender 操作 WeChat 客户端。
 - `agentgateway` 只代理 WeChat 登录相关流量并捕获请求/响应。
 - Docker entrypoint 只负责启动依赖进程：Display、agentgateway、WeChat、weagent。
+- Docker entrypoint 只给 WeChat 进程注入 MITM 代理环境变量，避免 agentgateway 或 weagent 继承代理造成环路。
 - Docker entrypoint 做最小进程监督，关键进程退出时让容器失败，由 Docker restart policy 重启。
 - WeChat 客户端在镜像构建期内置，容器运行期不下载或更新客户端。
 

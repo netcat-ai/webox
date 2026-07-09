@@ -9,7 +9,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked --bin weagent && mkdir -p /out && cp target/release/weagent /out/weagent
 
-FROM ${DEBIAN_RUNTIME_IMAGE}
+FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime-base
 ARG AGENTGATEWAY_VERSION=v1.3.1
 ARG AGENTGATEWAY_RELEASE_URL_BASE=https://github.com/agentgateway/agentgateway/releases/download
 ARG APT_DEBIAN_MIRROR=
@@ -49,6 +49,13 @@ COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/install-agentgateway.sh /tmp/install-agentgateway.sh
 RUN chmod 755 /tmp/install-agentgateway.sh && AGENTGATEWAY_VERSION="${AGENTGATEWAY_VERSION}" AGENTGATEWAY_RELEASE_URL_BASE="${AGENTGATEWAY_RELEASE_URL_BASE}" /tmp/install-agentgateway.sh && rm -f /tmp/install-agentgateway.sh
 
+COPY docker/scripts/wechat-ctl.sh docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
+COPY docker/agentgateway/config.example.yaml /webox/weagent/share/agentgateway/config.example.yaml
+
+RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && chmod 644 /webox/weagent/share/agentgateway/config.example.yaml
+
+FROM runtime-base AS runtime
+
 COPY docker/wechat/ /tmp/wechat/
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
@@ -66,11 +73,6 @@ RUN set -eux; \
     dpkg-deb -f "$deb" Version > /webox/wechat/.webox-version; \
     test -x /webox/wechat/opt/wechat/wechat; \
     rm -rf /tmp/wechat
-
-COPY docker/scripts/wechat-ctl.sh docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
-COPY docker/agentgateway/config.example.yaml /webox/weagent/share/agentgateway/config.example.yaml
-
-RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && chmod 644 /webox/weagent/share/agentgateway/config.example.yaml
 
 VOLUME ["/webox/agentgateway", "/webox/state", "/webox/logs"]
 EXPOSE 8080

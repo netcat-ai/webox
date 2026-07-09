@@ -18,6 +18,12 @@ docker compose up -d --build
 - `docker/wechat/WeChatLinux_x86_64.deb`
 - `docker/wechat/WeChatLinux_arm64.deb`
 
+缺少 WeChat deb 时，可以先验证 Rust、运行时依赖和 agentgateway 安装：
+
+```bash
+docker build --target runtime-base -t webox:runtime-base-check .
+```
+
 服务默认暴露在 `http://127.0.0.1:38080`。
 
 默认 Compose 配置使用官方 base image 和 Debian apt 源，依赖 Docker daemon 的全局代理：
@@ -81,7 +87,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 2. 启动 Xvfb + openbox。
 3. 启动 `agentgateway` v1.3.1，本地 admin API 默认监听 `127.0.0.1:15000`，并把它的 CA 写入系统和 NSS 信任库。
 4. 启动镜像内置的 Linux 微信。
-5. 通过代理环境变量启动微信。
+5. 只给微信进程注入代理环境变量，让登录流量经过 agentgateway。
 6. 启动 Rust `weagent`。
 
 entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`agentgateway`、`weagent` 或 WeChat
