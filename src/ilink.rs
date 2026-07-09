@@ -134,7 +134,6 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "hasWechatKey": state.wechat.has_key(),
-        "cursor": state.wechat.current_cursor(),
     }))
 }
 

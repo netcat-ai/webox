@@ -26,3 +26,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -49,18 +49,7 @@ async fn main() -> anyhow::Result<()> {
         wechat,
     });
 
-    let app = Router::new()
-        .route("/healthz", get(ilink::health))
-        .route("/ilink/sendmessage", post(ilink::send_message))
-        .route("/ilink/getupdates", post(ilink::get_updates))
-        .route("/ilink/ack", post(ilink::ack))
-        .route("/ilink/login/qrcode/latest", get(ilink::latest_qrcode))
-        .route("/ilink/login/qrcode/events", get(ilink::qrcode_events))
-        .route("/login/qrcode/latest", get(ilink::latest_qrcode))
-        .route("/login/qrcode/events", get(ilink::qrcode_events))
-        .fallback(ilink::not_found)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = TcpListener::bind(&config.listen_addr)
         .await
@@ -72,6 +61,94 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(ilink::health))
+        .route("/ilink/sendmessage", post(ilink::send_message))
+        .route("/ilink/getupdates", post(ilink::get_updates))
+        .route("/ilink/ack", post(ilink::ack))
+        .route("/ilink/login/qrcode/latest", get(ilink::latest_qrcode))
+        .route("/ilink/login/qrcode/events", get(ilink::qrcode_events))
+        .fallback(ilink::not_found)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_does_not_expose_internal_cursor() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body.get("cursor").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_login_qrcode_routes_are_not_exposed() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/login/qrcode/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ilink_login_qrcode_route_is_exposed() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ilink/login/qrcode/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn test_state() -> Arc<AppState> {
+        let state_dir = std::env::temp_dir().join(format!("webox-router-{}", uuid::Uuid::new_v4()));
+        let wechat = WechatState::new(state_dir);
+        Arc::new(AppState {
+            api_token: "token".to_string(),
+            tenant_id: "default".to_string(),
+            provider_account_id: "wx".to_string(),
+            sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
+            qr_source: QrSource::new("http://127.0.0.1:15000".to_string(), vec!["qrcode".into()]),
+            wechat,
+        })
+    }
 }

@@ -74,16 +74,6 @@ impl WechatState {
         self.key_file.exists()
     }
 
-    pub fn current_cursor(&self) -> String {
-        let Ok((db_dir, keys)) = self.db_material() else {
-            return encode_db_cursor(&HashMap::new());
-        };
-        match wechat_db::current_session_state(db_dir, keys, self.cache_dir()) {
-            Ok(state) => encode_db_cursor(&state),
-            Err(_) => encode_db_cursor(&HashMap::new()),
-        }
-    }
-
     pub fn poll_messages_after_id(&self, after_id: i64, limit: usize) -> Result<PollResult> {
         let (db_dir, keys) = self.ensure_db_material()?;
         let limit = limit.clamp(1, MAX_POLL_LIMIT);
