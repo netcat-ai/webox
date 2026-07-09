@@ -179,6 +179,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_login_qrcode_accepts_sdk_post_body() {
+        let app = build_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ilink/bot/get_bot_qrcode?bot_type=3")
+                    .header("iLink-App-Id", "bot")
+                    .header("iLink-App-ClientVersion", "131072")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"local_token_list":["token"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["qrcode"], "");
+        assert_eq!(body["qrcode_img_content"], "");
+    }
+
+    #[tokio::test]
     async fn standard_login_status_reports_waiting_state() {
         let app = build_router(test_state());
         let response = app

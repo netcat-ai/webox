@@ -77,7 +77,14 @@ APT_DEBIAN_SECURITY_MIRROR=
 `/getconfig`、`/sendtyping`、`/msg/notifystart`、`/msg/notifystop`、`/getuploadurl`。
 这是为了兼容把 `baseurl` 当服务根地址后再拼相对路径的 iLink 客户端。
 
-`/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码：
+`/ilink/bot/get_bot_qrcode` 返回 agentgateway 捕获到的最新微信登录二维码。标准 SDK 会用 `POST` 并传
+`local_token_list`，weagent 当前只接受该请求形态，不把历史 token 复制成独立登录状态：
+
+```json
+{
+  "local_token_list": ["<bot_token>"]
+}
+```
 
 ```json
 {
@@ -87,7 +94,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 ```
 
 `/ilink/bot/get_qrcode_status` 轮询本地 WeChat 登录状态。扫码后会主动尝试提取 DB key；能读取消息时返回
-`confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`：
+`confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`。当前只从本机 WeChat 状态推导
+`wait`、`scaned`、`confirmed`，不伪造 `binded_redirect`、`need_verifycode` 这类远端 iLink 状态：
 
 ```json
 {
@@ -122,6 +130,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
+`to_user_id` 是标准 SDK 会携带的兼容字段，weagent 发送路由只信任 `context_token`，避免第三方绕开入站会话上下文直发。
+
 `WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。标准 iLink SDK 会自己拼 `/ilink/bot/...`，
 所以这里应配置服务根地址，例如 `https://webox.example.com`。如果不设置，默认从请求 `Host` 派生
 `http://host`。为兼容旧配置，末尾的 `/ilink/bot` 会被自动去掉。
@@ -133,7 +143,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 ```http
 AuthorizationType: ilink_bot_token
 Authorization: Bearer <bot_token>
-X-WECHAT-UIN: <ilink_user_id>
+X-WECHAT-UIN: <base64(String(random_uint32))>
 ```
 
 - `WEBOX_MEDIA_STORE_DIR`：本地 CDN shim 保存待上传 metadata 和加密媒体，默认 `/webox/state/weagent/media`。

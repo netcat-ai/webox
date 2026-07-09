@@ -87,7 +87,9 @@ WeChat login request/response
 - `/api/logs/search` 和 `/api/logs/get` 保留为兼容路径；实测 v1.4.0-alpha.1 普通 HTTPS MITM 请求不会写入该 API 背后的 log store。
 - 请求/响应 body 来自 log attributes 中的 `request.body` / `response.body`；JSON access log 输出的是 base64 原始字节。
 - `GET|POST /ilink/bot/get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
+- `POST /ilink/bot/get_bot_qrcode` 接受标准 SDK 的 `local_token_list`，但不因此引入独立登录状态表。
 - `GET /ilink/bot/get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。
+- 状态只从本机 WeChat 推导；`binded_redirect`、`need_verifycode` 等远端 iLink 状态不做伪造。
 - `confirmed.baseurl` 返回服务根地址；标准 SDK 会自己拼 `/ilink/bot/...`。
 - `weagent` 只查询和解析，不把捕获结果复制到自己的数据库。
 
