@@ -78,6 +78,7 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
     let after_id = current_update_id_floor();
     let b64_to = STANDARD.encode(recipient.display.as_bytes());
     let b64_text = STANDARD.encode(text.as_bytes());
+    let open_chat = open_chat_script(&b64_to, "set_clip");
     let script = [
         "set -e".to_string(),
         "display=\"${DISPLAY:-}\"".to_string(),
@@ -102,12 +103,8 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
         "sleep 0.2".to_string(),
         "eval \"$(xdotool getwindowgeometry --shell \"$win\")\"".to_string(),
         "root_x=${X:-0}; root_y=${Y:-0}; root_w=${WIDTH:-1856}; root_h=${HEIGHT:-857}".to_string(),
-        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 157)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
-        "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
-        "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
-            + &format!("set_clip {}", shell_quote_single(&b64_to))
-            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Down Down Down Down Down Down Return",
-        "sleep 1.5".to_string(),
+        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 80)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
+        open_chat,
         "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
         "sleep 0.2".to_string(),
         "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
@@ -178,6 +175,7 @@ fn send_file_blocking(
     let media_path = media_path.to_string_lossy().to_string();
     let b64_media_path = STANDARD.encode(media_path.as_bytes());
     let b64_to = STANDARD.encode(recipient.display.as_bytes());
+    let open_chat = open_chat_script(&b64_to, "set_text_clip");
     let script = [
         "set -e".to_string(),
         "display=\"${DISPLAY:-}\"".to_string(),
@@ -203,12 +201,8 @@ fn send_file_blocking(
         "sleep 0.2".to_string(),
         "eval \"$(xdotool getwindowgeometry --shell \"$win\")\"".to_string(),
         "root_x=${X:-0}; root_y=${Y:-0}; root_w=${WIDTH:-1856}; root_h=${HEIGHT:-857}".to_string(),
-        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 157)); file_x=$((root_x + 433)); file_y=$((root_y + root_h - 194)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
-        "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
-        "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
-            + &format!("set_text_clip {}", shell_quote_single(&b64_to))
-            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Down Down Down Down Down Down Return",
-        "sleep 1.5".to_string(),
+        "input_x=$((root_x + 500)); input_y=$((root_y + root_h - 80)); file_x=$((root_x + 381)); file_y=$((root_y + root_h - 125)); send_x=$((root_x + root_w - 67)); send_y=$((root_y + root_h - 34))".to_string(),
+        open_chat,
         "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
         "sleep 0.2".to_string(),
         "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
@@ -245,6 +239,25 @@ fn send_file_blocking(
         return Err(anyhow!("send file failed: {detail}"));
     }
     Ok(receipt(client_msg_id, &recipient))
+}
+
+fn open_chat_script(query_b64: &str, clipboard_fn: &str) -> String {
+    format!(
+        "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; \
+         if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; \
+         xdotool key --clearmodifiers Escape; sleep 0.1; \
+         xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; \
+         xdotool key --clearmodifiers ctrl+f; sleep 0.3; \
+         xdotool key --clearmodifiers ctrl+a; sleep 0.05; \
+         xdotool key --clearmodifiers BackSpace; sleep 0.05; \
+         xdotool key --clearmodifiers ctrl+a; sleep 0.05; \
+         xdotool key --clearmodifiers Delete; sleep 0.2; \
+         {clipboard_fn} {query}; paste_clip; sleep 1.8; \
+         xdotool key --clearmodifiers Return; sleep 1.5; \
+         xdotool key --clearmodifiers Escape; sleep 0.2",
+        query = shell_quote_single(query_b64),
+        clipboard_fn = clipboard_fn,
+    )
 }
 
 fn receipt(client_msg_id: String, recipient: &crate::wechat_db::Recipient) -> SendReceipt {
@@ -313,5 +326,15 @@ mod tests {
     #[test]
     fn shell_quote_single_handles_quotes() {
         assert_eq!(shell_quote_single("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn open_chat_script_uses_reference_selection_flow() {
+        let script = open_chat_script("query", "set_clip");
+
+        assert!(script.contains("set_clip 'query'; paste_clip; sleep 1.8"));
+        assert!(script.contains("key --clearmodifiers Return; sleep 1.5"));
+        assert!(script.contains("key --clearmodifiers Escape; sleep 0.2"));
+        assert!(!script.contains("Down"));
     }
 }
