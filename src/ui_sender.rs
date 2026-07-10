@@ -7,10 +7,13 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MAX_TEXT_LEN: usize = 5000;
 const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+const UPDATE_ID_SCALE: i64 = 1_000_000;
 
 #[derive(Clone)]
 pub struct UiSender {
@@ -72,6 +75,7 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
     }
 
     let client_msg_id = Uuid::new_v4().simple().to_string();
+    let after_id = current_update_id_floor();
     let b64_to = STANDARD.encode(recipient.display.as_bytes());
     let b64_text = STANDARD.encode(text.as_bytes());
     let script = [
@@ -102,8 +106,8 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
         "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
         "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
             + &format!("set_clip {}", shell_quote_single(&b64_to))
-            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Return",
-        "sleep 1.5; xdotool key --clearmodifiers Escape; sleep 0.2".to_string(),
+            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Down Down Down Down Down Down Return",
+        "sleep 1.5".to_string(),
         "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
         "sleep 0.2".to_string(),
         "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
@@ -134,7 +138,16 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
         };
         return Err(anyhow!("send failed: {detail}"));
     }
-    Ok(receipt(client_msg_id, &recipient))
+    for _ in 0..20 {
+        if wechat
+            .has_text_message_after(after_id, &recipient.username, &text)
+            .context("verify sent text in WeChat db")?
+        {
+            return Ok(receipt(client_msg_id, &recipient));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    bail!("send verification failed: message was not found in WeChat db")
 }
 
 fn send_file_blocking(
@@ -194,8 +207,8 @@ fn send_file_blocking(
         "main_win=\"$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)\"; if [ -n \"$main_win\" ]; then win=\"$main_win\"; xdotool windowactivate \"$win\"; xdotool windowraise \"$win\" 2>/dev/null || true; sleep 0.2; fi; xdotool key --clearmodifiers Escape; sleep 0.1; xdotool mousemove $((root_x + 31)) $((root_y + 96)) click 1; sleep 0.2; xdotool key --clearmodifiers ctrl+f; sleep 0.3".to_string(),
         "xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers BackSpace; sleep 0.05; xdotool key --clearmodifiers ctrl+a; sleep 0.05; xdotool key --clearmodifiers Delete; sleep 0.2; ".to_string()
             + &format!("set_text_clip {}", shell_quote_single(&b64_to))
-            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Return",
-        "sleep 1.5; xdotool key --clearmodifiers Escape; sleep 0.2".to_string(),
+            + "; paste_clip; sleep 1.8; xdotool key --clearmodifiers Down Down Down Down Down Down Return",
+        "sleep 1.5".to_string(),
         "xdotool mousemove \"$input_x\" \"$input_y\" click 1".to_string(),
         "sleep 0.2".to_string(),
         "xdotool key --clearmodifiers ctrl+a BackSpace".to_string(),
@@ -282,6 +295,15 @@ fn safe_media_file_name(raw: &str, fallback: &str) -> String {
 
 fn shell_quote_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn current_update_id_floor() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+        * UPDATE_ID_SCALE
 }
 
 #[cfg(test)]

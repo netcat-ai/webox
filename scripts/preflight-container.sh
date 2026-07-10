@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-runtime_image="${WEBOX_RUNTIME_BASE_IMAGE:-webox:runtime-base-check}"
+runtime_image="${WEBOX_RUNTIME_IMAGE:-webox:local}"
 skip_wechat_deb="${WEBOX_PREFLIGHT_SKIP_WECHAT_DEB:-0}"
 skip_runtime_base="${WEBOX_PREFLIGHT_SKIP_RUNTIME_BASE:-0}"
 
@@ -40,24 +40,26 @@ check_wechat_deb() {
 
 check_runtime_base() {
   if ! docker image inspect "$runtime_image" >/dev/null 2>&1; then
-    echo "[preflight] missing runtime-base image: $runtime_image" >&2
-    echo "[preflight] run: docker build --target runtime-base -t $runtime_image ." >&2
+    echo "[preflight] missing runtime image: $runtime_image" >&2
+    echo "[preflight] run: docker compose build" >&2
     return 3
   fi
 
-  docker run --rm "$runtime_image" bash -lc '
+  docker run --rm --entrypoint bash "$runtime_image" -lc '
     set -euo pipefail
     test -x /webox/weagent/bin/weagent
     test -x /webox/weagent/bin/entrypoint.sh
     test -x /webox/weagent/bin/wechat-ctl.sh
     test -x /webox/weagent/bin/webox-identity.sh
+    test "$(getent passwd webox | cut -d: -f6)" = "/webox/state/home"
+    getcap /webox/weagent/bin/weagent | grep -q "cap_sys_ptrace=ep"
     for cmd in Xvfb openbox xdotool xclip gosu tini curl; do
       command -v "$cmd" >/dev/null
     done
     ldconfig -p | grep -q "libpulse\\.so\\.0"
     ldconfig -p | grep -q "libpulse-simple\\.so\\.0"
   '
-  echo "[preflight] runtime-base image has required process and UI dependencies: $runtime_image"
+  echo "[preflight] runtime image has required process and UI dependencies: $runtime_image"
 }
 
 if [ "$skip_wechat_deb" != "1" ]; then

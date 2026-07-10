@@ -10,8 +10,10 @@ use axum::response::IntoResponse;
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -19,6 +21,7 @@ const TEXT_ITEM_TYPE: i64 = 1;
 const GET_UPDATES_TIMEOUT: Duration = Duration::from_secs(35);
 const GET_UPDATES_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GET_UPDATES_TIMEOUT_MS: i64 = 35_000;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -171,12 +174,18 @@ pub async fn get_qrcode_status(
         return Err(ApiError::bad_request("qrcode is required"));
     }
     let _verify_code = query.verify_code.as_deref();
+    let qr_visible = state.qr_source.latest().await.ok().flatten().is_some();
     let login = state.wechat.login_status(true);
+    if let Some(detail) = login.detail.as_deref() {
+        tracing::warn!(status = ?login.status, detail, "wechat login state is not ready");
+    }
     let mut response = serde_json::Map::new();
-    let status = match login.status {
-        LoginStatusKind::LoggedIn => "confirmed",
-        LoginStatusKind::WaitingForKey | LoginStatusKind::KeyUnavailable => "scaned",
-        LoginStatusKind::WaitingForLogin => "wait",
+    let status = match (qr_visible, login.status) {
+        (true, _) => "wait",
+        (false, LoginStatusKind::LoggedIn) => "confirmed",
+        (false, LoginStatusKind::WaitingForKey | LoginStatusKind::KeyUnavailable) => "scaned",
+        (false, LoginStatusKind::WaitingForLogin) if login.has_key => "scaned",
+        (false, LoginStatusKind::WaitingForLogin) => "wait",
     };
     response.insert("status".to_string(), json!(status));
     if status == "confirmed" {
@@ -248,7 +257,7 @@ pub async fn send_message(
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
     let _base_info = request.base_info.as_ref();
-    let target = outbound_target(&request.msg)?;
+    let target = outbound_target(&state, &request.msg)?;
     let text = outbound_text(&request.msg);
     let media_items = outbound_media_items(&state.media_store, &request.msg)?;
     if text.is_none() && media_items.is_empty() {
@@ -291,19 +300,19 @@ pub async fn get_config(
     authenticate(&state, &headers)?;
     let _base_info = request.base_info.as_ref();
     let context_token = request.context_token.as_deref().and_then(non_empty);
-    if let Some(token) = context_token.as_deref() {
-        decode_context_token(token)
-            .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
-    }
+    let context = context_token
+        .as_deref()
+        .map(|token| decode_context_token(&state, token))
+        .transpose()
+        .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
     let ilink_user_id = request
         .ilink_user_id
         .as_deref()
         .and_then(non_empty)
         .or_else(|| {
-            context_token
-                .as_deref()
-                .and_then(|token| decode_context_token(token).ok())
-                .and_then(|context| non_empty(&context.external_room_id))
+            context
+                .as_ref()
+                .and_then(|value| non_empty(&value.external_room_id))
         })
         .ok_or_else(|| ApiError::bad_request("ilink_user_id or context_token is required"))?;
     Ok(Json(json!({
@@ -548,7 +557,7 @@ fn standard_message_view(state: &AppState, message: &Value) -> Value {
         "create_time_ms": created_time_ms,
         "message_type": 1,
         "message_state": 2,
-        "context_token": context_token_for_room(&room),
+        "context_token": context_token_for_room(state, &room),
         "text": text,
         "item_list": [{
             "type": TEXT_ITEM_TYPE,
@@ -558,13 +567,13 @@ fn standard_message_view(state: &AppState, message: &Value) -> Value {
     })
 }
 
-fn outbound_target(message: &OutboundMessage) -> Result<String, ApiError> {
+fn outbound_target(state: &AppState, message: &OutboundMessage) -> Result<String, ApiError> {
     let token = message
         .context_token
         .as_deref()
         .and_then(non_empty)
         .ok_or_else(|| ApiError::bad_request("msg.context_token is required"))?;
-    let context = decode_context_token(&token)
+    let context = decode_context_token(state, &token)
         .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
     non_empty(&context.outbound_target)
         .or_else(|| non_empty(&context.external_room_id))
@@ -694,7 +703,7 @@ fn room_view_from_target(
     })
 }
 
-fn context_token_for_room(room: &Value) -> String {
+fn context_token_for_room(state: &AppState, room: &Value) -> String {
     let context = ContextToken {
         v: 1,
         tenant_id: value_str(room, "tenant_id").to_string(),
@@ -705,14 +714,35 @@ fn context_token_for_room(room: &Value) -> String {
         display_name: value_str(room, "display_name").to_string(),
         outbound_target: value_str(room, "outbound_target").to_string(),
     };
-    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).expect("context token serializes"))
+    let payload =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context).expect("context token serializes"));
+    let mut mac = HmacSha256::new_from_slice(state.api_token.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(payload.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("{payload}.{signature}")
 }
 
-fn decode_context_token(token: &str) -> anyhow::Result<ContextToken> {
-    let bytes = URL_SAFE_NO_PAD.decode(token.trim())?;
+fn decode_context_token(state: &AppState, token: &str) -> anyhow::Result<ContextToken> {
+    let (payload, signature) = token
+        .trim()
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("missing signature"))?;
+    let signature = URL_SAFE_NO_PAD.decode(signature)?;
+    let mut mac = HmacSha256::new_from_slice(state.api_token.as_bytes())?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| anyhow::anyhow!("signature mismatch"))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload)?;
     let context: ContextToken = serde_json::from_slice(&bytes)?;
     if context.v != 1 {
         anyhow::bail!("unsupported version");
+    }
+    if context.tenant_id != state.tenant_id
+        || context.provider_account_id != state.provider_account_id
+        || context.channel != "wechat"
+    {
+        anyhow::bail!("context scope mismatch");
     }
     Ok(context)
 }
@@ -903,6 +933,7 @@ mod tests {
 
     #[test]
     fn context_token_round_trips_room_target() {
+        let state = test_state();
         let room = json!({
             "tenant_id": "default",
             "channel": "wechat",
@@ -912,14 +943,27 @@ mod tests {
             "display_name": "Alice",
             "outbound_target": "alice",
         });
-        let token = context_token_for_room(&room);
+        let token = context_token_for_room(&state, &room);
         let message = OutboundMessage {
             context_token: Some(token),
             text: Some("hello".to_string()),
             item_list: Vec::new(),
         };
 
-        assert_eq!(outbound_target(&message).unwrap(), "alice");
+        assert_eq!(outbound_target(&state, &message).unwrap(), "alice");
+    }
+
+    #[test]
+    fn context_token_rejects_tampering() {
+        let state = test_state();
+        let room = room_view_from_target(&state, "alice", None, false);
+        let token = context_token_for_room(&state, &room);
+        let (payload, signature) = token.split_once('.').unwrap();
+        let mut payload = payload.as_bytes().to_vec();
+        payload[0] ^= 1;
+        let tampered = format!("{}.{}", String::from_utf8(payload).unwrap(), signature);
+
+        assert!(decode_context_token(&state, &tampered).is_err());
     }
 
     #[test]

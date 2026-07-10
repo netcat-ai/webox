@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_POLL_LIMIT: usize = 500;
@@ -109,10 +110,14 @@ impl WechatState {
         match material {
             Ok((db_dir, keys)) => {
                 let has_db_storage = db_dir.is_dir();
+                let ui_ready = wechat_main_window_ready();
                 let can_read_messages = has_db_storage && !keys.is_empty();
+                let logged_in = can_read_messages && ui_ready.unwrap_or(true);
                 LoginStatus {
-                    status: if can_read_messages {
+                    status: if logged_in {
                         LoginStatusKind::LoggedIn
+                    } else if ui_ready == Some(false) {
+                        LoginStatusKind::WaitingForLogin
                     } else {
                         LoginStatusKind::KeyUnavailable
                     },
@@ -149,7 +154,7 @@ impl WechatState {
                     refreshed: refresh_key,
                     key_source: key.as_ref().and_then(|key| key.source.clone()),
                     key_updated_at: key.as_ref().map(|key| key.updated_at),
-                    detail: refresh_key.then(|| err.to_string()),
+                    detail: refresh_key.then(|| format!("{err:#}")),
                 }
             }
         }
@@ -205,6 +210,14 @@ impl WechatState {
         wechat_db::resolve_recipient_by_username(db_dir, keys, self.cache_dir(), username)
             .with_context(|| format!("resolve wechat recipient {username}"))?
             .ok_or_else(|| anyhow!("recipient not found: target must be a WeChat internal id"))
+    }
+
+    pub fn has_text_message_after(&self, after_id: i64, target: &str, text: &str) -> Result<bool> {
+        Ok(self
+            .poll_messages_after_id(after_id, 100)?
+            .messages
+            .iter()
+            .any(|message| message_matches_text(message, target, text)))
     }
 
     fn ensure_db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
@@ -303,6 +316,47 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+fn wechat_main_window_ready() -> Option<bool> {
+    if std::env::var("DISPLAY").ok()?.trim().is_empty() {
+        return None;
+    }
+    let output = Command::new("xdotool")
+        .args([
+            "search",
+            "--onlyvisible",
+            "--class",
+            "wechat",
+            "getwindowgeometry",
+            "--shell",
+            "%@",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(false);
+    }
+    Some(window_geometry_has_main_window(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn window_geometry_has_main_window(output: &str) -> bool {
+    let mut width = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("WIDTH=") {
+            width = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("HEIGHT=") {
+            let height = value.parse::<u32>().ok();
+            if width.is_some_and(|width| width >= 700) && height.is_some_and(|height| height >= 500)
+            {
+                return true;
+            }
+            width = None;
+        }
+    }
+    false
+}
+
 fn encode_db_cursor(sessions: &HashMap<String, i64>) -> String {
     URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&DbCursor {
@@ -355,6 +409,15 @@ fn stable_sequence(message: &Value) -> i64 {
     i64::from_be_bytes(bytes) & i64::MAX
 }
 
+fn message_matches_text(message: &Value, target: &str, text: &str) -> bool {
+    message.get("roomid").and_then(Value::as_str) == Some(target)
+        && message
+            .get("text")
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_str)
+            == Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +434,28 @@ mod tests {
 
         assert_eq!(message_update_id(&message) / UPDATE_ID_SCALE, 1781703356);
         assert_eq!(message_update_id(&message) % UPDATE_ID_SCALE, 42);
+    }
+
+    #[test]
+    fn message_matches_exact_target_and_text() {
+        let message = json!({
+            "roomid": "filehelper",
+            "text": { "content": "webox proof" },
+        });
+
+        assert!(message_matches_text(&message, "filehelper", "webox proof"));
+        assert!(!message_matches_text(&message, "other", "webox proof"));
+        assert!(!message_matches_text(&message, "filehelper", "webox"));
+    }
+
+    #[test]
+    fn main_window_geometry_rejects_login_window() {
+        assert!(!window_geometry_has_main_window(
+            "WINDOW=1\nWIDTH=280\nHEIGHT=380\n"
+        ));
+        assert!(window_geometry_has_main_window(
+            "WINDOW=1\nWIDTH=280\nHEIGHT=380\nWINDOW=2\nWIDTH=980\nHEIGHT=710\n"
+        ));
     }
 
     #[test]

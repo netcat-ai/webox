@@ -90,7 +90,7 @@ WeChat local DB
 
 - 对外只接受 iLink `get_updates_buf`，不暴露内部 DB cursor。
 - `get_updates_buf` 是不透明游标，内部只编码最后投递的稳定 update id。
-- 每条 `msg` 包含无状态 `context_token`，agent 回复时必须原样传给 `/sendmessage`。
+- 每条 `msg` 包含无状态、HMAC 签名的 `context_token`，agent 回复时必须原样传给 `/sendmessage`。
 - `msg/notifystart` 和 `msg/notifystop` 接收标准 SDK 生命周期通知，不参与本地 DB 游标。
 - 服务端不维护独立 ack 状态。
 - 如果标准 iLink 明确要求持久上下文状态，再增加最小状态；不能预先引入 msghub-style mailbox。
@@ -106,6 +106,7 @@ iLink sendmessage
   -> search/open conversation
   -> paste content
   -> click/send
+  -> verify the exact text from WeChat local DB
   -> return iLink ret=0
 ```
 
@@ -113,10 +114,13 @@ iLink sendmessage
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
 - 只使用 `msg.context_token` 中的 room target；不接受显式 `msg.to_user_id` 直发，避免绕开 iLink 上下文。
+- `context_token` 使用 API token 做 HMAC 签名，不维护服务端 token 表。
+- 文本发送必须从 WeChat DB 读回目标和文本均精确匹配的新消息后才成功。
 - 不暴露 UI sender receipt；同步执行成功返回 `ret=0`。
 - 文本、图片、视频、语音和文件都通过同一个 `sendmessage` 入口；媒体最终落到 Linux WeChat 文件选择器。
 - `getconfig`/`sendtyping` 初版只做 iLink SDK 兼容：无状态 `typing_ticket` + no-op `sendtyping`。
 - 群聊目标必须使用可唯一定位的备注或会话名，否则拒绝发送。
+- 所有发送目标的 UI 搜索词必须在联系人库中精确唯一；同名联系人先设置唯一备注。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
 
 ### 媒体上传
@@ -160,11 +164,9 @@ weagent
 5. 从 Xvfb framebuffer 解码并裁剪登录二维码。
 6. 整理 Dockerfile 和 entrypoint，保证内置 WeChat、权限和 Display 启动顺序正确。
 
-## 当前硬缺口
+## 验证状态
 
-- 真实第三方 iLink 客户端兼容性验证。
-- Xvfb 二维码定位、解码与裁剪已完成单元测试和真实容器回归。
-- 如果第三方客户端要求服务端持久上下文状态，需要补最小状态；当前只支持 `get_updates_buf` 拉取。
-- Linux WeChat 在目标镜像内的 DB 路径、权限和 ptrace 条件。
-- 真实容器内 WeChat 登录后，需要用实际 DB 和 UI 窗口验证 `get_updates_buf` 投影是否覆盖同秒多消息边界。
-- 真实 Linux WeChat 文件选择器发送图片、视频、语音和文件的窗口坐标兼容性。
+- WeChat 4.1.1.7 ARM64 已完成真实容器二维码、登录、内存 key 提取和 15 个本地 DB key 读取验证。
+- 标准 `/getupdates` 已用真实消息验证不透明游标、`context_token` 和文本投影。
+- 文本 UI 发送原语及发送后 DB 回读已在文件传输助手验证。
+- 待完成：签名 `context_token` 后的标准 `/sendmessage` 最终回归、媒体文件选择器回归、真实第三方 iLink SDK 兼容性验证。

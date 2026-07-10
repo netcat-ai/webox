@@ -22,12 +22,13 @@ docker compose up -d --build
 
 ```bash
 docker build --target runtime-base -t webox:runtime-base-check .
-WEBOX_PREFLIGHT_SKIP_WECHAT_DEB=1 scripts/preflight-container.sh
+WEBOX_RUNTIME_IMAGE=webox:runtime-base-check WEBOX_PREFLIGHT_SKIP_WECHAT_DEB=1 scripts/preflight-container.sh
 ```
 
-完整构建前检查当前 Docker 架构需要的内置 WeChat deb 和运行时依赖：
+完整构建后检查当前 Docker 架构需要的内置 WeChat deb 和运行时依赖：
 
 ```bash
+docker compose build
 scripts/preflight-container.sh
 ```
 
@@ -116,6 +117,7 @@ APT_DEBIAN_SECURITY_MIRROR=
 ```
 
 `to_user_id` 是标准 SDK 会携带的兼容字段，weagent 发送路由只信任 `context_token`，避免第三方绕开入站会话上下文直发。
+`context_token` 使用 `WEBOX_API_TOKEN` 做 HMAC 签名，客户端只需原样透传；修改目标或更换 API token 后，旧 token 会失效。
 
 `WEBOX_PUBLIC_BASE_URL` 可覆盖登录确认返回的 `baseurl`。这里应配置服务根地址，例如
 `https://webox.example.com`。如果通过带路径前缀的反向代理暴露服务，这里应包含该前缀。如果不设置，默认从请求
@@ -150,6 +152,9 @@ X-WECHAT-UIN: <base64(String(random_uint32))>
 Linux WeChat 文件选择器发送图片、视频、语音或文件。Node.js SDK 可直接使用 `upload_full_url`；其他 SDK 如果只拼固定
 CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL。
 
+文本发送只有在 WeChat 本地 DB 中读回同一会话的精确文本后才返回 `ret=0`，避免窗口被弹窗遮挡或搜索选错时误报成功。
+发送前还会要求联系人搜索词在本地联系人库中精确唯一；同名联系人需要先设置唯一备注。
+
 ## 核心边界
 
 - `weagent` 对外只提供标准 iLink 协议和健康检查。
@@ -171,6 +176,9 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 
 entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`weagent` 或 WeChat
 循环任一关键进程退出时，容器退出；Compose 的 `restart: unless-stopped` 负责重启容器。
+`openbox` 只提供窗口激活、层级和焦点管理；没有窗口管理器时，`xdotool` 无法稳定操作 WeChat 主窗和文件选择器。
+
+首次扫码后，WeChat 可能在容器重启时要求手机再次确认“登录”，这是官方客户端的会话恢复流程；持久化 HOME 和 DB key 不会丢失。
 
 容器内工作目录统一在 `/webox` 下：
 
@@ -184,3 +192,6 @@ Compose 按子目录挂载 `./data/*`，不要把整个 `/webox` 作为一个 bi
 `weagent` 从 `WEBOX_QR_SCREENSHOT_PATH` 指向的 Xvfb framebuffer 读取登录窗口。它先检测 WeChat 蓝色二维码，
 再用 QR 解码器确认、提取登录 URL并按二维码边界裁剪，只把裁剪后的 `data:image/png;base64,...` 返回给
 `qrcode_img_content`。WeChat 直接联网，不安装额外 CA，也不修改客户端网络进程。
+
+为从同一用户运行的 WeChat 进程内存提取本地 DB key，Compose 只增加 `SYS_PTRACE`，并只给 `weagent` 二进制
+`cap_sys_ptrace=ep`；容器不使用 `privileged` 或 `seccomp=unconfined`。

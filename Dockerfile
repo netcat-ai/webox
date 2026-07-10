@@ -25,7 +25,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl dbus dbus-x11 dpkg gosu locales \
+      ca-certificates curl dbus dbus-x11 dpkg gosu libcap2-bin locales \
       openbox procps tini x11-utils xclip xdotool xsettingsd xvfb xz-utils \
       fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
       libatomic1 libnss3 libgbm1 libasound2 libpulse0 libxss1 libxdamage1 libxkbcommon-x11-0 \
@@ -34,7 +34,7 @@ RUN set -eux; \
       libxcomposite1 libxrandr2 libxfixes3 libxtst6 libxshmfence1 libdrm2; \
     sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
     locale-gen; \
-    useradd -m -u 1000 -s /bin/bash webox; \
+    useradd -M -d /webox/state/home -u 1000 -s /bin/bash webox; \
     mkdir -p /webox/wechat /webox/weagent/bin /webox/state /webox/logs /webox/runtime; \
     chown -R webox:webox /webox; \
     apt-get clean; \
@@ -43,7 +43,8 @@ RUN set -eux; \
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/wechat-ctl.sh docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 
-RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh
+RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
+    setcap cap_sys_ptrace=ep /webox/weagent/bin/weagent
 
 FROM runtime-base AS runtime
 

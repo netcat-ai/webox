@@ -398,25 +398,21 @@ pub fn resolve_recipient_by_username(
     let Some(recipient) = recipient else {
         return Ok(None);
     };
-    if recipient.is_group {
-        if !recipient.search_uses_remark {
-            bail!("群聊必须设置唯一备注作为发送搜索词");
-        }
-        let duplicate: Option<String> = conn
-            .query_row(
-                "SELECT username FROM contact WHERE delete_flag=0 AND remark=?1 AND username<>?2 LIMIT 1",
-                [&recipient.display, &recipient.username],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(other) = duplicate {
-            bail!(
-                "群聊备注不唯一：{} 同时匹配 {} 和 {}",
-                recipient.display,
-                recipient.username,
-                other
-            );
-        }
+    if recipient.is_group && !recipient.search_uses_remark {
+        bail!("群聊必须设置唯一备注作为发送搜索词");
+    }
+    let duplicate: Option<String> = conn
+        .query_row(
+            "SELECT username FROM contact
+             WHERE delete_flag=0 AND username<>?2
+               AND (username=?1 OR nick_name=?1 OR remark=?1 OR alias=?1)
+             LIMIT 1",
+            [&recipient.display, &recipient.username],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        bail!("联系人搜索词不唯一，请先设置唯一备注");
     }
     Ok(Some(recipient))
 }
@@ -460,6 +456,9 @@ fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     }
 
     let mut raw_keys: Vec<(String, String)> = Vec::new();
+    let mut readable_processes = 0usize;
+    let mut scanned_regions = 0usize;
+    let mut scanned_bytes = 0usize;
     for pid in pids {
         let Ok(regions) = parse_maps(pid) else {
             continue;
@@ -468,8 +467,10 @@ fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         let Ok(mut mem_file) = fs::File::open(&mem_path) else {
             continue;
         };
+        readable_processes += 1;
+        scanned_regions += regions.len();
         for (start, end) in &regions {
-            scan_region(&mut mem_file, *start, *end, &mut raw_keys);
+            scanned_bytes += scan_region(&mut mem_file, *start, *end, &mut raw_keys);
         }
     }
 
@@ -488,6 +489,15 @@ fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
                 });
             }
         }
+    }
+    if entries.is_empty() {
+        bail!(
+            "未从内存提取到有效 Message Key: readable_processes={readable_processes}, \
+             scanned_regions={scanned_regions}, scanned_bytes={scanned_bytes}, \
+             key_candidates={}, database_salts={}",
+            raw_keys.len(),
+            db_salts.len()
+        );
     }
     Ok(entries)
 }
@@ -560,10 +570,16 @@ fn parse_maps(pid: u32) -> Result<Vec<(u64, u64)>> {
     Ok(regions)
 }
 
-fn scan_region(mem: &mut fs::File, start: u64, end: u64, results: &mut Vec<(String, String)>) {
+fn scan_region(
+    mem: &mut fs::File,
+    start: u64,
+    end: u64,
+    results: &mut Vec<(String, String)>,
+) -> usize {
     let total_len = (end - start) as usize;
     let overlap = HEX_PATTERN_LEN + 3;
     let mut offset = 0usize;
+    let mut scanned_bytes = 0usize;
     while offset < total_len {
         let chunk_size = std::cmp::min(CHUNK_SIZE, total_len - offset);
         let addr = start + offset as u64;
@@ -574,6 +590,7 @@ fn scan_region(mem: &mut fs::File, start: u64, end: u64, results: &mut Vec<(Stri
         match mem.read(&mut buf) {
             Ok(n) if n > 0 => {
                 buf.truncate(n);
+                scanned_bytes += n;
                 search_pattern(&buf, results);
             }
             _ => {}
@@ -584,6 +601,7 @@ fn scan_region(mem: &mut fs::File, start: u64, end: u64, results: &mut Vec<(Stri
             offset += chunk_size;
         }
     }
+    scanned_bytes
 }
 
 fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
