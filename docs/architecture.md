@@ -44,6 +44,7 @@ flowchart LR
 - `weagent` 暴露 iLink HTTP API。
 - `weagent` 从 Xvfb framebuffer 定位、解码并裁剪 WeChat 登录二维码。
 - `weagent` 解密并轮询 WeChat 本地 DB，把消息投影成 iLink updates。
+- `weagent` 后台状态机独立完成登录后的 DB key 提取和可读性验证；HTTP 请求不触发初始化。
 - `weagent` 接收 iLink 发送请求，文本直接串行调用 UI sender，媒体先走本地 CDN shim 上传和解密。
 - Docker entrypoint 只负责启动 Display、WeChat 和 weagent。
 - WeChat 直接连接上游，不安装 CA、不修改客户端二进制、不注入代理。
@@ -71,11 +72,13 @@ WeChat login window
 
 - `WEBOX_QR_SCREENSHOT_PATH` 指向 Xvfb framebuffer。只有同时检测到 WeChat 蓝色二维码并由 QR 解码器识别成功时才返回裁剪后的 PNG。
 - `GET /get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
-- `GET /get_qrcode_status` 在轮询时主动尝试提取 DB key；能读取消息时返回 `confirmed`。
+- `GET /get_qrcode_status` 只读取状态；后台初始化器能读取消息后才返回 `confirmed`。
 - 状态只从本机 WeChat 推导；`binded_redirect`、`need_verifycode` 等远端 iLink 状态不做伪造。
 - `confirmed.baseurl` 返回服务根地址，客户端按标准协议拼根路径端点。
 - 只暴露标准根路径端点，不保留 `/ilink/bot/*` 或项目早期的自定义 API。
 - `weagent` 不保存二维码历史；二维码变化直接反映当前 WeChat 登录窗口。
+- 持久账号启动页由后台状态机自动点击登录；微信要求的手机确认仍保持官方安全边界。
+- iLink 客户端没有 `/init` 阶段：扫码并确认后，后台自动完成 key 提取与 DB 验证。
 
 ### 收消息
 
@@ -154,6 +157,22 @@ weagent
   media_store  local iLink CDN upload/download shim
   ui_sender    xdotool/xclip based send executor
 ```
+
+## 自动初始化状态机
+
+```text
+container starts
+  -> iLink routes listen immediately
+  -> wait for QR scan or activate saved-account login
+  -> detect logged-in main window
+  -> load and validate persisted DB keys, or extract keys from WeChat memory
+  -> validate local DB session state
+  -> mark ready and return confirmed
+  -> getupdates/sendmessage operate without another init call
+```
+
+初始化器是唯一允许提取 key 的组件。二维码状态、`getupdates` 和 `sendmessage` 不会隐式触发扫描，避免请求时延和
+多个并发请求重复初始化。退出登录后 ready 状态自动清除；再次登录会重新验证或提取 key。
 
 ## 实施顺序
 

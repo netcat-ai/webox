@@ -79,8 +79,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 }
 ```
 
-`/get_qrcode_status` 轮询本地 WeChat 登录状态。扫码后会主动尝试提取 DB key；能读取消息时返回
-`confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`。当前只从本机 WeChat 状态推导
+`/get_qrcode_status` 只轮询本地 WeChat 登录状态，不承担初始化工作。后台初始化器在检测到主窗口登录成功后自动
+提取并验证 DB key；能读取消息时返回 `confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`。当前只从本机 WeChat 状态推导
 `wait`、`scaned`、`confirmed`，不伪造 `binded_redirect`、`need_verifycode` 这类远端 iLink 状态：
 
 ```json
@@ -104,6 +104,9 @@ APT_DEBIAN_SECURITY_MIRROR=
 
 响应会按 iLink 语义长轮询最多 35 秒，包含 `ret`、`msgs` 和新的 `get_updates_buf`。每条消息包含 `context_token`，回复时必须原样放进
 `/sendmessage` 的 `msg.context_token`。
+
+容器启动后所有 iLink 路由立即可用。登录初始化尚未完成时，`getupdates` 保持标准长轮询并返回空消息；
+`sendmessage` 明确返回未就绪。状态变成 `confirmed` 后，收发接口自动可用，不存在额外 `/init` 调用。
 
 ```json
 {
@@ -173,6 +176,7 @@ CDN 地址，需要改成使用返回的上传地址或支持配置 CDN base URL
 2. 启动 Xvfb + openbox，并把 framebuffer 写到 `/webox/runtime/xvfb/Xvfb_screen0`。
 3. 启动 Rust `weagent`。
 4. 启动镜像内置的 Linux 微信并直接连接上游。
+5. 后台观察登录窗口；持久账号页会自动点击“登录”，主窗口出现后自动提取并验证 DB key。
 
 entrypoint 使用 `tini` 加最小 shell supervisor。`Xvfb`、`openbox`、`weagent` 或 WeChat
 循环任一关键进程退出时，容器退出；Compose 的 `restart: unless-stopped` 负责重启容器。

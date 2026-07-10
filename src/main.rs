@@ -13,7 +13,7 @@ use crate::ilink::AppState;
 use crate::media_store::{MediaStore, MAX_MEDIA_UPLOAD_BYTES};
 use crate::qr_source::QrSource;
 use crate::ui_sender::UiSender;
-use crate::wechat_state::WechatState;
+use crate::wechat_state::{InitializationState, WechatState};
 use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
@@ -40,13 +40,15 @@ async fn main() -> anyhow::Result<()> {
 
     let wechat = WechatState::new(config.state_dir.clone());
     wechat.ensure_state_dir()?;
+    let qr_source = QrSource::new(config.qr_screenshot_path.clone());
+    spawn_wechat_initializer(wechat.clone(), qr_source.clone());
     let state = Arc::new(AppState {
         api_token: config.api_token.clone(),
         tenant_id: config.tenant_id.clone(),
         provider_account_id: config.provider_account_id.clone(),
         public_base_url: config.public_base_url.clone(),
         sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
-        qr_source: QrSource::new(config.qr_screenshot_path.clone()),
+        qr_source,
         media_store: MediaStore::new(config.media_dir.clone()),
         wechat,
     });
@@ -61,6 +63,71 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn spawn_wechat_initializer(wechat: WechatState, qr_source: QrSource) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let mut ready_logged = false;
+        let mut login_clicked = false;
+        let mut no_qr_checks = 0_u8;
+        loop {
+            let state = wechat.clone();
+            let init = tokio::task::spawn_blocking(move || state.initialize_if_ready()).await;
+            match init {
+                Ok(Ok(InitializationState::Ready)) => {
+                    if !ready_logged {
+                        tracing::info!("wechat automatic initialization is ready");
+                        ready_logged = true;
+                    }
+                    no_qr_checks = 0;
+                }
+                Ok(Ok(InitializationState::WaitingForLogin)) => {
+                    ready_logged = false;
+                    let qr_visible = qr_source.latest().await.ok().flatten().is_some();
+                    if qr_visible || login_clicked {
+                        no_qr_checks = 0;
+                    } else {
+                        no_qr_checks = no_qr_checks.saturating_add(1);
+                        if no_qr_checks >= 3 {
+                            let state = wechat.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                state.click_saved_account_login()
+                            })
+                            .await
+                            {
+                                Ok(Ok(true)) => {
+                                    tracing::info!("activated saved-account WeChat login");
+                                    login_clicked = true;
+                                }
+                                Ok(Ok(false)) => {}
+                                Ok(Err(err)) => {
+                                    tracing::warn!(error = %err, "could not activate saved-account login")
+                                }
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "saved-account login task failed")
+                                }
+                            }
+                            no_qr_checks = 0;
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    ready_logged = false;
+                    let detail = format!("{err:#}");
+                    wechat.record_init_error(detail.clone());
+                    tracing::warn!(error = %detail, "wechat automatic initialization is not ready");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(err) => {
+                    ready_logged = false;
+                    wechat.record_init_error(err.to_string());
+                    tracing::warn!(error = %err, "wechat automatic initialization task failed");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
 }
 
 fn build_router(state: Arc<AppState>) -> Router {

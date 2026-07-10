@@ -143,6 +143,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "hasWechatKey": state.wechat.has_key(),
+        "ready": state.wechat.is_initialized(),
     }))
 }
 
@@ -175,7 +176,7 @@ pub async fn get_qrcode_status(
     }
     let _verify_code = query.verify_code.as_deref();
     let qr_visible = state.qr_source.latest().await.ok().flatten().is_some();
-    let login = state.wechat.login_status(true);
+    let login = state.wechat.login_status();
     if let Some(detail) = login.detail.as_deref() {
         tracing::warn!(status = ?login.status, detail, "wechat login state is not ready");
     }
@@ -213,6 +214,18 @@ pub async fn get_updates(
     let after_id = decode_updates_buf(request.get_updates_buf.as_deref())?;
     let deadline = Instant::now() + GET_UPDATES_TIMEOUT;
     let result = loop {
+        if !state.wechat.is_initialized() {
+            if Instant::now() >= deadline {
+                return Ok(Json(json!({
+                    "ret": 0,
+                    "msgs": [],
+                    "get_updates_buf": request.get_updates_buf.unwrap_or_default(),
+                    "longpolling_timeout_ms": GET_UPDATES_TIMEOUT_MS,
+                })));
+            }
+            sleep(GET_UPDATES_POLL_INTERVAL).await;
+            continue;
+        }
         match state.wechat.poll_messages_after_id(after_id, 100) {
             Ok(result) if !result.messages.is_empty() => break Ok(result),
             Ok(result) if Instant::now() >= deadline => break Ok(result),
@@ -256,6 +269,11 @@ pub async fn send_message(
     Json(request): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
+    if !state.wechat.is_initialized() {
+        return Err(ApiError::bad_request(
+            "wechat automatic initialization is not complete",
+        ));
+    }
     let _base_info = request.base_info.as_ref();
     let target = outbound_target(&state, &request.msg)?;
     let text = outbound_text(&request.msg);

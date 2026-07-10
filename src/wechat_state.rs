@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_POLL_LIMIT: usize = 500;
@@ -17,6 +19,13 @@ const UPDATE_ID_SCALE: i64 = 1_000_000;
 pub struct WechatState {
     state_dir: PathBuf,
     key_file: PathBuf,
+    runtime: Arc<WechatRuntime>,
+}
+
+#[derive(Debug, Default)]
+struct WechatRuntime {
+    initialized: AtomicBool,
+    last_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,11 +87,18 @@ pub enum LoginStatusKind {
     KeyUnavailable,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum InitializationState {
+    WaitingForLogin,
+    Ready,
+}
+
 impl WechatState {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
             key_file: state_dir.join("wechat.key"),
             state_dir,
+            runtime: Arc::new(WechatRuntime::default()),
         }
     }
 
@@ -100,18 +116,20 @@ impl WechatState {
         self.key_file.exists()
     }
 
-    pub fn login_status(&self, refresh_key: bool) -> LoginStatus {
+    pub fn is_initialized(&self) -> bool {
+        self.runtime.initialized.load(Ordering::Acquire)
+    }
+
+    pub fn login_status(&self) -> LoginStatus {
         let key = self.read_key().ok();
-        let material = if refresh_key {
-            self.ensure_db_material()
-        } else {
-            self.db_material()
-        };
+        let material = self.db_material();
         match material {
             Ok((db_dir, keys)) => {
                 let has_db_storage = db_dir.is_dir();
                 let ui_ready = wechat_main_window_ready();
-                let can_read_messages = has_db_storage && !keys.is_empty();
+                let has_material = has_db_storage && !keys.is_empty();
+                let can_read_messages =
+                    has_material && (self.is_initialized() || ui_ready.is_none());
                 let logged_in = can_read_messages && ui_ready.unwrap_or(true);
                 LoginStatus {
                     status: if logged_in {
@@ -124,17 +142,16 @@ impl WechatState {
                     can_read_messages,
                     has_key: true,
                     has_db_storage,
-                    refreshed: refresh_key,
+                    refreshed: false,
                     key_source: key.as_ref().and_then(|key| key.source.clone()),
                     key_updated_at: key.as_ref().map(|key| key.updated_at),
-                    detail: if has_db_storage {
-                        None
-                    } else {
-                        Some("wechat db_storage directory is missing".to_string())
-                    },
+                    detail: self.last_init_error().or_else(|| {
+                        (!has_db_storage)
+                            .then(|| "wechat db_storage directory is missing".to_string())
+                    }),
                 }
             }
-            Err(err) => {
+            Err(_) => {
                 let detected_db = key
                     .as_ref()
                     .and_then(|key| key.db_dir.as_ref().map(PathBuf::from))
@@ -151,17 +168,63 @@ impl WechatState {
                     can_read_messages: false,
                     has_key: self.has_key(),
                     has_db_storage,
-                    refreshed: refresh_key,
+                    refreshed: false,
                     key_source: key.as_ref().and_then(|key| key.source.clone()),
                     key_updated_at: key.as_ref().map(|key| key.updated_at),
-                    detail: refresh_key.then(|| format!("{err:#}")),
+                    detail: self.last_init_error(),
                 }
             }
         }
     }
 
+    pub fn initialize_if_ready(&self) -> Result<InitializationState> {
+        if wechat_main_window_ready() != Some(true) {
+            self.runtime.initialized.store(false, Ordering::Release);
+            return Ok(InitializationState::WaitingForLogin);
+        }
+        if self.is_initialized() {
+            return Ok(InitializationState::Ready);
+        }
+
+        let material = self
+            .db_material()
+            .and_then(|material| self.validate_db_material(material));
+        let material = match material {
+            Ok(material) => material,
+            Err(_) => {
+                let init = wechat_db::init_from_memory()
+                    .context("extract wechat message keys during automatic initialization")?;
+                self.write_wechat_db_key(init, None)?;
+                self.validate_db_material(self.db_material()?)?
+            }
+        };
+        drop(material);
+        self.runtime.initialized.store(true, Ordering::Release);
+        self.set_init_error(None);
+        Ok(InitializationState::Ready)
+    }
+
+    pub fn record_init_error(&self, error: String) {
+        self.runtime.initialized.store(false, Ordering::Release);
+        self.set_init_error(Some(error));
+    }
+
+    pub fn click_saved_account_login(&self) -> Result<bool> {
+        let Some(window) = wechat_login_window() else {
+            return Ok(false);
+        };
+        let status = Command::new("xdotool")
+            .args(["mousemove", "--window", &window, "140", "290", "click", "1"])
+            .status()
+            .context("click saved-account login button")?;
+        if !status.success() {
+            bail!("xdotool could not click saved-account login button");
+        }
+        Ok(true)
+    }
+
     pub fn poll_messages_after_id(&self, after_id: i64, limit: usize) -> Result<PollResult> {
-        let (db_dir, keys) = self.ensure_db_material()?;
+        let (db_dir, keys) = self.ready_db_material()?;
         let limit = limit.clamp(1, MAX_POLL_LIMIT);
         let cursor_state = if after_id > 0 {
             let since_ts = update_id_seconds(after_id).saturating_sub(1);
@@ -206,7 +269,7 @@ impl WechatState {
     }
 
     pub fn resolve_recipient(&self, username: &str) -> Result<wechat_db::Recipient> {
-        let (db_dir, keys) = self.ensure_db_material()?;
+        let (db_dir, keys) = self.ready_db_material()?;
         wechat_db::resolve_recipient_by_username(db_dir, keys, self.cache_dir(), username)
             .with_context(|| format!("resolve wechat recipient {username}"))?
             .ok_or_else(|| anyhow!("recipient not found: target must be a WeChat internal id"))
@@ -220,13 +283,20 @@ impl WechatState {
             .any(|message| message_matches_text(message, target, text)))
     }
 
-    fn ensure_db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
-        if let Ok(material) = self.db_material() {
-            return Ok(material);
+    fn ready_db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
+        if std::env::var("DISPLAY").is_ok() && !self.is_initialized() {
+            bail!("wechat automatic initialization is not complete");
         }
-        let init = wechat_db::init_from_memory().context("extract wechat message keys")?;
-        self.write_wechat_db_key(init, None)?;
         self.db_material()
+    }
+
+    fn validate_db_material(
+        &self,
+        material: (PathBuf, HashMap<String, String>),
+    ) -> Result<(PathBuf, HashMap<String, String>)> {
+        wechat_db::current_session_state(material.0.clone(), material.1.clone(), self.cache_dir())
+            .context("validate wechat database keys")?;
+        Ok(material)
     }
 
     fn db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
@@ -307,6 +377,20 @@ impl WechatState {
     fn cache_dir(&self) -> PathBuf {
         self.state_dir.join("cache")
     }
+
+    fn set_init_error(&self, error: Option<String>) {
+        if let Ok(mut value) = self.runtime.last_error.lock() {
+            *value = error;
+        }
+    }
+
+    fn last_init_error(&self) -> Option<String> {
+        self.runtime
+            .last_error
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+    }
 }
 
 fn now() -> i64 {
@@ -338,6 +422,48 @@ fn wechat_main_window_ready() -> Option<bool> {
     Some(window_geometry_has_main_window(&String::from_utf8_lossy(
         &output.stdout,
     )))
+}
+
+fn wechat_login_window() -> Option<String> {
+    if std::env::var("DISPLAY").ok()?.trim().is_empty() {
+        return None;
+    }
+    let output = Command::new("xdotool")
+        .args([
+            "search",
+            "--onlyvisible",
+            "--class",
+            "wechat",
+            "getwindowgeometry",
+            "--shell",
+            "%@",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    login_window_from_geometry(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn login_window_from_geometry(output: &str) -> Option<String> {
+    let mut window = None;
+    let mut width = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("WINDOW=") {
+            window = Some(value.to_string());
+            width = None;
+        } else if let Some(value) = line.strip_prefix("WIDTH=") {
+            width = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("HEIGHT=") {
+            let height = value.parse::<u32>().ok();
+            if width.is_some_and(|width| width <= 400) && height.is_some_and(|height| height <= 500)
+            {
+                return window;
+            }
+        }
+    }
+    None
 }
 
 fn window_geometry_has_main_window(output: &str) -> bool {
@@ -459,11 +585,34 @@ mod tests {
     }
 
     #[test]
+    fn login_window_geometry_returns_small_wechat_window() {
+        assert_eq!(
+            login_window_from_geometry(
+                "WINDOW=1\nWIDTH=980\nHEIGHT=710\nWINDOW=2\nWIDTH=280\nHEIGHT=380\n"
+            )
+            .as_deref(),
+            Some("2")
+        );
+        assert!(login_window_from_geometry("WINDOW=1\nWIDTH=980\nHEIGHT=710\n").is_none());
+    }
+
+    #[test]
+    fn login_status_does_not_create_key_material() {
+        let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
+        let state = WechatState::new(state_dir.clone());
+
+        let _ = state.login_status();
+
+        assert!(!state_dir.join("wechat.key").exists());
+        fs::remove_dir_all(state_dir).ok();
+    }
+
+    #[test]
     fn login_status_waits_for_login_without_key_or_db() {
         let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
         let state = WechatState::new(state_dir.clone());
 
-        let status = state.login_status(false);
+        let status = state.login_status();
 
         fs::remove_dir_all(state_dir).ok();
         assert_eq!(status.status, LoginStatusKind::WaitingForLogin);
@@ -500,7 +649,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = state.login_status(false);
+        let status = state.login_status();
 
         fs::remove_dir_all(state_dir).ok();
         assert_eq!(status.status, LoginStatusKind::LoggedIn);
