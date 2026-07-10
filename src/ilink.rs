@@ -175,19 +175,18 @@ pub async fn get_qrcode_status(
         return Err(ApiError::bad_request("qrcode is required"));
     }
     let _verify_code = query.verify_code.as_deref();
-    let qr_visible = state.qr_source.latest().await.ok().flatten().is_some();
+    let current_qrcode = state.qr_source.latest().await.ok().flatten();
     let login = state.wechat.login_status();
     if let Some(detail) = login.detail.as_deref() {
         tracing::warn!(status = ?login.status, detail, "wechat login state is not ready");
     }
     let mut response = serde_json::Map::new();
-    let status = match (qr_visible, login.status) {
-        (true, _) => "wait",
-        (false, LoginStatusKind::LoggedIn) => "confirmed",
-        (false, LoginStatusKind::WaitingForKey | LoginStatusKind::KeyUnavailable) => "scaned",
-        (false, LoginStatusKind::WaitingForLogin) if login.has_key => "scaned",
-        (false, LoginStatusKind::WaitingForLogin) => "wait",
-    };
+    let status = qrcode_status(
+        &query.qrcode,
+        current_qrcode.as_ref().map(|qrcode| qrcode.id.as_str()),
+        login.status,
+        login.has_key,
+    );
     response.insert("status".to_string(), json!(status));
     if status == "confirmed" {
         response.insert("bot_token".to_string(), json!(state.api_token));
@@ -202,6 +201,27 @@ pub async fn get_qrcode_status(
         );
     }
     Ok(Json(Value::Object(response)))
+}
+
+fn qrcode_status(
+    requested_qrcode: &str,
+    current_qrcode: Option<&str>,
+    login_status: LoginStatusKind,
+    has_key: bool,
+) -> &'static str {
+    if let Some(current_qrcode) = current_qrcode {
+        return if current_qrcode == requested_qrcode {
+            "wait"
+        } else {
+            "expired"
+        };
+    }
+    match login_status {
+        LoginStatusKind::LoggedIn => "confirmed",
+        LoginStatusKind::WaitingForKey | LoginStatusKind::KeyUnavailable => "scaned",
+        LoginStatusKind::WaitingForLogin if has_key => "scaned",
+        LoginStatusKind::WaitingForLogin => "wait",
+    }
 }
 
 pub async fn get_updates(
@@ -929,6 +949,28 @@ fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qrcode_status_expires_replaced_qrcode() {
+        assert_eq!(
+            qrcode_status(
+                "xvfb-qr-old",
+                Some("xvfb-qr-current"),
+                LoginStatusKind::WaitingForLogin,
+                false,
+            ),
+            "expired"
+        );
+        assert_eq!(
+            qrcode_status(
+                "xvfb-qr-current",
+                Some("xvfb-qr-current"),
+                LoginStatusKind::WaitingForLogin,
+                false,
+            ),
+            "wait"
+        );
+    }
 
     #[test]
     fn updates_cursor_round_trips() {

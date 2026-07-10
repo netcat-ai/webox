@@ -81,7 +81,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 
 `/get_qrcode_status` 只轮询本地 WeChat 登录状态，不承担初始化工作。后台初始化器在检测到主窗口登录成功后自动
 提取并验证 DB key；能读取消息时返回 `confirmed`，并返回后续业务请求使用的 `bot_token` 和 `baseurl`。当前只从本机 WeChat 状态推导
-`wait`、`scaned`、`confirmed`，不伪造 `binded_redirect`、`need_verifycode` 这类远端 iLink 状态：
+`wait`、`scaned`、`confirmed`。WeChat 自动刷新二维码后，使用旧二维码 ID 查询会返回 `expired`，客户端应重新调用
+`/get_bot_qrcode`；不伪造 `binded_redirect`、`need_verifycode` 这类远端 iLink 状态：
 
 ```json
 {

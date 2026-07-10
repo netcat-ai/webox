@@ -73,6 +73,7 @@ WeChat login window
 - `WEBOX_QR_SCREENSHOT_PATH` 指向 Xvfb framebuffer。只有同时检测到 WeChat 蓝色二维码并由 QR 解码器识别成功时才返回裁剪后的 PNG。
 - `GET /get_bot_qrcode` 返回标准 `qrcode` 和 `qrcode_img_content`。
 - `GET /get_qrcode_status` 只读取状态；后台初始化器能读取消息后才返回 `confirmed`。
+- WeChat 自动刷新二维码时 ID 会随图像变化；旧 ID 查询返回 `expired`，客户端重新获取当前二维码。
 - 状态只从本机 WeChat 推导；`binded_redirect`、`need_verifycode` 等远端 iLink 状态不做伪造。
 - `confirmed.baseurl` 返回服务根地址，客户端按标准协议拼根路径端点。
 - 只暴露标准根路径端点，不保留 `/ilink/bot/*` 或项目早期的自定义 API。
