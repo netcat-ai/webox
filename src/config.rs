@@ -1,4 +1,6 @@
+use anyhow::{Context, Result};
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -14,10 +16,16 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self> {
+        let state_dir = optional_path(&env::var("WEBOX_WEAGENT_STATE_DIR").unwrap_or_default())
+            .unwrap_or_else(|| PathBuf::from("/webox/state/weagent"));
+        let api_token = match optional_string(&env::var("WEBOX_API_TOKEN").unwrap_or_default()) {
+            Some(token) => token,
+            None => load_or_create_api_token(&state_dir)?,
+        };
+        Ok(Self {
             listen_addr: normalize_listen_addr(&env_or("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
-            api_token: env_or("WEBOX_API_TOKEN", "webox"),
+            api_token,
             tenant_id: env_or("WEBOX_TENANT_ID", "default"),
             provider_account_id: env_or("WEBOX_PROVIDER_ACCOUNT_ID", "default"),
             public_base_url: optional_string(
@@ -28,14 +36,33 @@ impl Config {
                 "WEBOX_QR_SCREENSHOT_PATH",
                 "/webox/runtime/xvfb/Xvfb_screen0",
             )),
-            state_dir: env::var("WEBOX_WEAGENT_STATE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/webox/state/weagent")),
-            media_dir: env::var("WEBOX_MEDIA_STORE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/webox/state/weagent/media")),
+            state_dir,
+            media_dir: optional_path(&env::var("WEBOX_MEDIA_STORE_DIR").unwrap_or_default())
+                .unwrap_or_else(|| PathBuf::from("/webox/state/weagent/media")),
+        })
+    }
+}
+
+fn load_or_create_api_token(state_dir: &PathBuf) -> Result<String> {
+    let path = state_dir.join("api-token");
+    if let Ok(value) = fs::read_to_string(&path) {
+        if let Some(token) = optional_string(&value) {
+            return Ok(token);
         }
     }
+    fs::create_dir_all(state_dir)
+        .with_context(|| format!("create state directory {}", state_dir.display()))?;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, token.as_bytes())
+        .with_context(|| format!("write API token {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&tmp, &path).with_context(|| format!("persist API token {}", path.display()))?;
+    Ok(token)
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
@@ -72,5 +99,17 @@ mod tests {
     fn listen_addr_accepts_go_style_port_only() {
         assert_eq!(normalize_listen_addr(":8080"), "0.0.0.0:8080");
         assert_eq!(normalize_listen_addr("127.0.0.1:8080"), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn generated_api_token_is_stable_in_state_directory() {
+        let root = std::env::temp_dir().join(format!("webox-config-{}", uuid::Uuid::new_v4()));
+
+        let first = load_or_create_api_token(&root).unwrap();
+        let second = load_or_create_api_token(&root).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        fs::remove_dir_all(root).ok();
     }
 }

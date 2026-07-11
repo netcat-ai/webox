@@ -45,19 +45,23 @@ check_runtime_base() {
     return 3
   fi
 
-  docker run --rm --entrypoint bash "$runtime_image" -lc '
+  docker run --rm --entrypoint bash \
+    -e WEBOX_PREFLIGHT_SKIP_WECHAT_DEB="$skip_wechat_deb" \
+    "$runtime_image" -lc '
     set -euo pipefail
     test -x /webox/weagent/bin/weagent
     test -x /webox/weagent/bin/entrypoint.sh
-    test -x /webox/weagent/bin/wechat-ctl.sh
     test -x /webox/weagent/bin/webox-identity.sh
+    if [ "$WEBOX_PREFLIGHT_SKIP_WECHAT_DEB" != "1" ]; then
+      test -x /webox/wechat/opt/wechat/wechat
+    fi
     test "$(getent passwd webox | cut -d: -f6)" = "/webox/state/home"
-    getcap /webox/weagent/bin/weagent | grep -q "cap_sys_ptrace=ep"
-    for cmd in Xvfb openbox xdotool xclip gosu tini curl; do
+    getcap /webox/weagent/bin/weagent | grep "cap_sys_ptrace=ep" >/dev/null
+    for cmd in Xvfb ffmpeg openbox xdotool xclip gosu tini; do
       command -v "$cmd" >/dev/null
     done
-    ldconfig -p | grep -q "libpulse\\.so\\.0"
-    ldconfig -p | grep -q "libpulse-simple\\.so\\.0"
+    ldconfig -p | grep "libpulse\\.so\\.0" >/dev/null
+    ldconfig -p | grep "libpulse-simple\\.so\\.0" >/dev/null
   '
   echo "[preflight] runtime image has required process and UI dependencies: $runtime_image"
 }

@@ -8,24 +8,21 @@ services:
         APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-}
         APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-}
     image: webox:local
-    container_name: webox
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - RUST_LOG=${RUST_LOG:-weagent=info,tower_http=info}
-      - WEBOX_API_TOKEN=${WEBOX_API_TOKEN:-webox}
+      - WEBOX_API_TOKEN=${WEBOX_API_TOKEN:-}
       - WEBOX_TENANT_ID=${WEBOX_TENANT_ID:-default}
       - WEBOX_PROVIDER_ACCOUNT_ID=${WEBOX_PROVIDER_ACCOUNT_ID:-default}
       - WEBOX_LISTEN_ADDR=:8080
       - WEBOX_PUBLIC_BASE_URL=${WEBOX_PUBLIC_BASE_URL:-}
       - WEBOX_WEAGENT_STATE_DIR=${WEBOX_WEAGENT_STATE_DIR:-/webox/state/weagent}
       - WEBOX_MEDIA_STORE_DIR=${WEBOX_MEDIA_STORE_DIR:-/webox/state/weagent/media}
-      - WEBOX_MEDIA_TRANSFER_DIR=${WEBOX_MEDIA_TRANSFER_DIR:-/webox/state/weagent/transfer}
       - WEBOX_QR_SCREENSHOT_PATH=${WEBOX_QR_SCREENSHOT_PATH:-/webox/runtime/xvfb/Xvfb_screen0}
     volumes:
       - ./data/state:/webox/state
-      - ./data/logs:/webox/logs
     ports:
-      - "${WEBOX_HTTP_PORT:-38080}:8080"
+      - "${WEBOX_HTTP_HOST:-127.0.0.1}:${WEBOX_HTTP_PORT:-38080}:8080"
     shm_size: "1gb"
     cap_add:
       - SYS_PTRACE

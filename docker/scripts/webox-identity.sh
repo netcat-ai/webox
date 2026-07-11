@@ -23,18 +23,3 @@ fi
 printf '%s\n' "$MID" > /etc/machine-id 2>/dev/null || true
 mkdir -p /var/lib/dbus
 printf '%s\n' "$MID" > /var/lib/dbus/machine-id 2>/dev/null || true
-rm -f /.dockerenv 2>/dev/null || true
-
-if [ "${WEBOX_SPOOF_OS:-1}" = "1" ]; then
-  cat > /etc/os-release <<'OSEOF'
-PRETTY_NAME="deepin 23"
-NAME="deepin"
-VERSION_ID="23"
-VERSION="23"
-VERSION_CODENAME=beige
-ID=deepin
-ID_LIKE=debian
-HOME_URL="https://www.deepin.org/"
-BUG_REPORT_URL="https://bbs.deepin.org/"
-OSEOF
-fi

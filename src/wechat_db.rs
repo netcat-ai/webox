@@ -3,12 +3,12 @@
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
 use anyhow::{anyhow, bail, Context, Result};
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::Decryptor;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,10 +28,8 @@ const SQLITE_HDR: &[u8] = b"SQLite format 3\x00";
 const V2_IMAGE_MAGIC: [u8; 6] = [0x07, 0x08, b'V', b'2', 0x08, 0x07];
 const V1_IMAGE_MAGIC: [u8; 6] = [0x07, 0x08, b'V', b'1', 0x08, 0x07];
 const V2_IMAGE_HEADER_SIZE: usize = 15;
-const MAX_EMOTION_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_VIDEO_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LOCAL_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
 
-type Aes128CbcDec = Decryptor<Aes128>;
 type Aes256CbcDec = Decryptor<Aes256>;
 type Block = aes::cipher::Block<Aes256>;
 
@@ -45,14 +43,23 @@ struct KeyEntry {
 #[derive(Debug, Clone)]
 pub struct InitData {
     pub db_dir: PathBuf,
+    pub wxid: String,
     pub keys: HashMap<String, String>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MessagePosition {
+    pub create_time: i64,
+    pub local_id: i64,
+}
+
+pub type MessagePositions = BTreeMap<String, BTreeMap<String, MessagePosition>>;
+pub type RoomMessagePositions = BTreeMap<String, MessagePosition>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PollData {
     pub messages: Vec<Value>,
-    pub new_state: HashMap<String, i64>,
-    pub meta: Value,
+    pub new_state: MessagePositions,
 }
 
 #[derive(Debug, Clone)]
@@ -100,29 +107,6 @@ struct ReferMsg {
     body: Value,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CacheMode {
-    CacheHit,
-    WalIncremental,
-    FullDecrypt,
-}
-
-impl CacheMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            CacheMode::CacheHit => "cache_hit",
-            CacheMode::WalIncremental => "wal_incremental",
-            CacheMode::FullDecrypt => "full_decrypt",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CacheResolve {
-    path: PathBuf,
-    mode: CacheMode,
-}
-
 struct DbCache {
     db_dir: PathBuf,
     cache_dir: PathBuf,
@@ -144,7 +128,6 @@ struct MessageShard {
     path: PathBuf,
     table: String,
     max_ts: i64,
-    cache_mode: CacheMode,
 }
 
 pub fn detect_db_storage() -> Option<PathBuf> {
@@ -162,6 +145,13 @@ pub fn detect_db_storage() -> Option<PathBuf> {
     candidates.into_iter().next_back()
 }
 
+pub fn account_id_from_db_dir(db_dir: &Path) -> Option<String> {
+    let account_dir = db_dir.parent()?;
+    let raw = account_dir.file_name()?.to_string_lossy();
+    let normalized = normalize_wxid(&raw);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 pub fn init_from_memory() -> Result<InitData> {
     let db_dir = detect_db_storage().ok_or_else(|| anyhow!("未找到微信 db_storage 目录"))?;
     let entries = scan_keys(&db_dir)?;
@@ -172,7 +162,9 @@ pub fn init_from_memory() -> Result<InitData> {
         .iter()
         .map(|entry| (entry.db_name.clone(), entry.enc_key.clone()))
         .collect();
-    Ok(InitData { db_dir, keys })
+    let wxid = account_id_from_db_dir(&db_dir)
+        .ok_or_else(|| anyhow!("无法从微信数据库目录识别当前账号"))?;
+    Ok(InitData { db_dir, wxid, keys })
 }
 
 pub fn parse_keys_value(value: &Value) -> Result<HashMap<String, String>> {
@@ -207,13 +199,40 @@ pub fn read_keys_file(path: &Path) -> Result<HashMap<String, String>> {
 pub fn poll_new_messages(
     db_dir: PathBuf,
     keys: HashMap<String, String>,
-    state: Option<HashMap<String, i64>>,
+    state: MessagePositions,
+    started_at: i64,
     limit: usize,
     cache_dir: PathBuf,
 ) -> Result<PollData> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
     let names = load_names(&mut db)?;
-    q_new_messages(&mut db, &names, state, limit)
+    q_new_messages(&mut db, &names, state, started_at, limit)
+}
+
+pub fn baseline_message_positions(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    started_at: i64,
+) -> Result<MessagePositions> {
+    let mut db = DbCache::new(db_dir, cache_dir, keys)?;
+    let names = load_names(&mut db)?;
+    let sessions = load_session_state(&mut db)?;
+    let mut positions = BTreeMap::new();
+    for username in sessions.keys() {
+        let mut room = BTreeMap::new();
+        for shard in find_msg_shards(&mut db, &names, username)? {
+            room.insert(
+                shard.rel_key,
+                max_message_position(&shard.path, &shard.table)?.unwrap_or(MessagePosition {
+                    create_time: started_at,
+                    local_id: 0,
+                }),
+            );
+        }
+        positions.insert(username.clone(), room);
+    }
+    Ok(positions)
 }
 
 pub fn current_session_state(
@@ -223,6 +242,91 @@ pub fn current_session_state(
 ) -> Result<HashMap<String, i64>> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
     load_session_state(&mut db)
+}
+
+pub fn has_outgoing_text(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+    positions: &RoomMessagePositions,
+    text: &str,
+) -> Result<bool> {
+    has_outgoing_payload(
+        db_dir,
+        keys,
+        cache_dir,
+        roomid,
+        positions,
+        |local_type, content| {
+            is_text_message(local_type)
+                && strip_group_prefix(content, roomid.ends_with("@chatroom")) == text
+        },
+    )
+}
+
+pub fn room_message_positions(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+) -> Result<RoomMessagePositions> {
+    let mut db = DbCache::new(db_dir, cache_dir, keys)?;
+    let names = load_names(&mut db)?;
+    let mut positions = BTreeMap::new();
+    for shard in find_msg_shards(&mut db, &names, roomid)? {
+        positions.insert(
+            shard.rel_key,
+            max_message_position(&shard.path, &shard.table)?.unwrap_or_default(),
+        );
+    }
+    Ok(positions)
+}
+
+fn has_outgoing_payload(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+    positions: &RoomMessagePositions,
+    matches: impl Fn(i64, &str) -> bool,
+) -> Result<bool> {
+    let mut db = DbCache::new(db_dir, cache_dir, keys)?;
+    let names = load_names(&mut db)?;
+    for shard in find_msg_shards(&mut db, &names, roomid)? {
+        let position = positions.get(&shard.rel_key).copied().unwrap_or_default();
+        let conn = Connection::open(&shard.path)?;
+        let sql = format!(
+            "SELECT local_type, message_content, WCDB_CT_message_content
+             FROM [{}]
+             WHERE ((create_time > ?1) OR (create_time = ?2 AND local_id > ?3))
+               AND status = 2 AND origin_source = 1
+             ORDER BY create_time DESC, local_id DESC LIMIT 100",
+            shard.table
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                position.create_time,
+                position.create_time,
+                position.local_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    get_content_bytes(row, 1),
+                    row.get::<_, i64>(2).unwrap_or(0),
+                ))
+            },
+        )?;
+        for row in rows.flatten() {
+            let content = decompress_message(&row.1, row.2);
+            if matches(row.0, &content) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub fn read_media(
@@ -241,7 +345,16 @@ pub fn read_media(
     )? {
         return Ok(Some(media));
     }
-    read_video_media(db_dir, keys, cache_dir, roomid, msgid)
+    if let Some(media) = read_video_media(
+        db_dir.clone(),
+        keys.clone(),
+        cache_dir.clone(),
+        roomid,
+        msgid,
+    )? {
+        return Ok(Some(media));
+    }
+    read_file_media(db_dir, keys, cache_dir, roomid, msgid)
 }
 
 pub fn read_image_media(
@@ -325,10 +438,59 @@ fn read_video_media(
             if let Some(media) = find_video_file(&account_dir, local_id, create_time, &content)? {
                 return Ok(Some(media));
             }
-            if let Some(media) = download_video_media(&content)? {
-                return Ok(Some(media));
-            }
         }
+    }
+    Ok(None)
+}
+
+fn read_file_media(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+    msgid: &str,
+) -> Result<Option<MediaFile>> {
+    let server_id = match msgid.trim().parse::<i64>() {
+        Ok(value) if value > 0 => value,
+        _ => return Ok(None),
+    };
+    let roomid = roomid.trim();
+    if roomid.is_empty() {
+        return Ok(None);
+    }
+    let mut db = DbCache::new(db_dir.clone(), cache_dir, keys)?;
+    let names = load_names(&mut db)?;
+    let shards = find_msg_shards(&mut db, &names, roomid)?;
+    let account_dir = db_dir
+        .parent()
+        .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?;
+    for shard in shards {
+        let Some((_local_id, content, _create_time, _local_type)) =
+            media_message_content(&shard.path, &shard.table, server_id, &[49])?
+        else {
+            continue;
+        };
+        let content = strip_group_prefix(&content, roomid.ends_with("@chatroom"));
+        if appmsg_type(content) != Some(6) {
+            continue;
+        }
+        let filename = appmsg_title(content);
+        if filename.is_empty() {
+            continue;
+        }
+        let Some(path) = find_file_by_name(&account_dir.join("msg").join("file"), &filename)?
+        else {
+            continue;
+        };
+        let metadata = fs::metadata(&path)?;
+        if metadata.len() == 0 || metadata.len() > MAX_LOCAL_MEDIA_BYTES {
+            continue;
+        }
+        return Ok(Some(MediaFile {
+            data: fs::read(path)?,
+            content_type: "application/octet-stream".to_string(),
+            filename,
+        }));
     }
     Ok(None)
 }
@@ -681,10 +843,6 @@ impl DbCache {
         Ok(cache)
     }
 
-    fn db_dir(&self) -> &Path {
-        &self.db_dir
-    }
-
     fn cache_file_path(&self, rel_key: &str) -> PathBuf {
         let hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
         self.cache_dir.join(format!("{hash}.db"))
@@ -742,10 +900,6 @@ impl DbCache {
     }
 
     fn get(&mut self, rel_key: &str) -> Result<Option<PathBuf>> {
-        Ok(self.get_with_mode(rel_key)?.map(|r| r.path))
-    }
-
-    fn get_with_mode(&mut self, rel_key: &str) -> Result<Option<CacheResolve>> {
         let Some(enc_key_hex) = self.all_keys.get(rel_key).cloned() else {
             return Ok(None);
         };
@@ -766,10 +920,7 @@ impl DbCache {
         if let Some(entry) = self.inner.get(rel_key).cloned() {
             if entry.db_mtime == db_mt && entry.decrypted_path.exists() {
                 if entry.wal_mtime == wal_mt {
-                    return Ok(Some(CacheResolve {
-                        path: entry.decrypted_path,
-                        mode: CacheMode::CacheHit,
-                    }));
+                    return Ok(Some(entry.decrypted_path));
                 }
                 if wal_path.exists() {
                     apply_wal(&wal_path, &entry.decrypted_path, &enc_key_bytes)?;
@@ -783,10 +934,7 @@ impl DbCache {
                     },
                 );
                 self.save_persistent();
-                return Ok(Some(CacheResolve {
-                    path: entry.decrypted_path,
-                    mode: CacheMode::WalIncremental,
-                }));
+                return Ok(Some(entry.decrypted_path));
             }
         }
 
@@ -804,10 +952,7 @@ impl DbCache {
             },
         );
         self.save_persistent();
-        Ok(Some(CacheResolve {
-            path: out_path,
-            mode: CacheMode::FullDecrypt,
-        }))
+        Ok(Some(out_path))
     }
 }
 
@@ -858,127 +1003,100 @@ fn load_names(db: &mut DbCache) -> Result<Names> {
 fn q_new_messages(
     db: &mut DbCache,
     names: &Names,
-    state: Option<HashMap<String, i64>>,
+    mut state: MessagePositions,
+    started_at: i64,
     limit: usize,
 ) -> Result<PollData> {
-    let fallback_ts = unix_now() - 86400;
     let session_ts_map = load_session_state(db)?;
-    let changed: Vec<(String, i64)> = session_ts_map
+    let changed: Vec<String> = session_ts_map
         .iter()
         .filter(|(uname, ts)| {
             let last_known = state
-                .as_ref()
-                .and_then(|m| m.get(*uname))
-                .copied()
-                .unwrap_or(fallback_ts);
-            **ts > last_known
+                .get(*uname)
+                .and_then(|streams| streams.values().max())
+                .map(|position| position.create_time)
+                .unwrap_or(started_at);
+            **ts >= last_known
         })
-        .map(|(uname, ts)| (uname.clone(), *ts))
+        .map(|(uname, _)| uname.clone())
         .collect();
-    let unknown_shards = discover_unknown_shards(db.db_dir(), &names.msg_db_keys);
-
     if changed.is_empty() {
         return Ok(PollData {
             messages: Vec::new(),
-            new_state: session_ts_map,
-            meta: json!({
-                "shards_scanned": 0,
-                "shards_hit": 0,
-                "unknown_shards": unknown_shards,
-                "status": "windowed",
-                "cache_mode_per_shard": {},
-                "shard_paths": {},
-            }),
+            new_state: state,
         });
     }
 
-    let per_table_limit = limit.saturating_mul(5).max(200);
-    let mut all_msgs = Vec::new();
-    let mut scanned_rel_keys = HashSet::new();
-    let mut hit_rel_keys = HashSet::new();
-    let mut cache_modes = serde_json::Map::new();
-    let mut shard_paths = serde_json::Map::new();
+    let per_table_limit = limit.saturating_mul(4).clamp(100, 2_000);
+    let mut events = Vec::new();
 
-    for (uname, _) in &changed {
-        let since_ts = state
-            .as_ref()
-            .and_then(|m| m.get(uname))
-            .copied()
-            .unwrap_or(fallback_ts);
+    for uname in &changed {
         let shards = find_msg_shards(db, names, uname)?;
         if shards.is_empty() {
             continue;
         }
-        for shard in &shards {
-            scanned_rel_keys.insert(shard.rel_key.clone());
-            cache_modes.insert(
-                shard.rel_key.clone(),
-                Value::String(shard.cache_mode.as_str().to_string()),
-            );
-            shard_paths.insert(
-                shard.rel_key.clone(),
-                Value::String(shard.path.to_string_lossy().into_owned()),
-            );
-        }
-
         let display = names.display(uname);
         let chat_type = chat_type_of(uname, names);
         let is_group = chat_type == "group";
         for shard in &shards {
-            let msgs = query_new_table(
+            let position = state
+                .get(uname)
+                .and_then(|streams| streams.get(&shard.rel_key))
+                .copied()
+                .unwrap_or(MessagePosition {
+                    create_time: started_at,
+                    local_id: 0,
+                });
+            let rows = query_new_table(
                 &shard.path,
                 &shard.table,
+                &shard.rel_key,
                 uname,
                 &display,
                 chat_type,
                 is_group,
                 &names.map,
-                since_ts,
+                position,
                 per_table_limit,
             )
-            .unwrap_or_else(|e| {
-                eprintln!("[new-messages] skip {}: {}", shard.table, e);
-                Vec::new()
-            });
-            if !msgs.is_empty() {
-                hit_rel_keys.insert(shard.rel_key.clone());
-            }
-            all_msgs.extend(msgs);
+            .with_context(|| format!("query message table {}", shard.table))?;
+            events.extend(rows);
         }
     }
 
-    let all_msgs = select_poll_messages(all_msgs, limit);
-
-    let mut returned_max_ts: HashMap<String, i64> = HashMap::new();
-    for msg in &all_msgs {
-        if let (Some(u), Some(ts_ms)) = (msg["roomid"].as_str(), msg["msgtime"].as_i64()) {
-            let ts = ts_ms / 1000;
-            let current = returned_max_ts.entry(u.to_string()).or_insert(0);
-            if ts > *current {
-                *current = ts;
+    events.sort_by(|a, b| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| a.room.cmp(&b.room))
+            .then_with(|| a.shard.cmp(&b.shard))
+    });
+    let scan_limit = limit.saturating_mul(10).clamp(200, 5_000);
+    let mut messages = Vec::new();
+    for event in events.into_iter().take(scan_limit) {
+        state
+            .entry(event.room)
+            .or_default()
+            .insert(event.shard, event.position);
+        if let Some(message) = event.message {
+            messages.push(message);
+            if messages.len() >= limit {
+                break;
             }
         }
     }
-    let new_state = next_poll_state(
-        session_ts_map,
-        &changed,
-        state.as_ref(),
-        &returned_max_ts,
-        fallback_ts,
-    );
 
     Ok(PollData {
-        messages: all_msgs,
-        new_state,
-        meta: json!({
-            "shards_scanned": scanned_rel_keys.len(),
-            "shards_hit": hit_rel_keys.len(),
-            "unknown_shards": unknown_shards,
-            "status": "windowed",
-            "cache_mode_per_shard": cache_modes,
-            "shard_paths": shard_paths,
-        }),
+        messages,
+        new_state: state,
     })
+}
+
+#[derive(Debug)]
+struct MessageEvent {
+    room: String,
+    shard: String,
+    position: MessagePosition,
+    message: Option<Value>,
 }
 
 fn load_session_state(db: &mut DbCache) -> Result<HashMap<String, i64>> {
@@ -1001,10 +1119,10 @@ fn find_msg_shards(db: &mut DbCache, names: &Names, username: &str) -> Result<Ve
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     let mut results = Vec::new();
     for rel_key in &names.msg_db_keys {
-        let Some(resolved) = db.get_with_mode(rel_key)? else {
+        let Some(path) = db.get(rel_key)? else {
             continue;
         };
-        let conn = Connection::open(&resolved.path)?;
+        let conn = Connection::open(&path)?;
         let table_exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -1027,10 +1145,9 @@ fn find_msg_shards(db: &mut DbCache, names: &Names, username: &str) -> Result<Ve
         if let Some(ts) = max_ts {
             results.push(MessageShard {
                 rel_key: rel_key.clone(),
-                path: resolved.path,
+                path,
                 table: table_name.clone(),
                 max_ts: ts,
-                cache_mode: resolved.mode,
             });
         }
     }
@@ -1042,41 +1159,78 @@ fn find_msg_shards(db: &mut DbCache, names: &Names, username: &str) -> Result<Ve
 fn query_new_table(
     db_path: &Path,
     table: &str,
+    shard: &str,
     username: &str,
     _display: &str,
     _chat_type: &str,
     is_group: bool,
     names: &HashMap<String, String>,
-    since_ts: i64,
+    position: MessagePosition,
     limit: usize,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<MessageEvent>> {
     let conn = Connection::open(db_path)?;
     let id2u = load_id2u(&conn);
     let sql = format!(
         "SELECT local_id, server_id, local_type, create_time, real_sender_id,
-                message_content, WCDB_CT_message_content
-         FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
+                message_content, WCDB_CT_message_content, status, origin_source
+         FROM [{}]
+         WHERE create_time > ? OR (create_time = ? AND local_id > ?)
+         ORDER BY create_time ASC, local_id ASC LIMIT ?",
         table
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<_> = stmt
-        .query_map(rusqlite::params![since_ts, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                get_content_bytes(row, 5),
-                row.get::<_, i64>(6).unwrap_or(0),
-            ))
-        })?
+        .query_map(
+            rusqlite::params![
+                position.create_time,
+                position.create_time,
+                position.local_id,
+                limit as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    get_content_bytes(row, 5),
+                    row.get::<_, i64>(6).unwrap_or(0),
+                    row.get::<_, i64>(7).unwrap_or(0),
+                    row.get::<_, i64>(8).unwrap_or(0),
+                ))
+            },
+        )?
         .filter_map(|row| row.ok())
         .collect();
 
     let mut out = Vec::new();
     let empty_group_names = HashMap::new();
-    for (local_id, server_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
+    for (
+        local_id,
+        server_id,
+        local_type,
+        ts,
+        real_sender_id,
+        content_bytes,
+        ct,
+        status,
+        origin_source,
+    ) in rows
+    {
+        let position = MessagePosition {
+            create_time: ts,
+            local_id,
+        };
+        if status != 3 || origin_source != 2 {
+            out.push(MessageEvent {
+                room: username.to_string(),
+                shard: shard.to_string(),
+                position,
+                message: None,
+            });
+            continue;
+        }
         let content = decompress_message(&content_bytes, ct);
         let _sender_display = sender_label(
             real_sender_id,
@@ -1113,9 +1267,30 @@ fn query_new_table(
         } else {
             msg[msgtype] = json!({ "content": text });
         }
-        out.push(msg);
+        out.push(MessageEvent {
+            room: username.to_string(),
+            shard: shard.to_string(),
+            position,
+            message: Some(msg),
+        });
     }
     Ok(out)
+}
+
+fn max_message_position(db_path: &Path, table: &str) -> Result<Option<MessagePosition>> {
+    let conn = Connection::open(db_path)?;
+    let sql = format!(
+        "SELECT create_time, local_id FROM [{}] ORDER BY create_time DESC, local_id DESC LIMIT 1",
+        table
+    );
+    conn.query_row(&sql, [], |row| {
+        Ok(MessagePosition {
+            create_time: row.get(0)?,
+            local_id: row.get(1)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn media_message_content(
@@ -1161,28 +1336,7 @@ fn find_emotion_media(account_dir: &Path, content: &str) -> Result<Option<MediaF
         return Ok(None);
     };
 
-    if let Some(media) = find_local_emotion_media(account_dir, &md5)? {
-        return Ok(Some(media));
-    }
-
-    for attr in ["cdnurl", "thumburl"] {
-        let Some(url) = xml_attr(content, attr).filter(|value| is_http_url(value)) else {
-            continue;
-        };
-        if let Some(media) = download_emotion_media(&url, &md5, None)? {
-            return Ok(Some(media));
-        }
-    }
-
-    let encrypted = xml_attr(content, "encrypturl").filter(|value| is_http_url(value));
-    let aes_key = xml_attr(content, "aeskey").and_then(|value| hex_16_bytes(&value));
-    if let (Some(url), Some(key)) = (encrypted, aes_key) {
-        if let Some(media) = download_emotion_media(&url, &md5, Some(key))? {
-            return Ok(Some(media));
-        }
-    }
-
-    Ok(None)
+    find_local_emotion_media(account_dir, &md5)
 }
 
 fn find_local_emotion_media(account_dir: &Path, md5: &str) -> Result<Option<MediaFile>> {
@@ -1204,71 +1358,6 @@ fn find_local_emotion_media(account_dir: &Path, md5: &str) -> Result<Option<Medi
         Ok(false)
     })?;
     Ok(found)
-}
-
-fn download_emotion_media(
-    url: &str,
-    filename_stem: &str,
-    aes_key: Option<[u8; 16]>,
-) -> Result<Option<MediaFile>> {
-    download_binary_media(
-        url,
-        filename_stem,
-        MAX_EMOTION_MEDIA_BYTES,
-        aes_key,
-        image_media_from_bytes,
-    )
-}
-
-fn download_binary_media(
-    url: &str,
-    filename_stem: &str,
-    max_bytes: u64,
-    aes_key: Option<[u8; 16]>,
-    decode: fn(Vec<u8>, &str) -> Result<Option<MediaFile>>,
-) -> Result<Option<MediaFile>> {
-    let tmp = std::env::temp_dir();
-    let id = uuid::Uuid::new_v4();
-    let output_path = tmp.join(format!("webox-media-{id}.bin"));
-    let output_path_str = output_path.to_string_lossy().into_owned();
-    let max_bytes_arg = max_bytes.to_string();
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "45",
-            "--retry",
-            "1",
-            "--max-filesize",
-            &max_bytes_arg,
-            "--output",
-        ])
-        .arg(&output_path_str)
-        .arg(url)
-        .output()
-        .context("启动 curl 下载表情失败")?;
-
-    if !output.status.success() {
-        let _ = fs::remove_file(&output_path);
-        return Ok(None);
-    }
-
-    let metadata = fs::metadata(&output_path)
-        .with_context(|| format!("读取媒体下载结果失败: {}", output_path.display()))?;
-    if metadata.len() == 0 || metadata.len() > max_bytes {
-        let _ = fs::remove_file(&output_path);
-        return Ok(None);
-    }
-
-    let mut data = fs::read(&output_path)
-        .with_context(|| format!("读取媒体下载结果失败: {}", output_path.display()))?;
-    let _ = fs::remove_file(&output_path);
-    if let Some(key) = aes_key {
-        data = aes128_cbc_decrypt_pkcs7_with_key_iv(&key, &data)?;
-    }
-    decode(data, filename_stem)
 }
 
 fn image_media_from_bytes(data: Vec<u8>, filename_stem: &str) -> Result<Option<MediaFile>> {
@@ -1386,35 +1475,11 @@ fn video_media_from_file(path: &Path, filename_stem: &str) -> Result<Option<Medi
         return Ok(None);
     }
     let metadata = fs::metadata(path)?;
-    if metadata.len() == 0 || metadata.len() > MAX_VIDEO_MEDIA_BYTES {
+    if metadata.len() == 0 || metadata.len() > MAX_LOCAL_MEDIA_BYTES {
         return Ok(None);
     }
     let data = fs::read(path)?;
     video_media_from_bytes(data, filename_stem)
-}
-
-fn download_video_media(content: &str) -> Result<Option<MediaFile>> {
-    let Some(url) = xml_attr(content, "cdnvideourl")
-        .or_else(|| xml_attr(content, "videourl"))
-        .or_else(|| xml_attr(content, "url"))
-    else {
-        return Ok(None);
-    };
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Ok(None);
-    }
-    let filename_stem = xml_attr(content, "md5")
-        .or_else(|| xml_attr(content, "cdnvideomd5"))
-        .filter(|value| is_hex_like(value, 32))
-        .unwrap_or_else(|| format!("{:x}", md5::compute(url.as_bytes())));
-    let aes_key = xml_attr(content, "aeskey").and_then(|value| hex_16_bytes(&value));
-    download_binary_media(
-        &url,
-        &filename_stem,
-        MAX_VIDEO_MEDIA_BYTES,
-        aes_key,
-        video_media_from_bytes,
-    )
 }
 
 fn video_media_from_bytes(data: Vec<u8>, filename_stem: &str) -> Result<Option<MediaFile>> {
@@ -1674,8 +1739,9 @@ fn convert_wxgf_to_jpeg(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     let jpeg = fs::read(&output_path)
-        .with_context(|| format!("读取 ffmpeg JPEG 输出失败: {}", output_path.display()))?;
+        .with_context(|| format!("读取 ffmpeg JPEG 输出失败: {}", output_path.display()));
     let _ = fs::remove_file(&output_path);
+    let jpeg = jpeg?;
     if detect_media_content_type(&jpeg) != "image/jpeg" {
         bail!("ffmpeg 转换 wxgf 后未生成 JPEG");
     }
@@ -1755,15 +1821,6 @@ fn aes_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn aes128_cbc_decrypt_pkcs7_with_key_iv(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
-    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
-        bail!("AES-CBC 输入长度不是 16 的倍数");
-    }
-    Aes128CbcDec::new(key.into(), key.into())
-        .decrypt_padded_vec_mut::<Pkcs7>(cipher)
-        .map_err(|_| anyhow!("AES-CBC PKCS7 解密失败"))
-}
-
 fn decode_legacy_xor_image(file_bytes: &[u8]) -> Result<Vec<u8>> {
     let key =
         detect_legacy_xor_key(file_bytes).ok_or_else(|| anyhow!("无法识别 legacy XOR 图片"))?;
@@ -1821,12 +1878,20 @@ fn image_key_for_account(account_dir: &Path, attach_root: &Path) -> Result<Image
 
     let cache_key = account_dir.to_string_lossy().into_owned();
     let cache = IMAGE_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(found) = cache.lock().unwrap().get(&cache_key).copied() {
+    if let Some(found) = cache
+        .lock()
+        .map_err(|_| anyhow!("image key cache lock is poisoned"))?
+        .get(&cache_key)
+        .copied()
+    {
         return Ok(found);
     }
 
     let key = derive_image_key_for_account(account_dir, attach_root)?;
-    cache.lock().unwrap().insert(cache_key, key);
+    cache
+        .lock()
+        .map_err(|_| anyhow!("image key cache lock is poisoned"))?
+        .insert(cache_key, key);
     Ok(key)
 }
 
@@ -2217,19 +2282,6 @@ fn is_http_url(value: &str) -> bool {
     value.len() <= 4096 && (value.starts_with("http://") || value.starts_with("https://"))
 }
 
-fn hex_16_bytes(value: &str) -> Option<[u8; 16]> {
-    let value = value.trim();
-    if !is_hex_like(value, 32) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (idx, slot) in out.iter_mut().enumerate() {
-        let start = idx * 2;
-        *slot = u8::from_str_radix(&value[start..start + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
 fn is_hex_like(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
@@ -2363,8 +2415,14 @@ fn msgtype_for_message(t: i64, content: &str, is_group: bool, is_quote: bool) ->
     if is_quote {
         return "text";
     }
-    if base_type(t) == 49 && appmsg_sphfeed_body(strip_group_prefix(content, is_group)).is_some() {
-        return "sphfeed";
+    if base_type(t) == 49 {
+        let content = strip_group_prefix(content, is_group);
+        if appmsg_sphfeed_body(content).is_some() {
+            return "sphfeed";
+        }
+        if appmsg_type(content) == Some(6) {
+            return "file";
+        }
     }
     msgtype_for_base(base_type(t))
 }
@@ -2464,6 +2522,10 @@ fn parse_appmsg(text: &str) -> Option<String> {
 
 fn appmsg_title(text: &str) -> String {
     clean_xml_text(extract_xml_text(text, "title").unwrap_or_default())
+}
+
+fn appmsg_type(text: &str) -> Option<i64> {
+    extract_xml_text(text, "type")?.trim().parse().ok()
 }
 
 fn quote_for_message(local_type: i64, content: &str, is_group: bool) -> Option<ReferMsg> {
@@ -2646,85 +2708,6 @@ fn is_text_message(t: i64) -> bool {
     base_type(t) == 1
 }
 
-fn select_poll_messages(mut messages: Vec<Value>, limit: usize) -> Vec<Value> {
-    if messages.len() <= limit {
-        messages.sort_by_key(message_sort_ts);
-        return messages;
-    }
-
-    messages.sort_by(|a, b| {
-        let a_ts = message_sort_ts(a);
-        let b_ts = message_sort_ts(b);
-        a_ts.cmp(&b_ts).then_with(|| {
-            a["roomid"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["roomid"].as_str().unwrap_or(""))
-        })
-    });
-
-    let mut buckets: HashMap<String, VecDeque<Value>> = HashMap::new();
-    for msg in messages {
-        let roomid = msg["roomid"].as_str().unwrap_or("").to_string();
-        buckets.entry(roomid).or_default().push_back(msg);
-    }
-    let mut keys: Vec<String> = buckets.keys().cloned().collect();
-    keys.sort_by_key(|key| {
-        buckets
-            .get(key)
-            .and_then(|bucket| bucket.front())
-            .map(message_sort_ts)
-            .unwrap_or(0)
-    });
-
-    let mut selected = Vec::with_capacity(limit);
-    while selected.len() < limit && !keys.is_empty() {
-        let mut remaining = Vec::new();
-        for key in keys {
-            if selected.len() >= limit {
-                remaining.push(key);
-                continue;
-            }
-            if let Some(bucket) = buckets.get_mut(&key) {
-                if let Some(msg) = bucket.pop_front() {
-                    selected.push(msg);
-                }
-                if !bucket.is_empty() {
-                    remaining.push(key);
-                }
-            }
-        }
-        keys = remaining;
-    }
-    selected.sort_by_key(message_sort_ts);
-    selected
-}
-
-fn message_sort_ts(msg: &Value) -> i64 {
-    msg["msgtime"]
-        .as_i64()
-        .or_else(|| msg["timestamp"].as_i64().map(|ts| ts.saturating_mul(1000)))
-        .unwrap_or(0)
-}
-
-fn next_poll_state(
-    mut session_ts_map: HashMap<String, i64>,
-    changed: &[(String, i64)],
-    previous_state: Option<&HashMap<String, i64>>,
-    returned_max_ts: &HashMap<String, i64>,
-    fallback_ts: i64,
-) -> HashMap<String, i64> {
-    for (uname, _) in changed {
-        let prev = previous_state
-            .and_then(|state| state.get(uname))
-            .copied()
-            .unwrap_or(fallback_ts);
-        let next_ts = returned_max_ts.get(uname).copied().unwrap_or(prev);
-        session_ts_map.insert(uname.clone(), next_ts);
-    }
-    session_ts_map
-}
-
 fn appmsg_url_for_content(content: &str) -> Option<String> {
     let url = extract_xml_text(content, "url")
         .or_else(|| extract_xml_text(content, "url1"))
@@ -2757,30 +2740,6 @@ fn unescape_html(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
-}
-
-fn discover_unknown_shards(db_dir: &Path, known: &[String]) -> Vec<String> {
-    let known_set: HashSet<String> = known.iter().map(|k| k.replace('\\', "/")).collect();
-    let msg_dir = db_dir.join("message");
-    let Ok(entries) = fs::read_dir(&msg_dir) else {
-        return Vec::new();
-    };
-    let mut unknown = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if !is_message_shard(name_str) {
-            continue;
-        }
-        let rel = format!("message/{name_str}");
-        if !known_set.contains(&rel) {
-            unknown.push(rel);
-        }
-    }
-    unknown.sort();
-    unknown
 }
 
 fn is_message_shard_key(rel_key: &str) -> bool {
@@ -2921,13 +2880,6 @@ fn hex_to_32bytes(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -2935,6 +2887,94 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_query_advances_outgoing_rows_but_only_emits_incoming_rows() {
+        let path = std::env::temp_dir().join(format!("webox-message-{}.db", uuid::Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE [Msg_test] (
+                local_id INTEGER PRIMARY KEY,
+                server_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content TEXT,
+                WCDB_CT_message_content INTEGER,
+                status INTEGER,
+                origin_source INTEGER
+            );
+            INSERT INTO [Msg_test] VALUES (1, 101, 1, 1000, 0, 'outgoing', 0, 2, 1);
+            INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'incoming', 0, 3, 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = query_new_table(
+            &path,
+            "Msg_test",
+            "message/msg_0.db",
+            "alice",
+            "Alice",
+            "private",
+            false,
+            &HashMap::new(),
+            MessagePosition {
+                create_time: 999,
+                local_id: 0,
+            },
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events[0].message.is_none());
+        assert_eq!(events[0].position.local_id, 1);
+        assert_eq!(
+            events[1].message.as_ref().unwrap()["text"]["content"],
+            "incoming"
+        );
+        assert_eq!(events[1].position.local_id, 2);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn message_query_uses_local_id_to_resume_within_same_second() {
+        let path = std::env::temp_dir().join(format!("webox-message-{}.db", uuid::Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE [Msg_test] (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, real_sender_id INTEGER, message_content TEXT,
+                WCDB_CT_message_content INTEGER, status INTEGER, origin_source INTEGER
+            );
+            INSERT INTO [Msg_test] VALUES (1, 101, 1, 1000, 0, 'first', 0, 3, 2);
+            INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'second', 0, 3, 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = query_new_table(
+            &path,
+            "Msg_test",
+            "message/msg_0.db",
+            "alice",
+            "Alice",
+            "private",
+            false,
+            &HashMap::new(),
+            MessagePosition {
+                create_time: 1000,
+                local_id: 1,
+            },
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].position.local_id, 2);
+        fs::remove_file(path).ok();
+    }
 
     #[test]
     fn recipient_from_contact_keeps_internal_username() {
@@ -3041,11 +3081,8 @@ mod tests {
             Some("http://x.test/a?m=1&n=2")
         );
         assert_eq!(
-            xml_attr(xml, "aeskey").and_then(|value| hex_16_bytes(&value)),
-            Some([
-                0x0f, 0x0e, 0xf2, 0xe6, 0xb3, 0x3a, 0x47, 0x13, 0xa5, 0x60, 0xc1, 0xb0, 0xb1, 0xf6,
-                0x54, 0x6b
-            ])
+            xml_attr(xml, "aeskey").as_deref(),
+            Some("0f0ef2e6b33a4713a560c1b0b1f6546b")
         );
     }
 
@@ -3079,70 +3116,6 @@ mod tests {
     fn normalizes_wxid_with_suffix() {
         assert_eq!(normalize_wxid("wxid_abc_def0"), "wxid_abc");
         assert_eq!(normalize_wxid("plain_abcd"), "plain");
-    }
-
-    #[test]
-    fn poll_state_does_not_ack_unreturned_changed_sessions() {
-        let session_ts = HashMap::from([
-            ("busy@chatroom".to_string(), 2000),
-            ("target@chatroom".to_string(), 2100),
-        ]);
-        let changed = vec![
-            ("busy@chatroom".to_string(), 2000),
-            ("target@chatroom".to_string(), 2100),
-        ];
-        let returned = HashMap::from([("busy@chatroom".to_string(), 1500)]);
-
-        let state = next_poll_state(session_ts, &changed, None, &returned, 1000);
-
-        assert_eq!(state.get("busy@chatroom"), Some(&1500));
-        assert_eq!(state.get("target@chatroom"), Some(&1000));
-    }
-
-    #[test]
-    fn poll_selection_keeps_low_volume_session_when_busy_session_overflows_limit() {
-        let mut messages = Vec::new();
-        for i in 0..10 {
-            messages.push(json!({
-                "roomid": "busy@chatroom",
-                "msgtime": (1000 + i) * 1000,
-                "text": { "content": format!("busy {i}") },
-            }));
-        }
-        messages.push(json!({
-            "roomid": "target@chatroom",
-            "msgtime": 1005 * 1000,
-            "text": { "content": "target" },
-        }));
-
-        let selected = select_poll_messages(messages, 5);
-
-        assert_eq!(selected.len(), 5);
-        assert!(selected
-            .iter()
-            .any(|msg| msg["roomid"].as_str() == Some("target@chatroom")));
-    }
-
-    #[test]
-    fn poll_state_keeps_previous_position_for_unreturned_sessions() {
-        let session_ts = HashMap::from([
-            ("busy@chatroom".to_string(), 2000),
-            ("target@chatroom".to_string(), 2100),
-        ]);
-        let previous = HashMap::from([
-            ("busy@chatroom".to_string(), 1200),
-            ("target@chatroom".to_string(), 1800),
-        ]);
-        let changed = vec![
-            ("busy@chatroom".to_string(), 2000),
-            ("target@chatroom".to_string(), 2100),
-        ];
-        let returned = HashMap::from([("busy@chatroom".to_string(), 1500)]);
-
-        let state = next_poll_state(session_ts, &changed, Some(&previous), &returned, 1000);
-
-        assert_eq!(state.get("busy@chatroom"), Some(&1500));
-        assert_eq!(state.get("target@chatroom"), Some(&1800));
     }
 
     #[test]
@@ -3331,6 +3304,14 @@ mod tests {
             sphfeed_display_text(&body),
             "[视频号] 么会良-刑事律师: 同样搭梯子，为什么有人判刑有人没事？#搭梯子#VPN法律问题"
         );
+    }
+
+    #[test]
+    fn appmsg_file_is_classified_as_file() {
+        let xml = r#"<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>"#;
+
+        assert_eq!(appmsg_type(xml), Some(6));
+        assert_eq!(msgtype_for_message(49, xml, false, false), "file");
     }
 
     #[test]

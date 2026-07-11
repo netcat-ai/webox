@@ -23,16 +23,16 @@ APT_DEBIAN_MIRROR=
 APT_DEBIAN_SECURITY_MIRROR=
 ```
 
-国内镜像 fallback：
+如果仅 Debian apt 较慢，可以使用阿里云 apt 镜像，同时继续从官方 Docker Registry 拉取基础镜像：
 
 ```dotenv
-RUST_BUILDER_IMAGE=docker.m.daocloud.io/library/rust:1.96-bookworm
-DEBIAN_RUNTIME_IMAGE=docker.m.daocloud.io/library/debian:bookworm
+RUST_BUILDER_IMAGE=rust:1.96-bookworm
+DEBIAN_RUNTIME_IMAGE=debian:bookworm
 APT_DEBIAN_MIRROR=http://mirrors.aliyun.com/debian
 APT_DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ```
 
-先验证镜像是否可用：
+项目不通过第三方 registry 反向代理重写基础镜像地址。先验证官方镜像是否可用：
 
 ```bash
 docker buildx imagetools inspect "$RUST_BUILDER_IMAGE"

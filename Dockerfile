@@ -5,7 +5,10 @@ FROM ${RUST_BUILDER_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --bin weagent && mkdir -p /out && cp target/release/weagent /out/weagent
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bin weagent && \
+    mkdir -p /out && cp target/release/weagent /out/weagent
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime-base
 ARG APT_DEBIAN_MIRROR=
@@ -25,7 +28,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl dbus dbus-x11 dpkg gosu libcap2-bin locales \
+      ca-certificates dbus dbus-x11 dpkg ffmpeg gosu libcap2-bin locales \
       openbox procps tini x11-utils xclip xdotool xsettingsd xvfb xz-utils \
       fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
       libatomic1 libnss3 libgbm1 libasound2 libpulse0 libxss1 libxdamage1 libxkbcommon-x11-0 \
@@ -35,13 +38,13 @@ RUN set -eux; \
     sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen; \
     locale-gen; \
     useradd -M -d /webox/state/home -u 1000 -s /bin/bash webox; \
-    mkdir -p /webox/wechat /webox/weagent/bin /webox/state /webox/logs /webox/runtime; \
+    mkdir -p /webox/wechat /webox/weagent/bin /webox/state /webox/runtime; \
     chown -R webox:webox /webox; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
-COPY docker/scripts/wechat-ctl.sh docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
+COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 
 RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
     setcap cap_sys_ptrace=ep /webox/weagent/bin/weagent
@@ -66,7 +69,7 @@ RUN set -eux; \
     test -x /webox/wechat/opt/wechat/wechat; \
     rm -rf /tmp/wechat
 
-VOLUME ["/webox/state", "/webox/logs"]
+VOLUME ["/webox/state"]
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/webox/weagent/bin/entrypoint.sh"]

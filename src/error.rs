@@ -11,6 +11,10 @@ pub enum ApiError {
     Unauthorized(String),
     #[error("{0}")]
     Internal(String),
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl ApiError {
@@ -21,16 +25,31 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code) = match &self {
-            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            ApiError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        let (status, code, detail) = match &self {
+            ApiError::BadRequest(detail) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", detail.as_str())
+            }
+            ApiError::Unauthorized(detail) => {
+                (StatusCode::UNAUTHORIZED, "unauthorized", detail.as_str())
+            }
+            ApiError::Unsupported(detail) => {
+                (StatusCode::NOT_IMPLEMENTED, "unsupported", detail.as_str())
+            }
+            ApiError::Unavailable(detail) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                detail.as_str(),
+            ),
+            ApiError::Internal(detail) => {
+                tracing::error!(error = %detail, "request failed with an internal error");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "internal_error", "detail": "internal server error" })),
+                )
+                    .into_response();
+            }
         };
-        (
-            status,
-            Json(json!({ "error": code, "detail": self.to_string() })),
-        )
-            .into_response()
+        (status, Json(json!({ "error": code, "detail": detail }))).into_response()
     }
 }
 

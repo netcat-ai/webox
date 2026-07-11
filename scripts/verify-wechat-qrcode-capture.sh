@@ -25,14 +25,13 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$tmp_dir/state" "$tmp_dir/logs"
+mkdir -p "$tmp_dir/state"
 
 docker run -d \
   --name "$container" \
   -p "127.0.0.1:${port}:8080" \
-  -e RUST_LOG="${RUST_LOG:-webox=debug,tower_http=info}" \
+  -e RUST_LOG="${RUST_LOG:-weagent=debug,tower_http=info}" \
   -v "$tmp_dir/state:/webox/state" \
-  -v "$tmp_dir/logs:/webox/logs" \
   "$image" >/dev/null
 
 ready=0
@@ -45,7 +44,7 @@ for _ in $(seq 1 80); do
 done
 if [ "$ready" != "1" ]; then
   echo "[verify-wechat-qrcode] weagent did not become ready" >&2
-  tail -n 120 "$tmp_dir/logs/weagent.log" 2>/dev/null || true
+  docker logs --tail 120 "$container" 2>&1 || true
   exit 3
 fi
 
@@ -53,12 +52,14 @@ deadline=$((SECONDS + timeout_seconds))
 last_response=""
 qrcode_id=""
 while [ "$SECONDS" -lt "$deadline" ]; do
-  last_response="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/get_bot_qrcode?bot_type=3" || true)"
+  last_response="$(curl -fsS --max-time 5 -X POST \
+    -H 'content-type: application/json' \
+    --data '{"local_token_list":[]}' \
+    "http://127.0.0.1:${port}/ilink/bot/get_bot_qrcode?bot_type=3" || true)"
   if printf '%s' "$last_response" | grep -q '"qrcode":"xvfb-qr-[^"]*"' \
-    && printf '%s' "$last_response" | grep -q '"qrcode_img_content":"data:image/png;base64,'; then
+    && printf '%s' "$last_response" | grep -Eq '"qrcode_img_content":"https?://[^\"]+"'; then
     qrcode_id="$(printf '%s' "$last_response" | sed -n 's/.*"qrcode":"\([^"]*\)".*/\1/p')"
-    printf '{"qrcode":"%s","qrcode_img_content":"<omitted>"}\n' "$qrcode_id"
-    echo "[verify-wechat-qrcode] decoded and cropped login qrcode"
+    printf '[verify-wechat-qrcode] decoded login qrcode: %s\n' "$qrcode_id"
     exit 0
   fi
   sleep 2
@@ -66,7 +67,6 @@ done
 
 echo "[verify-wechat-qrcode] verification timed out after ${timeout_seconds}s" >&2
 echo "[verify-wechat-qrcode] qrcode id: ${qrcode_id:-<missing>}" >&2
-echo "[verify-wechat-qrcode] last response: ${last_response:-<empty>}" >&2
-tail -n 120 "$tmp_dir/logs/weagent.log" 2>/dev/null || true
-tail -n 120 "$tmp_dir/logs/wechat.log" 2>/dev/null || true
+echo "[verify-wechat-qrcode] no valid login qrcode was decoded" >&2
+docker logs --tail 240 "$container" 2>&1 || true
 exit 4

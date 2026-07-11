@@ -2,29 +2,37 @@ use crate::wechat_db;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_POLL_LIMIT: usize = 500;
-const UPDATE_ID_SCALE: i64 = 1_000_000;
+const DB_KEY_VALIDATION_INTERVAL_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
 pub struct WechatState {
     state_dir: PathBuf,
     key_file: PathBuf,
+    cursor_key: Arc<str>,
     runtime: Arc<WechatRuntime>,
 }
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Default)]
 struct WechatRuntime {
     initialized: AtomicBool,
+    had_ready_session: AtomicBool,
+    last_key_validation_at: AtomicU64,
+    db_io: Mutex<()>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -51,7 +59,8 @@ struct KeyFile {
 struct DbCursor {
     v: u8,
     source: String,
-    sessions: HashMap<String, i64>,
+    started_at: i64,
+    positions: wechat_db::MessagePositions,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +68,6 @@ struct DbCursor {
 pub struct PollResult {
     pub cursor: String,
     pub messages: Vec<Value>,
-    pub meta: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,7 +86,7 @@ pub struct LoginStatus {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginStatusKind {
     LoggedIn,
@@ -94,10 +102,11 @@ pub enum InitializationState {
 }
 
 impl WechatState {
-    pub fn new(state_dir: PathBuf) -> Self {
+    pub fn new(state_dir: PathBuf, cursor_key: impl Into<Arc<str>>) -> Self {
         Self {
             key_file: state_dir.join("wechat.key"),
             state_dir,
+            cursor_key: cursor_key.into(),
             runtime: Arc::new(WechatRuntime::default()),
         }
     }
@@ -112,12 +121,16 @@ impl WechatState {
         Ok(())
     }
 
-    pub fn has_key(&self) -> bool {
+    fn has_key(&self) -> bool {
         self.key_file.exists()
     }
 
     pub fn is_initialized(&self) -> bool {
         self.runtime.initialized.load(Ordering::Acquire)
+    }
+
+    pub fn had_ready_session(&self) -> bool {
+        self.runtime.had_ready_session.load(Ordering::Acquire)
     }
 
     pub fn login_status(&self) -> LoginStatus {
@@ -128,9 +141,8 @@ impl WechatState {
                 let has_db_storage = db_dir.is_dir();
                 let ui_ready = wechat_main_window_ready();
                 let has_material = has_db_storage && !keys.is_empty();
-                let can_read_messages =
-                    has_material && (self.is_initialized() || ui_ready.is_none());
-                let logged_in = can_read_messages && ui_ready.unwrap_or(true);
+                let can_read_messages = has_material && self.is_initialized();
+                let logged_in = can_read_messages && ui_ready == Some(true);
                 LoginStatus {
                     status: if logged_in {
                         LoginStatusKind::LoggedIn
@@ -182,24 +194,48 @@ impl WechatState {
             self.runtime.initialized.store(false, Ordering::Release);
             return Ok(InitializationState::WaitingForLogin);
         }
-        if self.is_initialized() {
+        let _db_guard = self.acquire_db_lock()?;
+        let active_db_dir = wechat_db::detect_db_storage()
+            .ok_or_else(|| anyhow!("wechat db_storage directory not found"))?;
+        let active_wxid = wechat_db::account_id_from_db_dir(&active_db_dir)
+            .ok_or_else(|| anyhow!("cannot identify active WeChat account"))?;
+        let material = self.db_material().and_then(|material| {
+            let key = self.read_key()?;
+            if key.wxid != active_wxid
+                || wechat_db::account_id_from_db_dir(&material.0).as_deref()
+                    != Some(active_wxid.as_str())
+            {
+                bail!("stored WeChat database key belongs to another account");
+            }
+            Ok(material)
+        });
+        if self.is_initialized()
+            && material.is_ok()
+            && !validation_due(
+                self.runtime.last_key_validation_at.load(Ordering::Acquire),
+                now_secs(),
+            )
+        {
             return Ok(InitializationState::Ready);
         }
-
-        let material = self
-            .db_material()
-            .and_then(|material| self.validate_db_material(material));
-        let material = match material {
+        self.runtime.initialized.store(false, Ordering::Release);
+        let material = match material.and_then(|material| self.validate_db_material(material)) {
             Ok(material) => material,
             Err(_) => {
                 let init = wechat_db::init_from_memory()
                     .context("extract wechat message keys during automatic initialization")?;
-                self.write_wechat_db_key(init, None)?;
+                self.write_wechat_db_key(init)?;
                 self.validate_db_material(self.db_material()?)?
             }
         };
         drop(material);
         self.runtime.initialized.store(true, Ordering::Release);
+        self.runtime
+            .had_ready_session
+            .store(true, Ordering::Release);
+        self.runtime
+            .last_key_validation_at
+            .store(now_secs(), Ordering::Release);
         self.set_init_error(None);
         Ok(InitializationState::Ready)
     }
@@ -223,71 +259,151 @@ impl WechatState {
         Ok(true)
     }
 
-    pub fn poll_messages_after_id(&self, after_id: i64, limit: usize) -> Result<PollResult> {
+    pub fn refresh_login_qrcode(&self) -> Result<bool> {
+        let Some(window) = wechat_login_window() else {
+            return Ok(false);
+        };
+        let status = Command::new("xdotool")
+            .args(["mousemove", "--window", &window, "140", "130", "click", "1"])
+            .status()
+            .context("click expired QR refresh area")?;
+        if !status.success() {
+            bail!("xdotool could not click expired QR refresh area");
+        }
+        Ok(true)
+    }
+
+    pub fn poll_messages(&self, cursor: Option<&str>, limit: usize) -> Result<PollResult> {
+        let _db_guard = self.acquire_db_lock()?;
         let (db_dir, keys) = self.ready_db_material()?;
         let limit = limit.clamp(1, MAX_POLL_LIMIT);
-        let cursor_state = if after_id > 0 {
-            let since_ts = update_id_seconds(after_id).saturating_sub(1);
-            Some(
-                wechat_db::current_session_state(db_dir.clone(), keys.clone(), self.cache_dir())?
-                    .into_keys()
-                    .map(|room| (room, since_ts))
-                    .collect(),
+        let cursor = cursor
+            .and_then(non_empty_cursor)
+            .map(|cursor| self.decode_db_cursor(cursor))
+            .transpose()?;
+        let cursor = match cursor {
+            Some(cursor) => cursor,
+            None => {
+                let started_at = now();
+                let positions = self.track_db_result(
+                    wechat_db::baseline_message_positions(
+                        db_dir,
+                        keys,
+                        self.cache_dir(),
+                        started_at,
+                    ),
+                    "baseline WeChat messages",
+                )?;
+                let cursor = DbCursor {
+                    v: 3,
+                    source: "db".to_string(),
+                    started_at,
+                    positions,
+                };
+                return Ok(PollResult {
+                    cursor: self.encode_db_cursor(&cursor)?,
+                    messages: Vec::new(),
+                });
+            }
+        };
+        let mut data = self
+            .track_db_result(
+                wechat_db::poll_new_messages(
+                    db_dir,
+                    keys,
+                    cursor.positions,
+                    cursor.started_at,
+                    limit,
+                    self.cache_dir(),
+                ),
+                "poll WeChat messages",
             )
-        } else {
-            None
+            .context("poll wechat local db")?;
+        data.messages.sort_by_key(message_order_key);
+        let cursor = DbCursor {
+            v: 3,
+            source: "db".to_string(),
+            started_at: cursor.started_at,
+            positions: data.new_state,
         };
-        let internal_limit = if after_id > 0 {
-            limit.saturating_mul(20).clamp(limit, MAX_POLL_LIMIT)
-        } else {
-            limit
-        };
-        let mut data = wechat_db::poll_new_messages(
-            db_dir,
-            keys,
-            cursor_state,
-            internal_limit,
-            self.cache_dir(),
-        )
-        .context("poll wechat local db")?;
-        if after_id > 0 {
-            data.messages
-                .retain(|message| message_update_id(message) > after_id);
-        }
-        data.messages.sort_by_key(message_update_id);
-        data.messages.truncate(limit);
-        let cursor = encode_db_cursor(&data.new_state);
         Ok(PollResult {
-            cursor,
+            cursor: self.encode_db_cursor(&cursor)?,
             messages: data.messages,
-            meta: json!({
-                "source": "wechat_db",
-                "newState": data.new_state,
-                "raw": data.meta,
-            }),
         })
     }
 
-    pub fn resolve_recipient(&self, username: &str) -> Result<wechat_db::Recipient> {
-        let (db_dir, keys) = self.ready_db_material()?;
-        wechat_db::resolve_recipient_by_username(db_dir, keys, self.cache_dir(), username)
-            .with_context(|| format!("resolve wechat recipient {username}"))?
-            .ok_or_else(|| anyhow!("recipient not found: target must be a WeChat internal id"))
+    pub fn validate_poll_cursor(&self, cursor: &str) -> Result<()> {
+        if let Some(cursor) = non_empty_cursor(cursor) {
+            self.decode_db_cursor(cursor)?;
+        }
+        Ok(())
     }
 
-    pub fn has_text_message_after(&self, after_id: i64, target: &str, text: &str) -> Result<bool> {
-        Ok(self
-            .poll_messages_after_id(after_id, 100)?
-            .messages
-            .iter()
-            .any(|message| message_matches_text(message, target, text)))
+    pub fn resolve_recipient(&self, username: &str) -> Result<wechat_db::Recipient> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::resolve_recipient_by_username(db_dir, keys, self.cache_dir(), username),
+            "resolve WeChat recipient",
+        )
+        .with_context(|| format!("resolve wechat recipient {username}"))?
+        .ok_or_else(|| anyhow!("recipient not found: target must be a WeChat internal id"))
+    }
+
+    pub fn room_message_positions(&self, target: &str) -> Result<wechat_db::RoomMessagePositions> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::room_message_positions(db_dir, keys, self.cache_dir(), target),
+            "read WeChat message positions",
+        )
+    }
+
+    pub fn has_text_message_after(
+        &self,
+        positions: &wechat_db::RoomMessagePositions,
+        target: &str,
+        text: &str,
+    ) -> Result<bool> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::has_outgoing_text(db_dir, keys, self.cache_dir(), target, positions, text),
+            "verify outgoing WeChat text",
+        )
+    }
+
+    pub fn read_media(&self, roomid: &str, msgid: &str) -> Result<Option<wechat_db::MediaFile>> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::read_media(db_dir, keys, self.cache_dir(), roomid, msgid),
+            "read WeChat media",
+        )
     }
 
     fn ready_db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
-        if std::env::var("DISPLAY").is_ok() && !self.is_initialized() {
+        if !self.is_initialized() {
             bail!("wechat automatic initialization is not complete");
         }
-        self.db_material()
+        self.db_material().map_err(|error| {
+            self.record_init_error(format!("load WeChat database keys: {error:#}"));
+            error
+        })
+    }
+
+    fn track_db_result<T>(&self, result: Result<T>, operation: &str) -> Result<T> {
+        result.map_err(|error| {
+            self.record_init_error(format!("{operation}: {error:#}"));
+            error
+        })
+    }
+
+    fn acquire_db_lock(&self) -> Result<MutexGuard<'_, ()>> {
+        self.runtime
+            .db_io
+            .lock()
+            .map_err(|_| anyhow!("WeChat database lock is poisoned"))
     }
 
     fn validate_db_material(
@@ -343,18 +459,12 @@ impl WechatState {
         Ok(key)
     }
 
-    fn write_wechat_db_key(
-        &self,
-        init: wechat_db::InitData,
-        wxid: Option<String>,
-    ) -> Result<KeyFile> {
+    fn write_wechat_db_key(&self, init: wechat_db::InitData) -> Result<KeyFile> {
         self.ensure_state_dir()?;
         let previous = self.read_key().ok();
         let doc = KeyFile {
             version: 1,
-            wxid: wxid
-                .or_else(|| previous.as_ref().map(|p| p.wxid.clone()))
-                .unwrap_or_default(),
+            wxid: init.wxid,
             key: "webox-weagent".to_string(),
             source: Some("memory".to_string()),
             keys_file: None,
@@ -391,13 +501,57 @@ impl WechatState {
             .ok()
             .and_then(|value| value.clone())
     }
+
+    fn encode_db_cursor(&self, cursor: &DbCursor) -> Result<String> {
+        let payload = serde_json::to_vec(cursor)?;
+        let mut mac = HmacSha256::new_from_slice(self.cursor_key.as_bytes())
+            .map_err(|_| anyhow!("invalid cursor signing key"))?;
+        mac.update(&payload);
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&payload),
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    fn decode_db_cursor(&self, raw: &str) -> Result<DbCursor> {
+        let (payload, signature) = raw
+            .trim()
+            .split_once('.')
+            .ok_or_else(|| anyhow!("invalid get_updates_buf"))?;
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("decode get_updates_buf")?;
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .context("decode get_updates_buf signature")?;
+        let mut mac = HmacSha256::new_from_slice(self.cursor_key.as_bytes())
+            .map_err(|_| anyhow!("invalid cursor signing key"))?;
+        mac.update(&payload);
+        mac.verify_slice(&signature)
+            .context("verify get_updates_buf signature")?;
+        let cursor: DbCursor = serde_json::from_slice(&payload).context("parse get_updates_buf")?;
+        if cursor.v != 3 || cursor.source != "db" || cursor.started_at <= 0 {
+            bail!("unsupported get_updates_buf");
+        }
+        Ok(cursor)
+    }
 }
 
 fn now() -> i64 {
+    now_secs() as i64
+}
+
+fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64
+        .as_secs()
+}
+
+fn validation_due(last_validation_at: u64, current_time: u64) -> bool {
+    last_validation_at == 0
+        || current_time.saturating_sub(last_validation_at) >= DB_KEY_VALIDATION_INTERVAL_SECS
 }
 
 fn wechat_main_window_ready() -> Option<bool> {
@@ -483,65 +637,27 @@ fn window_geometry_has_main_window(output: &str) -> bool {
     false
 }
 
-fn encode_db_cursor(sessions: &HashMap<String, i64>) -> String {
-    URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&DbCursor {
-            v: 2,
-            source: "db".to_string(),
-            sessions: sessions.clone(),
-        })
-        .expect("cursor serializes"),
-    )
+fn non_empty_cursor(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
-pub fn message_update_id(message: &Value) -> i64 {
-    let ts_ms = message
-        .get("msgtime")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            message
-                .get("timestamp")
-                .and_then(Value::as_i64)
-                .map(|ts| ts.saturating_mul(1000))
-        })
-        .unwrap_or_default();
-    let ts = ts_ms.saturating_div(1000).max(0);
-    ts.saturating_mul(UPDATE_ID_SCALE)
-        .saturating_add(stable_sequence(message) % UPDATE_ID_SCALE)
-}
-
-fn update_id_seconds(update_id: i64) -> i64 {
-    update_id.saturating_div(UPDATE_ID_SCALE).max(0)
-}
-
-fn stable_sequence(message: &Value) -> i64 {
-    if let Some(local_id) = message.get("local_id").and_then(Value::as_i64) {
-        return (local_id.unsigned_abs() % UPDATE_ID_SCALE as u64) as i64;
-    }
-    let seed = message
-        .get("msgid")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or_else(|| message.get("server_id").and_then(Value::as_str))
-        .unwrap_or_else(|| {
-            message
-                .get("from")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-        });
-    let digest = md5::compute(seed.as_bytes());
-    let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest.0[..8]);
-    i64::from_be_bytes(bytes) & i64::MAX
-}
-
-fn message_matches_text(message: &Value, target: &str, text: &str) -> bool {
-    message.get("roomid").and_then(Value::as_str) == Some(target)
-        && message
-            .get("text")
-            .and_then(|value| value.get("content"))
+fn message_order_key(message: &Value) -> (i64, i64, String) {
+    (
+        message
+            .get("msgtime")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        message
+            .get("local_id")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        message
+            .get("roomid")
             .and_then(Value::as_str)
-            == Some(text)
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -551,27 +667,74 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn message_update_id_keeps_timestamp_prefix() {
-        let message = json!({
-            "msgtime": 1781703356000_i64,
-            "local_id": 42,
-            "msgid": "7318462845630259071",
-        });
+    fn db_cursor_round_trips_exact_stream_positions() {
+        let cursor = DbCursor {
+            v: 3,
+            source: "db".to_string(),
+            started_at: 100,
+            positions: std::collections::BTreeMap::from([(
+                "room".to_string(),
+                std::collections::BTreeMap::from([(
+                    "message/msg_0.db".to_string(),
+                    wechat_db::MessagePosition {
+                        create_time: 101,
+                        local_id: 42,
+                    },
+                )]),
+            )]),
+        };
 
-        assert_eq!(message_update_id(&message) / UPDATE_ID_SCALE, 1781703356);
-        assert_eq!(message_update_id(&message) % UPDATE_ID_SCALE, 42);
+        let state = WechatState::new(PathBuf::from("/tmp/test"), "test-token");
+        let encoded = state.encode_db_cursor(&cursor).unwrap();
+        let decoded = state.decode_db_cursor(&encoded).unwrap();
+
+        assert_eq!(decoded.positions["room"]["message/msg_0.db"].local_id, 42);
     }
 
     #[test]
-    fn message_matches_exact_target_and_text() {
-        let message = json!({
-            "roomid": "filehelper",
-            "text": { "content": "webox proof" },
-        });
+    fn db_cursor_rejects_tampering() {
+        let state = WechatState::new(PathBuf::from("/tmp/test"), "test-token");
+        let cursor = DbCursor {
+            v: 3,
+            source: "db".to_string(),
+            started_at: 100,
+            positions: Default::default(),
+        };
+        let mut encoded = state.encode_db_cursor(&cursor).unwrap().into_bytes();
+        encoded[0] = if encoded[0] == b'A' { b'B' } else { b'A' };
 
-        assert!(message_matches_text(&message, "filehelper", "webox proof"));
-        assert!(!message_matches_text(&message, "other", "webox proof"));
-        assert!(!message_matches_text(&message, "filehelper", "webox"));
+        assert!(state
+            .decode_db_cursor(std::str::from_utf8(&encoded).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn key_validation_is_periodic() {
+        assert!(validation_due(0, 100));
+        assert!(!validation_due(100, 129));
+        assert!(validation_due(100, 130));
+        assert!(!validation_due(100, 90));
+    }
+
+    #[test]
+    fn missing_key_material_invalidates_a_ready_session() {
+        let state_dir = std::env::temp_dir().join(format!("webox-key-loss-{}", Uuid::new_v4()));
+        let state = WechatState::new(state_dir.clone(), "test-token");
+        state.runtime.initialized.store(true, Ordering::Release);
+
+        assert!(state.ready_db_material().is_err());
+        assert!(!state.is_initialized());
+
+        fs::remove_dir_all(state_dir).ok();
+    }
+
+    #[test]
+    fn cloned_state_serializes_database_access() {
+        let state = WechatState::new(PathBuf::from("/tmp/test"), "test-token");
+        let cloned = state.clone();
+        let _guard = state.acquire_db_lock().unwrap();
+
+        assert!(cloned.runtime.db_io.try_lock().is_err());
     }
 
     #[test]
@@ -599,7 +762,7 @@ mod tests {
     #[test]
     fn login_status_does_not_create_key_material() {
         let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
-        let state = WechatState::new(state_dir.clone());
+        let state = WechatState::new(state_dir.clone(), "test-token");
 
         let _ = state.login_status();
 
@@ -610,7 +773,7 @@ mod tests {
     #[test]
     fn login_status_waits_for_login_without_key_or_db() {
         let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
-        let state = WechatState::new(state_dir.clone());
+        let state = WechatState::new(state_dir.clone(), "test-token");
 
         let status = state.login_status();
 
@@ -624,11 +787,11 @@ mod tests {
     }
 
     #[test]
-    fn login_status_reports_logged_in_from_existing_key_material() {
+    fn login_status_does_not_assume_login_from_key_material_alone() {
         let state_dir = std::env::temp_dir().join(format!("webox-login-{}", Uuid::new_v4()));
         let db_dir = state_dir.join("db_storage");
         fs::create_dir_all(&db_dir).unwrap();
-        let state = WechatState::new(state_dir.clone());
+        let state = WechatState::new(state_dir.clone(), "test-token");
         state.ensure_state_dir().unwrap();
         let mut keys = HashMap::new();
         keys.insert("message/msg_0.db".to_string(), "00".repeat(32));
@@ -652,8 +815,8 @@ mod tests {
         let status = state.login_status();
 
         fs::remove_dir_all(state_dir).ok();
-        assert_eq!(status.status, LoginStatusKind::LoggedIn);
-        assert!(status.can_read_messages);
+        assert_eq!(status.status, LoginStatusKind::KeyUnavailable);
+        assert!(!status.can_read_messages);
         assert!(status.has_key);
         assert!(status.has_db_storage);
         assert_eq!(status.key_source.as_deref(), Some("test"));

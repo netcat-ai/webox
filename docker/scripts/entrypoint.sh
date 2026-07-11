@@ -4,7 +4,6 @@ set -euo pipefail
 export WEBOX_ROOT="${WEBOX_ROOT:-/webox}"
 export DISPLAY="${DISPLAY:-:1}"
 export WEBOX_STATE_DIR="${WEBOX_STATE_DIR:-${WEBOX_ROOT}/state}"
-export WEBOX_LOG_DIR="${WEBOX_LOG_DIR:-${WEBOX_ROOT}/logs}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${WEBOX_ROOT}/runtime}"
 export WEBOX_XVFB_FBDIR="${WEBOX_XVFB_FBDIR:-${XDG_RUNTIME_DIR}/xvfb}"
 export WEBOX_HOME="${WEBOX_HOME:-${WEBOX_STATE_DIR}/home}"
@@ -13,18 +12,20 @@ export HOME="$WEBOX_HOME"
 export WECHAT_BIN="${WECHAT_BIN:-${WEBOX_ROOT}/wechat/opt/wechat/wechat}"
 export WEBOX_WEAGENT_STATE_DIR="${WEBOX_WEAGENT_STATE_DIR:-${WEBOX_STATE_DIR}/weagent}"
 
-mkdir -p "$WEBOX_ROOT" "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
-chown -R webox:webox "$WEBOX_STATE_DIR" "$WEBOX_LOG_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
+mkdir -p "$WEBOX_ROOT" "$WEBOX_STATE_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
+ownership_marker="${WEBOX_STATE_DIR}/.webox-owned-v1"
+if [ ! -e "$ownership_marker" ]; then
+  chown -R webox:webox "$WEBOX_STATE_DIR" "$XDG_RUNTIME_DIR"
+  gosu webox touch "$ownership_marker"
+else
+  chown webox:webox "$WEBOX_STATE_DIR" "$XDG_RUNTIME_DIR" "$WEBOX_XVFB_FBDIR" "$HOME"
+fi
 chmod 700 "$XDG_RUNTIME_DIR"
 
 "${WEBOX_ROOT}/weagent/bin/webox-identity.sh"
 
 critical_pids=()
 critical_names=()
-
-log_path() {
-  echo "${WEBOX_LOG_DIR}/$1.log"
-}
 
 register_critical() {
   critical_names+=("$1")
@@ -65,11 +66,11 @@ wait_critical() {
 }
 
 start_display() {
-  Xvfb "$DISPLAY" -screen 0 "${WEBOX_SCREEN:-1280x800x24}" -fbdir "$WEBOX_XVFB_FBDIR" -nolisten tcp >"$(log_path xvfb)" 2>&1 &
+  Xvfb "$DISPLAY" -screen 0 "${WEBOX_SCREEN:-1280x800x24}" -fbdir "$WEBOX_XVFB_FBDIR" -nolisten tcp &
   register_critical xvfb "$!"
   sleep 1
 
-  gosu webox openbox >"$(log_path openbox)" 2>&1 &
+  gosu webox openbox &
   register_critical openbox "$!"
 
   local xsettings="${WEBOX_STATE_DIR}/xsettingsd.conf"
@@ -82,30 +83,32 @@ Xft/DPI 98304
 Gtk/FontName "WenQuanYi Micro Hei 10"
 EOF
   chown webox:webox "$xsettings"
-  gosu webox xsettingsd --config="$xsettings" >"$(log_path xsettingsd)" 2>&1 &
+  gosu webox xsettingsd --config="$xsettings" &
 }
 
 start_agent() {
-  local cmd="${WEBOX_AGENT_CMD:-${WEBOX_ROOT}/weagent/bin/weagent}"
-  echo "[entrypoint] starting agent: $cmd"
-  gosu webox bash -lc "exec $cmd" >"$(log_path weagent)" 2>&1 &
+  local agent="${WEBOX_ROOT}/weagent/bin/weagent"
+  echo "[entrypoint] starting agent: $agent"
+  gosu webox "$agent" &
   register_critical weagent "$!"
 }
 
-start_wechat_loop() {
-  while true; do
-    if [ ! -x "$WECHAT_BIN" ]; then
-      echo "[entrypoint] bundled wechat binary is missing: $WECHAT_BIN" >&2
-      exit 1
-    fi
-    echo "[entrypoint] starting wechat"
-    gosu webox dbus-run-session -- "$WECHAT_BIN" || true
-    sleep 2
-  done
+start_wechat() {
+  if [ ! -x "$WECHAT_BIN" ]; then
+    echo "[entrypoint] bundled wechat binary is missing: $WECHAT_BIN" >&2
+    exit 1
+  fi
+  # Crashpad reports are telemetry and must not grow the persistent account volume.
+  local crashinfo="${XDG_RUNTIME_DIR}/crashinfo"
+  gosu webox mkdir -p "$HOME/.xwechat" "$crashinfo"
+  rm -rf "$HOME/.xwechat/crashinfo"
+  gosu webox ln -s "$crashinfo" "$HOME/.xwechat/crashinfo"
+  echo "[entrypoint] starting wechat"
+  gosu webox dbus-run-session -- "$WECHAT_BIN" &
+  register_critical wechat "$!"
 }
 
 start_display
 start_agent
-start_wechat_loop &
-register_critical wechat "$!"
+start_wechat
 wait_critical

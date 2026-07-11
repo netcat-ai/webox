@@ -1,7 +1,4 @@
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use png::{BitDepth, ColorType, Encoder};
 use quircs::{Code, Quirc};
 use std::path::{Path, PathBuf};
 
@@ -20,9 +17,7 @@ pub struct QrSource {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoginQrCode {
     pub id: String,
-    pub source_url: String,
-    pub login_url: Option<String>,
-    pub image_data_uri: String,
+    pub login_url: String,
 }
 
 impl QrSource {
@@ -31,27 +26,30 @@ impl QrSource {
     }
 
     pub async fn latest(&self) -> Result<Option<LoginQrCode>> {
-        let Some(path) = &self.screenshot_path else {
+        let Some(path) = self.screenshot_path.clone() else {
             return Ok(None);
         };
-        let Some(screen) = read_xwd_screen(path)? else {
-            return Ok(None);
-        };
-        if !looks_like_wechat_login_qr_screen(&screen) {
-            return Ok(None);
-        }
-        let Some(qr) = extract_screen_qr(&screen) else {
-            return Ok(None);
-        };
-        let png = encode_rgb_png(qr.width, qr.height, &qr.rgb)?;
-        let digest = md5::compute(&png);
-        Ok(Some(LoginQrCode {
-            id: format!("xvfb-qr-{digest:x}"),
-            source_url: "x11://wechat/login-qrcode".to_string(),
-            login_url: Some(qr.payload),
-            image_data_uri: format!("data:image/png;base64,{}", STANDARD.encode(png)),
-        }))
+        tokio::task::spawn_blocking(move || latest_from_path(&path))
+            .await
+            .context("join qrcode capture task")?
     }
+}
+
+fn latest_from_path(path: &Path) -> Result<Option<LoginQrCode>> {
+    let Some(screen) = read_xwd_screen(path)? else {
+        return Ok(None);
+    };
+    if !looks_like_wechat_login_qr_screen(&screen) {
+        return Ok(None);
+    }
+    let Some(qr) = extract_screen_qr(&screen) else {
+        return Ok(None);
+    };
+    let digest = md5::compute(qr.payload.as_bytes());
+    Ok(Some(LoginQrCode {
+        id: format!("xvfb-qr-{digest:x}"),
+        login_url: qr.payload,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,22 +292,6 @@ fn qr_bounds(code: &Code) -> Option<(i32, i32, i32, i32)> {
         .then_some((left, top, right, bottom))
 }
 
-fn encode_rgb_png(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
-    let expected = width as usize * height as usize * 3;
-    if rgb.len() != expected {
-        anyhow::bail!("rgb length does not match dimensions");
-    }
-    let mut out = Vec::new();
-    {
-        let mut encoder = Encoder::new(&mut out, width, height);
-        encoder.set_color(ColorType::Rgb);
-        encoder.set_depth(BitDepth::Eight);
-        let mut writer = encoder.write_header().context("write png header")?;
-        writer.write_image_data(rgb).context("write png pixels")?;
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +300,7 @@ mod tests {
     use std::fs;
 
     #[tokio::test]
-    async fn reads_decodes_and_crops_wechat_qr_from_xvfb() {
+    async fn reads_and_decodes_wechat_qr_from_xvfb() {
         let screen_path =
             std::env::temp_dir().join(format!("webox-qr-screen-{}.xwd", uuid::Uuid::new_v4()));
         fs::write(&screen_path, xwd_fixture_with_blue_qr()).unwrap();
@@ -331,17 +313,9 @@ mod tests {
 
         assert!(qrcode.id.starts_with("xvfb-qr-"));
         assert_eq!(
-            qrcode.login_url.as_deref(),
-            Some("https://login.weixin.qq.com/l/screen-test")
+            qrcode.login_url,
+            "https://login.weixin.qq.com/l/screen-test"
         );
-        assert!(qrcode.image_data_uri.starts_with("data:image/png;base64,"));
-        let png = STANDARD
-            .decode(qrcode.image_data_uri.split_once(',').unwrap().1)
-            .unwrap();
-        let decoder = png::Decoder::new(png.as_slice());
-        let reader = decoder.read_info().unwrap();
-        assert!(reader.info().width < 320);
-        assert!(reader.info().height < 240);
         fs::remove_file(screen_path).unwrap();
     }
 
