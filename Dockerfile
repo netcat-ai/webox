@@ -1,5 +1,5 @@
 ARG RUST_BUILDER_IMAGE=rust:1.96-bookworm
-ARG DEBIAN_RUNTIME_IMAGE=debian:bookworm
+ARG DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${RUST_BUILDER_IMAGE} AS build
 WORKDIR /src
@@ -28,9 +28,9 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates dbus dbus-x11 dpkg ffmpeg gosu libcap2-bin locales \
-      openbox procps tini x11-utils xclip xdotool xsettingsd xvfb xz-utils \
-      fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk fonts-noto-color-emoji \
+      ca-certificates dbus dpkg ffmpeg gosu libcap2-bin locales \
+      openbox tini xclip xdotool xsettingsd xvfb \
+      fonts-wqy-microhei fonts-noto-color-emoji \
       libatomic1 libnss3 libgbm1 libasound2 libpulse0 libxss1 libxdamage1 libxkbcommon-x11-0 \
       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxcb-cursor0 \
       libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 \
@@ -41,7 +41,11 @@ RUN set -eux; \
     mkdir -p /webox/wechat /webox/weagent/bin /webox/state /webox/runtime; \
     chown -R webox:webox /webox; \
     apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf \
+      /var/lib/apt/lists/* \
+      /usr/share/doc/* \
+      /usr/share/man/* \
+      /usr/share/locale/*
 
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
@@ -51,8 +55,8 @@ RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
 
 FROM runtime-base AS runtime
 
-COPY docker/wechat/ /tmp/wechat/
-RUN set -eux; \
+RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
+    set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
       amd64) deb="/tmp/wechat/WeChatLinux_x86_64.deb" ;; \
@@ -66,8 +70,7 @@ RUN set -eux; \
     fi; \
     dpkg-deb -x "$deb" /webox/wechat; \
     dpkg-deb -f "$deb" Version > /webox/wechat/.webox-version; \
-    test -x /webox/wechat/opt/wechat/wechat; \
-    rm -rf /tmp/wechat
+    test -x /webox/wechat/opt/wechat/wechat
 
 VOLUME ["/webox/state"]
 EXPOSE 8080

@@ -29,6 +29,7 @@ mkdir -p "$tmp_dir/state"
 
 docker run -d \
   --name "$container" \
+  --cap-add SYS_PTRACE \
   -p "127.0.0.1:${port}:8080" \
   -e RUST_LOG="${RUST_LOG:-weagent=debug,tower_http=info}" \
   -v "$tmp_dir/state:/webox/state" \

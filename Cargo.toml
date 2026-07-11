@@ -31,3 +31,6 @@ zstd = "0.13"
 [dev-dependencies]
 qrcode = { version = "0.14", default-features = false }
 tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = "symbols"
