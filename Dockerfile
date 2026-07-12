@@ -10,6 +10,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin weagent && \
     mkdir -p /out && cp target/release/weagent /out/weagent
 
+FROM ${DEBIAN_RUNTIME_IMAGE} AS novnc-assets
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends novnc && \
+    mkdir -p /out && cp -a /usr/share/novnc/. /out/
+
 FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime-base
 ARG APT_DEBIAN_MIRROR=
 ARG APT_DEBIAN_SECURITY_MIRROR=
@@ -29,7 +34,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
       ca-certificates dbus dpkg ffmpeg gosu libcap2-bin locales \
-      openbox tini xclip xdotool xsettingsd xvfb \
+      openbox tini websockify x11vnc xclip xdotool xsettingsd xvfb \
       fonts-wqy-microhei fonts-noto-color-emoji \
       libatomic1 libnss3 libgbm1 libasound2 libpulse0 libxss1 libxdamage1 libxkbcommon-x11-0 \
       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxcb-cursor0 \
@@ -48,6 +53,7 @@ RUN set -eux; \
       /usr/share/locale/*
 
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
+COPY --from=novnc-assets /out/ /usr/share/novnc/
 COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 
 RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
@@ -73,6 +79,6 @@ RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
     test -x /webox/wechat/opt/wechat/wechat
 
 VOLUME ["/webox/state"]
-EXPOSE 8080
+EXPOSE 8080 6080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/webox/weagent/bin/entrypoint.sh"]

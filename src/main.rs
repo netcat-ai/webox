@@ -3,6 +3,7 @@ mod error;
 mod ilink;
 mod media_store;
 mod qr_source;
+mod signed_payload;
 mod ui_sender;
 mod wechat_db;
 mod wechat_state;
@@ -37,14 +38,13 @@ async fn main() -> anyhow::Result<()> {
     let mut initializer = spawn_wechat_initializer(wechat.clone(), qr_source.clone());
     let state = Arc::new(AppState {
         api_token: config.api_token.clone(),
-        tenant_id: config.tenant_id.clone(),
         provider_account_id: config.provider_account_id.clone(),
-        public_base_url: config.public_base_url.clone(),
         sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
         qr_source,
         media_store: MediaStore::new(config.media_dir.clone()),
         login_session: Arc::new(std::sync::Mutex::new(LoginSession::default())),
         send_receipts: Arc::new(std::sync::Mutex::new(Default::default())),
+        remark_reminders: Arc::new(std::sync::Mutex::new(Default::default())),
         wechat,
     });
 
@@ -332,23 +332,14 @@ mod tests {
         fs::write(
             state_dir.join("wechat.key"),
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
                 "wxid": "wxid_test",
-                "key": "webox-weagent",
-                "source": "test",
-                "keysFile": null,
                 "dbDir": db_dir.to_string_lossy(),
-                "keys": { "message/msg_0.db": "00".repeat(32) },
-                "createdAt": 1,
-                "updatedAt": 2
+                "keys": { "message/msg_0.db": "00".repeat(32) }
             }))
             .unwrap(),
         )
         .unwrap();
-        let app = build_router(test_state_with_dir(
-            state_dir.clone(),
-            Some("https://public.example".to_string()),
-        ));
+        let app = build_router(test_state_with_dir(state_dir.clone()));
 
         let response = app
             .oneshot(
@@ -664,19 +655,14 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         let state_dir = std::env::temp_dir().join(format!("webox-router-{}", uuid::Uuid::new_v4()));
-        test_state_with_dir(state_dir, Some("http://127.0.0.1:8080".to_string()))
+        test_state_with_dir(state_dir)
     }
 
-    fn test_state_with_dir(
-        state_dir: std::path::PathBuf,
-        public_base_url: Option<String>,
-    ) -> Arc<AppState> {
+    fn test_state_with_dir(state_dir: std::path::PathBuf) -> Arc<AppState> {
         let wechat = WechatState::new(state_dir, "test-token");
         Arc::new(AppState {
             api_token: "token".to_string(),
-            tenant_id: "default".to_string(),
             provider_account_id: "wx".to_string(),
-            public_base_url,
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new(None),
             media_store: MediaStore::new(
@@ -684,6 +670,7 @@ mod tests {
             ),
             login_session: Arc::new(std::sync::Mutex::new(LoginSession::default())),
             send_receipts: Arc::new(std::sync::Mutex::new(Default::default())),
+            remark_reminders: Arc::new(std::sync::Mutex::new(Default::default())),
             wechat,
         })
     }

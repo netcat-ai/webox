@@ -42,13 +42,13 @@ fn latest_from_path(path: &Path) -> Result<Option<LoginQrCode>> {
     if !looks_like_wechat_login_qr_screen(&screen) {
         return Ok(None);
     }
-    let Some(qr) = extract_screen_qr(&screen) else {
+    let Some(payload) = extract_screen_qr(&screen) else {
         return Ok(None);
     };
-    let digest = md5::compute(qr.payload.as_bytes());
+    let digest = md5::compute(payload.as_bytes());
     Ok(Some(LoginQrCode {
         id: format!("xvfb-qr-{digest:x}"),
-        login_url: qr.payload,
+        login_url: payload,
     }))
 }
 
@@ -73,14 +73,6 @@ struct XwdHeader {
     green_mask: u32,
     blue_mask: u32,
     ncolors: usize,
-}
-
-#[derive(Debug, PartialEq)]
-struct ScreenQr {
-    width: u32,
-    height: u32,
-    rgb: Vec<u8>,
-    payload: String,
 }
 
 fn read_xwd_screen(path: &Path) -> Result<Option<RgbScreen>> {
@@ -235,7 +227,7 @@ fn is_wechat_qr_blue(red: u8, green: u8, blue: u8) -> bool {
         && blue.saturating_sub(green) > 35
 }
 
-fn extract_screen_qr(screen: &RgbScreen) -> Option<ScreenQr> {
+fn extract_screen_qr(screen: &RgbScreen) -> Option<String> {
     let grayscale = screen
         .rgb
         .chunks_exact(3)
@@ -248,7 +240,7 @@ fn extract_screen_qr(screen: &RgbScreen) -> Option<ScreenQr> {
         })
         .collect::<Vec<_>>();
     let mut decoder = Quirc::default();
-    let (code, payload) = decoder
+    decoder
         .identify(screen.width as usize, screen.height as usize, &grayscale)
         .filter_map(Result::ok)
         .filter_map(|code| {
@@ -259,28 +251,7 @@ fn extract_screen_qr(screen: &RgbScreen) -> Option<ScreenQr> {
             Some((code, payload, area))
         })
         .max_by_key(|(_, _, area)| *area)
-        .map(|(code, payload, _)| (code, payload))?;
-    let (left, top, right, bottom) = qr_bounds(&code)?;
-    let module = ((right - left).max(bottom - top) / code.size.max(1)).max(1);
-    let margin = module * 4;
-    let left = (left - margin).max(0) as u32;
-    let top = (top - margin).max(0) as u32;
-    let right = (right + margin).min(screen.width as i32 - 1) as u32;
-    let bottom = (bottom + margin).min(screen.height as i32 - 1) as u32;
-    let width = right - left + 1;
-    let height = bottom - top + 1;
-    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-    for y in top..=bottom {
-        let row_start = ((y * screen.width + left) * 3) as usize;
-        let row_end = row_start + width as usize * 3;
-        rgb.extend_from_slice(&screen.rgb[row_start..row_end]);
-    }
-    Some(ScreenQr {
-        width,
-        height,
-        rgb,
-        payload,
-    })
+        .map(|(_, payload, _)| payload)
 }
 
 fn qr_bounds(code: &Code) -> Option<(i32, i32, i32, i32)> {

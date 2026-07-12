@@ -87,6 +87,7 @@ WeChat login window
 WeChat local DB
   -> wechat_db scanner decrypts and polls new rows
   -> normalize to iLink msgs
+  -> schedule missing-remark reminder when needed
   -> client pulls through iLink getupdates
 ```
 
@@ -100,6 +101,7 @@ WeChat local DB
 - 每条 `msg` 包含无状态、HMAC 签名的 `context_token`，agent 回复时必须原样传给 `/sendmessage`。
 - `msg/notifystart` 和 `msg/notifystop` 接收标准 SDK 生命周期通知，不参与本地 DB 游标。
 - 服务端不维护独立 ack 状态。
+- 未备注目标的提醒发送到当前登录用户会话，使用 `wb-{target_id}` 查询历史去重；待发送目标在进程内合并并重试，不阻塞 getupdates 返回。
 - 如果标准 iLink 明确要求持久上下文状态，再增加最小状态；不能预先引入 msghub-style mailbox。
 
 ### 发消息
@@ -112,6 +114,7 @@ iLink sendmessage
   -> Escape, Ctrl+F, paste remark, Return
   -> paste content
   -> Return
+  -> Ctrl+2, return to contacts
   -> verify the exact text from WeChat local DB
   -> return iLink ret=0
 ```
@@ -126,7 +129,7 @@ iLink sendmessage
 - `image_item`、`voice_item`、`video_item` 和 `file_item` 明确返回 HTTP 501；外部 URL 作为普通文本发送。
 - `msg.client_id` 是发送幂等键；有界内存缓存会拦截 SDK 并发重试，并拒绝同一键对应不同内容，不额外引入应用数据库。
 - 语音和输入状态没有可靠 Linux WeChat UI 动作，明确返回不支持，不伪造协议成功。
-- 群聊目标必须有备注，否则拒绝发送；UI 搜索后直接用 Return 选择第一个结果。
+- 联系人和群聊目标必须有备注，否则拒绝发送；文件传输助手和当前登录用户是内部稳定目标。UI 搜索后直接用 Return 选择第一个结果。
 - 部署方必须保证备注能让目标会话排在第一个搜索结果，weagent 无法从本地联系人库证明 UI 搜索结果唯一。
 - 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
 

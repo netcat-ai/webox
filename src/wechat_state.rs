@@ -1,11 +1,8 @@
+use crate::signed_payload;
 use crate::wechat_db;
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -25,8 +22,6 @@ pub struct WechatState {
     runtime: Arc<WechatRuntime>,
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
 #[derive(Debug, Default)]
 struct WechatRuntime {
     initialized: AtomicBool,
@@ -37,28 +32,17 @@ struct WechatRuntime {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyFile {
-    version: u8,
     wxid: String,
-    key: String,
-    #[serde(rename = "source")]
-    source: Option<String>,
-    #[serde(rename = "keysFile")]
-    keys_file: Option<String>,
-    #[serde(rename = "dbDir", skip_serializing_if = "Option::is_none")]
-    db_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    keys: Option<HashMap<String, String>>,
-    #[serde(rename = "createdAt")]
-    created_at: i64,
-    #[serde(rename = "updatedAt")]
-    updated_at: i64,
+    #[serde(rename = "dbDir")]
+    db_dir: String,
+    keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DbCursor {
-    v: u8,
-    source: String,
     started_at: i64,
     positions: wechat_db::MessagePositions,
 }
@@ -74,14 +58,7 @@ pub struct PollResult {
 #[serde(rename_all = "snake_case")]
 pub struct LoginStatus {
     pub status: LoginStatusKind,
-    pub can_read_messages: bool,
     pub has_key: bool,
-    pub has_db_storage: bool,
-    pub refreshed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_updated_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -134,13 +111,13 @@ impl WechatState {
     }
 
     pub fn login_status(&self) -> LoginStatus {
-        let key = self.read_key().ok();
-        let material = self.db_material();
-        match material {
-            Ok((db_dir, keys)) => {
+        let has_key = self.has_key();
+        match self.read_key() {
+            Ok(key) => {
+                let db_dir = PathBuf::from(&key.db_dir);
                 let has_db_storage = db_dir.is_dir();
                 let ui_ready = wechat_main_window_ready();
-                let has_material = has_db_storage && !keys.is_empty();
+                let has_material = has_db_storage && !key.keys.is_empty();
                 let can_read_messages = has_material && self.is_initialized();
                 let logged_in = can_read_messages && ui_ready == Some(true);
                 LoginStatus {
@@ -151,12 +128,7 @@ impl WechatState {
                     } else {
                         LoginStatusKind::KeyUnavailable
                     },
-                    can_read_messages,
                     has_key: true,
-                    has_db_storage,
-                    refreshed: false,
-                    key_source: key.as_ref().and_then(|key| key.source.clone()),
-                    key_updated_at: key.as_ref().map(|key| key.updated_at),
                     detail: self.last_init_error().or_else(|| {
                         (!has_db_storage)
                             .then(|| "wechat db_storage directory is missing".to_string())
@@ -164,25 +136,17 @@ impl WechatState {
                 }
             }
             Err(_) => {
-                let detected_db = key
-                    .as_ref()
-                    .and_then(|key| key.db_dir.as_ref().map(PathBuf::from))
-                    .or_else(wechat_db::detect_db_storage);
+                let detected_db = wechat_db::detect_db_storage();
                 let has_db_storage = detected_db.as_ref().is_some_and(|path| path.is_dir());
                 LoginStatus {
-                    status: if self.has_key() {
+                    status: if has_key {
                         LoginStatusKind::KeyUnavailable
                     } else if has_db_storage {
                         LoginStatusKind::WaitingForKey
                     } else {
                         LoginStatusKind::WaitingForLogin
                     },
-                    can_read_messages: false,
-                    has_key: self.has_key(),
-                    has_db_storage,
-                    refreshed: false,
-                    key_source: key.as_ref().and_then(|key| key.source.clone()),
-                    key_updated_at: key.as_ref().map(|key| key.updated_at),
+                    has_key,
                     detail: self.last_init_error(),
                 }
             }
@@ -199,8 +163,8 @@ impl WechatState {
             .ok_or_else(|| anyhow!("wechat db_storage directory not found"))?;
         let active_wxid = wechat_db::account_id_from_db_dir(&active_db_dir)
             .ok_or_else(|| anyhow!("cannot identify active WeChat account"))?;
-        let material = self.db_material().and_then(|material| {
-            let key = self.read_key()?;
+        let material = self.read_key().and_then(|key| {
+            let material = Self::db_material_from(&key)?;
             if key.wxid != active_wxid
                 || wechat_db::account_id_from_db_dir(&material.0).as_deref()
                     != Some(active_wxid.as_str())
@@ -295,8 +259,6 @@ impl WechatState {
                     "baseline WeChat messages",
                 )?;
                 let cursor = DbCursor {
-                    v: 3,
-                    source: "db".to_string(),
                     started_at,
                     positions,
                 };
@@ -321,8 +283,6 @@ impl WechatState {
             .context("poll wechat local db")?;
         data.messages.sort_by_key(message_order_key);
         let cursor = DbCursor {
-            v: 3,
-            source: "db".to_string(),
             started_at: cursor.started_at,
             positions: data.new_state,
         };
@@ -339,15 +299,48 @@ impl WechatState {
         Ok(())
     }
 
+    pub fn current_user_id(&self) -> Result<String> {
+        Ok(self.read_key()?.wxid)
+    }
+
     pub fn resolve_recipient(&self, username: &str) -> Result<wechat_db::Recipient> {
         let _db_guard = self.acquire_db_lock()?;
-        let (db_dir, keys) = self.ready_db_material()?;
+        if !self.is_initialized() {
+            bail!("wechat automatic initialization is not complete");
+        }
+        let key = self.read_key()?;
+        let current_user_id = key.wxid.clone();
+        let (db_dir, keys) = Self::db_material_from(&key)?;
         self.track_db_result(
-            wechat_db::resolve_recipient_by_username(db_dir, keys, self.cache_dir(), username),
+            wechat_db::resolve_recipient_by_username(
+                db_dir,
+                keys,
+                self.cache_dir(),
+                username,
+                &current_user_id,
+            ),
             "resolve WeChat recipient",
         )
         .with_context(|| format!("resolve wechat recipient {username}"))?
         .ok_or_else(|| anyhow!("recipient not found: target must be a WeChat internal id"))
+    }
+
+    pub fn contact_identity(&self, username: &str) -> Result<Option<wechat_db::ContactIdentity>> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::contact_identity(db_dir, keys, self.cache_dir(), username),
+            "read WeChat contact identity",
+        )
+    }
+
+    pub fn outgoing_text_contains(&self, target: &str, needle: &str) -> Result<bool> {
+        let _db_guard = self.acquire_db_lock()?;
+        let (db_dir, keys) = self.ready_db_material()?;
+        self.track_db_result(
+            wechat_db::outgoing_text_contains(db_dir, keys, self.cache_dir(), target, needle),
+            "search outgoing WeChat text",
+        )
     }
 
     pub fn room_message_positions(&self, target: &str) -> Result<wechat_db::RoomMessagePositions> {
@@ -417,43 +410,21 @@ impl WechatState {
 
     fn db_material(&self) -> Result<(PathBuf, HashMap<String, String>)> {
         let key = self.read_key()?;
-        if let (Some(db_dir), Some(keys)) = (&key.db_dir, &key.keys) {
-            if !keys.is_empty() {
-                return Ok((PathBuf::from(db_dir), keys.clone()));
-            }
+        Self::db_material_from(&key)
+    }
+
+    fn db_material_from(key: &KeyFile) -> Result<(PathBuf, HashMap<String, String>)> {
+        if key.db_dir.trim().is_empty() || key.keys.is_empty() {
+            bail!("wechat db key material not found");
         }
-        if let Some(keys_file) = key
-            .keys_file
-            .as_ref()
-            .filter(|path| !path.trim().is_empty())
-        {
-            let keys = wechat_db::read_keys_file(&PathBuf::from(keys_file))?;
-            let db_dir = key
-                .db_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .or_else(wechat_db::detect_db_storage)
-                .ok_or_else(|| anyhow!("wechat db_storage directory not found"))?;
-            return Ok((db_dir, keys));
-        }
-        bail!("wechat db key material not found")
+        Ok((PathBuf::from(&key.db_dir), key.keys.clone()))
     }
 
     fn read_key(&self) -> Result<KeyFile> {
         let data = fs::read_to_string(&self.key_file)
             .with_context(|| format!("read key file {}", self.key_file.display()))?;
         let key: KeyFile = serde_json::from_str(&data)?;
-        let has_key_map = key
-            .keys
-            .as_ref()
-            .map(|keys| !keys.is_empty())
-            .unwrap_or(false);
-        let has_keys_file = key
-            .keys_file
-            .as_ref()
-            .map(|path| !path.trim().is_empty())
-            .unwrap_or(false);
-        if !has_key_map && !has_keys_file {
+        if key.wxid.trim().is_empty() || key.db_dir.trim().is_empty() || key.keys.is_empty() {
             bail!("wechat key file has no database keys");
         }
         Ok(key)
@@ -461,17 +432,10 @@ impl WechatState {
 
     fn write_wechat_db_key(&self, init: wechat_db::InitData) -> Result<KeyFile> {
         self.ensure_state_dir()?;
-        let previous = self.read_key().ok();
         let doc = KeyFile {
-            version: 1,
             wxid: init.wxid,
-            key: "webox-weagent".to_string(),
-            source: Some("memory".to_string()),
-            keys_file: None,
-            db_dir: Some(init.db_dir.to_string_lossy().into_owned()),
-            keys: Some(init.keys),
-            created_at: previous.as_ref().map(|p| p.created_at).unwrap_or_else(now),
-            updated_at: now(),
+            db_dir: init.db_dir.to_string_lossy().into_owned(),
+            keys: init.keys,
         };
         let tmp = self.key_file.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&doc)?)?;
@@ -503,35 +467,13 @@ impl WechatState {
     }
 
     fn encode_db_cursor(&self, cursor: &DbCursor) -> Result<String> {
-        let payload = serde_json::to_vec(cursor)?;
-        let mut mac = HmacSha256::new_from_slice(self.cursor_key.as_bytes())
-            .map_err(|_| anyhow!("invalid cursor signing key"))?;
-        mac.update(&payload);
-        Ok(format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(&payload),
-            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-        ))
+        signed_payload::encode(&self.cursor_key, cursor)
     }
 
     fn decode_db_cursor(&self, raw: &str) -> Result<DbCursor> {
-        let (payload, signature) = raw
-            .trim()
-            .split_once('.')
-            .ok_or_else(|| anyhow!("invalid get_updates_buf"))?;
-        let payload = URL_SAFE_NO_PAD
-            .decode(payload)
-            .context("decode get_updates_buf")?;
-        let signature = URL_SAFE_NO_PAD
-            .decode(signature)
-            .context("decode get_updates_buf signature")?;
-        let mut mac = HmacSha256::new_from_slice(self.cursor_key.as_bytes())
-            .map_err(|_| anyhow!("invalid cursor signing key"))?;
-        mac.update(&payload);
-        mac.verify_slice(&signature)
-            .context("verify get_updates_buf signature")?;
-        let cursor: DbCursor = serde_json::from_slice(&payload).context("parse get_updates_buf")?;
-        if cursor.v != 3 || cursor.source != "db" || cursor.started_at <= 0 {
+        let cursor: DbCursor =
+            signed_payload::decode(&self.cursor_key, raw).context("decode get_updates_buf")?;
+        if cursor.started_at <= 0 {
             bail!("unsupported get_updates_buf");
         }
         Ok(cursor)
@@ -669,8 +611,6 @@ mod tests {
     #[test]
     fn db_cursor_round_trips_exact_stream_positions() {
         let cursor = DbCursor {
-            v: 3,
-            source: "db".to_string(),
             started_at: 100,
             positions: std::collections::BTreeMap::from([(
                 "room".to_string(),
@@ -695,8 +635,6 @@ mod tests {
     fn db_cursor_rejects_tampering() {
         let state = WechatState::new(PathBuf::from("/tmp/test"), "test-token");
         let cursor = DbCursor {
-            v: 3,
-            source: "db".to_string(),
             started_at: 100,
             positions: Default::default(),
         };
@@ -706,6 +644,35 @@ mod tests {
         assert!(state
             .decode_db_cursor(std::str::from_utf8(&encoded).unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn db_cursor_rejects_legacy_fields() {
+        let state = WechatState::new(PathBuf::from("/tmp/test"), "test-token");
+        let encoded = signed_payload::encode(
+            &state.cursor_key,
+            &serde_json::json!({
+                "v": 3,
+                "source": "db",
+                "started_at": 100,
+                "positions": {},
+            }),
+        )
+        .unwrap();
+
+        assert!(state.decode_db_cursor(&encoded).is_err());
+    }
+
+    #[test]
+    fn key_file_rejects_legacy_fields() {
+        let legacy = serde_json::json!({
+            "version": 1,
+            "wxid": "wxid_test",
+            "dbDir": "/tmp/db",
+            "keys": {},
+        });
+
+        assert!(serde_json::from_value::<KeyFile>(legacy).is_err());
     }
 
     #[test]
@@ -779,10 +746,7 @@ mod tests {
 
         fs::remove_dir_all(state_dir).ok();
         assert_eq!(status.status, LoginStatusKind::WaitingForLogin);
-        assert!(!status.can_read_messages);
         assert!(!status.has_key);
-        assert!(!status.has_db_storage);
-        assert!(!status.refreshed);
         assert!(status.detail.is_none());
     }
 
@@ -798,15 +762,9 @@ mod tests {
         fs::write(
             state_dir.join("wechat.key"),
             serde_json::to_vec(&KeyFile {
-                version: 1,
                 wxid: "wxid_test".to_string(),
-                key: "webox-weagent".to_string(),
-                source: Some("test".to_string()),
-                keys_file: None,
-                db_dir: Some(db_dir.to_string_lossy().into_owned()),
-                keys: Some(keys),
-                created_at: 1,
-                updated_at: 2,
+                db_dir: db_dir.to_string_lossy().into_owned(),
+                keys,
             })
             .unwrap(),
         )
@@ -816,11 +774,7 @@ mod tests {
 
         fs::remove_dir_all(state_dir).ok();
         assert_eq!(status.status, LoginStatusKind::KeyUnavailable);
-        assert!(!status.can_read_messages);
         assert!(status.has_key);
-        assert!(status.has_db_storage);
-        assert_eq!(status.key_source.as_deref(), Some("test"));
-        assert_eq!(status.key_updated_at, Some(2));
         assert!(status.detail.is_none());
     }
 }

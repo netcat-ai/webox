@@ -7,9 +7,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub listen_addr: String,
     pub api_token: String,
-    pub tenant_id: String,
     pub provider_account_id: String,
-    pub public_base_url: Option<String>,
     pub qr_screenshot_path: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub media_dir: PathBuf,
@@ -19,19 +17,12 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let state_dir = optional_path(&env::var("WEBOX_WEAGENT_STATE_DIR").unwrap_or_default())
             .unwrap_or_else(|| PathBuf::from("/webox/state/weagent"));
-        let api_token = match optional_string(&env::var("WEBOX_API_TOKEN").unwrap_or_default()) {
-            Some(token) => token,
-            None => load_or_create_api_token(&state_dir)?,
-        };
+        let api_token = load_or_create_id(&state_dir, "api-token", "")?;
+        let provider_account_id = load_or_create_id(&state_dir, "provider-account-id", "webox-")?;
         Ok(Self {
             listen_addr: normalize_listen_addr(&env_or("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
             api_token,
-            tenant_id: env_or("WEBOX_TENANT_ID", "default"),
-            provider_account_id: env_or("WEBOX_PROVIDER_ACCOUNT_ID", "default"),
-            public_base_url: optional_string(
-                &env::var("WEBOX_PUBLIC_BASE_URL").unwrap_or_default(),
-            )
-            .map(|value| value.trim_end_matches('/').to_string()),
+            provider_account_id,
             qr_screenshot_path: optional_path(&env_or(
                 "WEBOX_QR_SCREENSHOT_PATH",
                 "/webox/runtime/xvfb/Xvfb_screen0",
@@ -43,8 +34,8 @@ impl Config {
     }
 }
 
-fn load_or_create_api_token(state_dir: &PathBuf) -> Result<String> {
-    let path = state_dir.join("api-token");
+fn load_or_create_id(state_dir: &PathBuf, filename: &str, prefix: &str) -> Result<String> {
+    let path = state_dir.join(filename);
     if let Ok(value) = fs::read_to_string(&path) {
         if let Some(token) = optional_string(&value) {
             return Ok(token);
@@ -52,17 +43,16 @@ fn load_or_create_api_token(state_dir: &PathBuf) -> Result<String> {
     }
     fs::create_dir_all(state_dir)
         .with_context(|| format!("create state directory {}", state_dir.display()))?;
-    let token = uuid::Uuid::new_v4().simple().to_string();
+    let value = format!("{prefix}{}", uuid::Uuid::new_v4().simple());
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, token.as_bytes())
-        .with_context(|| format!("write API token {}", tmp.display()))?;
+    fs::write(&tmp, value.as_bytes()).with_context(|| format!("write ID {}", tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     }
-    fs::rename(&tmp, &path).with_context(|| format!("persist API token {}", path.display()))?;
-    Ok(token)
+    fs::rename(&tmp, &path).with_context(|| format!("persist ID {}", path.display()))?;
+    Ok(value)
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
@@ -102,14 +92,17 @@ mod tests {
     }
 
     #[test]
-    fn generated_api_token_is_stable_in_state_directory() {
+    fn generated_ids_are_stable_and_distinct() {
         let root = std::env::temp_dir().join(format!("webox-config-{}", uuid::Uuid::new_v4()));
 
-        let first = load_or_create_api_token(&root).unwrap();
-        let second = load_or_create_api_token(&root).unwrap();
+        let first = load_or_create_id(&root, "api-token", "").unwrap();
+        let second = load_or_create_id(&root, "api-token", "").unwrap();
+        let account = load_or_create_id(&root, "provider-account-id", "webox-").unwrap();
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 32);
+        assert!(account.starts_with("webox-"));
+        assert_ne!(first, account);
         fs::remove_dir_all(root).ok();
     }
 }

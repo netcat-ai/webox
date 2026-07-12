@@ -1,20 +1,17 @@
 use crate::error::ApiError;
 use crate::media_store::MediaStore;
 use crate::qr_source::QrSource;
+use crate::signed_payload;
 use crate::ui_sender::UiSender;
 use crate::wechat_state::{LoginStatusKind, WechatState};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use hmac::{Hmac, Mac};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -28,20 +25,18 @@ const QR_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(20);
 const QR_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(10);
 const QR_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_SEND_RECEIPTS: usize = 1024;
-type HmacSha256 = Hmac<Sha256>;
-
+const REMINDER_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct AppState {
     pub api_token: String,
-    pub tenant_id: String,
     pub provider_account_id: String,
-    pub public_base_url: Option<String>,
     pub wechat: WechatState,
     pub sender: Arc<tokio::sync::Mutex<UiSender>>,
     pub qr_source: QrSource,
     pub media_store: MediaStore,
     pub login_session: Arc<Mutex<LoginSession>>,
     pub send_receipts: Arc<Mutex<SendReceiptCache>>,
+    pub remark_reminders: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,23 +73,17 @@ pub struct BotQrcodeRequest {
 #[derive(Debug, Deserialize)]
 pub struct QrcodeStatusQuery {
     pub qrcode: String,
-    #[serde(default)]
-    pub verify_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GetUpdatesRequest {
     #[serde(default)]
     pub get_updates_buf: Option<String>,
-    #[serde(default)]
-    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
     pub msg: OutboundMessage,
-    #[serde(default)]
-    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,8 +92,6 @@ pub struct GetConfigRequest {
     pub ilink_user_id: Option<String>,
     #[serde(default)]
     pub context_token: Option<String>,
-    #[serde(default)]
-    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,15 +102,10 @@ pub struct SendTypingRequest {
     pub typing_ticket: Option<String>,
     #[serde(default)]
     pub status: Option<i64>,
-    #[serde(default)]
-    pub base_info: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct LifecycleRequest {
-    #[serde(default)]
-    pub base_info: Option<Value>,
-}
+pub struct LifecycleRequest {}
 
 #[derive(Debug, Deserialize)]
 pub struct CdnDownloadQuery {
@@ -143,24 +125,15 @@ pub struct OutboundMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TypingTicket {
-    v: u8,
-    tenant_id: String,
-    provider_account_id: String,
     ilink_user_id: String,
-    context_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContextToken {
-    v: u8,
-    tenant_id: String,
-    channel: String,
-    provider_account_id: String,
-    external_room_id: String,
-    room_type: String,
-    display_name: String,
-    outbound_target: String,
+    target: String,
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -266,7 +239,6 @@ pub async fn get_qrcode_status(
     if query.qrcode.trim().is_empty() {
         return Err(ApiError::bad_request("qrcode is required"));
     }
-    let _verify_code = query.verify_code.as_deref();
     let current_qrcode = state.qr_source.latest().await.ok().flatten();
     let login = state.wechat.login_status();
     if let Some(detail) = login.detail.as_deref() {
@@ -291,10 +263,7 @@ pub async fn get_qrcode_status(
             "ilink_user_id".to_string(),
             json!(state.provider_account_id),
         );
-        response.insert(
-            "baseurl".to_string(),
-            json!(ilink_base_url(&state, &headers)),
-        );
+        response.insert("baseurl".to_string(), json!(ilink_base_url(&headers)));
     }
     Ok(Json(Value::Object(response)))
 }
@@ -372,7 +341,6 @@ pub async fn get_updates(
     Json(request): Json<GetUpdatesRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
-    let _base_info = request.base_info.as_ref();
     let mut cursor = request.get_updates_buf.unwrap_or_default();
     state
         .wechat
@@ -421,7 +389,12 @@ pub async fn get_updates(
             })));
         }
     };
-    let baseurl = ilink_base_url(&state, &headers);
+    let baseurl = ilink_base_url(&headers);
+    let reminder_targets = result
+        .messages
+        .iter()
+        .filter_map(remark_reminder_target)
+        .collect::<HashSet<_>>();
     let view_state = state.clone();
     let messages = result.messages;
     let msgs = tokio::task::spawn_blocking(move || {
@@ -432,12 +405,90 @@ pub async fn get_updates(
     })
     .await
     .map_err(|err| ApiError::Internal(format!("join message mapping task: {err}")))?;
+    schedule_remark_reminders(state, reminder_targets);
     Ok(Json(json!({
         "ret": 0,
         "msgs": msgs,
         "get_updates_buf": result.cursor,
         "longpolling_timeout_ms": GET_UPDATES_TIMEOUT_MS,
     })))
+}
+
+fn schedule_remark_reminders(state: Arc<AppState>, targets: HashSet<String>) {
+    for target_id in targets {
+        let scheduled = state
+            .remark_reminders
+            .lock()
+            .is_ok_and(|mut pending| pending.insert(target_id.clone()));
+        if !scheduled {
+            continue;
+        }
+        let task_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match remind_missing_remark(&task_state, &target_id).await {
+                    Ok(()) => break,
+                    Err(err) => {
+                        tracing::warn!(error = %err, target_id, "could not deliver remark reminder");
+                        sleep(REMINDER_RETRY_INTERVAL).await;
+                    }
+                }
+            }
+            if let Ok(mut pending) = task_state.remark_reminders.lock() {
+                pending.remove(&target_id);
+            }
+        });
+    }
+}
+
+async fn remind_missing_remark(state: &AppState, target_id: &str) -> anyhow::Result<()> {
+    let wechat = state.wechat.clone();
+    let lookup_id = target_id.to_string();
+    let identity =
+        tokio::task::spawn_blocking(move || wechat.contact_identity(&lookup_id)).await??;
+    let Some(identity) = identity.filter(|identity| !identity.has_remark) else {
+        return Ok(());
+    };
+    let current_user_id = state.wechat.current_user_id()?;
+    let marker = remark_reminder_marker(target_id);
+    let wechat = state.wechat.clone();
+    let history_target = current_user_id.clone();
+    let history_marker = marker.clone();
+    let already_reminded = tokio::task::spawn_blocking(move || {
+        wechat.outgoing_text_contains(&history_target, &history_marker)
+    })
+    .await??;
+    if already_reminded {
+        return Ok(());
+    }
+    state
+        .sender
+        .lock()
+        .await
+        .send_text(
+            current_user_id,
+            remark_reminder_text(&marker, &identity.display),
+        )
+        .await?;
+    Ok(())
+}
+
+fn remark_reminder_marker(target_id: &str) -> String {
+    format!("wb-{target_id}")
+}
+
+fn remark_reminder_text(marker: &str, display: &str) -> String {
+    format!("{marker} {display}")
+}
+
+fn remark_reminder_target(message: &Value) -> Option<String> {
+    let room_id = value_str(message, "roomid");
+    let target = if room_id.ends_with("@chatroom") {
+        room_id
+    } else {
+        value_str(message, "from")
+    };
+    (!target.is_empty() && target != "filehelper").then(|| target.to_string())
 }
 
 fn session_expired_response(cursor: &str) -> Value {
@@ -468,7 +519,6 @@ pub async fn send_message(
     if !state.wechat.is_initialized() {
         return Ok(Json(session_unavailable_response()));
     }
-    let _base_info = request.base_info.as_ref();
     let request_client_id = normalized_client_id(request.msg.client_id.as_deref())?;
     let fingerprint = outbound_fingerprint(&request.msg)?;
     if let Some(client_id) = request_client_id.as_deref() {
@@ -574,7 +624,6 @@ pub async fn get_config(
     Json(request): Json<GetConfigRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
-    let _base_info = request.base_info.as_ref();
     let context_token = request.context_token.as_deref().and_then(non_empty);
     let context = context_token
         .as_deref()
@@ -585,15 +634,11 @@ pub async fn get_config(
         .ilink_user_id
         .as_deref()
         .and_then(non_empty)
-        .or_else(|| {
-            context
-                .as_ref()
-                .and_then(|value| non_empty(&value.external_room_id))
-        })
+        .or_else(|| context.as_ref().and_then(|value| non_empty(&value.target)))
         .ok_or_else(|| ApiError::bad_request("ilink_user_id or context_token is required"))?;
     Ok(Json(json!({
         "ret": 0,
-        "typing_ticket": typing_ticket_for(&state, &ilink_user_id, context_token.as_deref()),
+        "typing_ticket": typing_ticket_for(&state, &ilink_user_id),
     })))
 }
 
@@ -603,7 +648,6 @@ pub async fn send_typing(
     Json(request): Json<SendTypingRequest>,
 ) -> Result<Json<Value>, ApiError> {
     authenticate(&state, &headers)?;
-    let _base_info = request.base_info.as_ref();
     let status = request
         .status
         .ok_or_else(|| ApiError::bad_request("status is required"))?;
@@ -617,11 +661,6 @@ pub async fn send_typing(
         .ok_or_else(|| ApiError::bad_request("typing_ticket is required"))?;
     let ticket = decode_typing_ticket(&state, &ticket)
         .map_err(|err| ApiError::bad_request(format!("invalid typing_ticket: {err}")))?;
-    if ticket.tenant_id != state.tenant_id
-        || ticket.provider_account_id != state.provider_account_id
-    {
-        return Err(ApiError::bad_request("typing_ticket account mismatch"));
-    }
     if let Some(ilink_user_id) = request.ilink_user_id.as_deref().and_then(non_empty) {
         if ilink_user_id != ticket.ilink_user_id {
             return Err(ApiError::bad_request("typing_ticket user mismatch"));
@@ -635,10 +674,9 @@ pub async fn send_typing(
 pub async fn notify_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<LifecycleRequest>,
+    Json(_request): Json<LifecycleRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authenticate(&state, &headers)?;
-    let _base_info = request.base_info.as_ref();
     Ok(Json(json!({ "ret": 0 })))
 }
 
@@ -699,10 +737,7 @@ fn has_matching_local_token(tokens: &[String], expected: &str) -> bool {
     tokens.iter().any(|token| token.trim() == expected)
 }
 
-fn ilink_base_url(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(value) = state.public_base_url.as_deref().and_then(non_empty) {
-        return normalize_base_url(&value);
-    }
+fn ilink_base_url(headers: &HeaderMap) -> String {
     let host = header_string(headers, "host").unwrap_or_else(|| "127.0.0.1:8080".to_string());
     format!("http://{host}")
 }
@@ -718,29 +753,21 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
         .and_then(non_empty)
 }
 
-fn typing_ticket_for(state: &AppState, ilink_user_id: &str, context_token: Option<&str>) -> String {
-    encode_signed_json(
-        state,
+fn typing_ticket_for(state: &AppState, ilink_user_id: &str) -> String {
+    signed_payload::encode(
+        &state.api_token,
         &TypingTicket {
-            v: 1,
-            tenant_id: state.tenant_id.clone(),
-            provider_account_id: state.provider_account_id.clone(),
             ilink_user_id: ilink_user_id.to_string(),
-            context_token: context_token.unwrap_or_default().to_string(),
         },
     )
+    .expect("typing ticket serializes")
 }
 
 fn decode_typing_ticket(state: &AppState, ticket: &str) -> anyhow::Result<TypingTicket> {
-    let ticket: TypingTicket = decode_signed_json(state, ticket)?;
-    if ticket.v != 1 {
-        anyhow::bail!("unsupported version");
-    }
-    Ok(ticket)
+    signed_payload::decode(&state.api_token, ticket)
 }
 
 fn standard_message_view(state: &AppState, message: &Value, baseurl: &str) -> Value {
-    let room = room_view(state, message);
     let text = message_display_text(message);
     let created_time_ms = message_time_millis(message);
     let external_id = external_message_id(message);
@@ -761,7 +788,7 @@ fn standard_message_view(state: &AppState, message: &Value, baseurl: &str) -> Va
         "session_id": roomid,
         "message_type": 1,
         "message_state": 2,
-        "context_token": context_token_for_room(state, &room),
+        "context_token": context_token_for_target(state, roomid),
         "text": text,
         "item_list": standard_item_list(state, message, baseurl, &text),
         "wechat_msgtype": message_type(message),
@@ -850,8 +877,7 @@ fn outbound_target(state: &AppState, message: &OutboundMessage) -> Result<String
         .ok_or_else(|| ApiError::bad_request("msg.context_token is required"))?;
     let context = decode_context_token(state, &token)
         .map_err(|err| ApiError::bad_request(format!("invalid context_token: {err}")))?;
-    non_empty(&context.outbound_target)
-        .or_else(|| non_empty(&context.external_room_id))
+    non_empty(&context.target)
         .ok_or_else(|| ApiError::bad_request("msg.context_token has no outbound target"))
 }
 
@@ -889,89 +915,18 @@ fn item_text(item: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn room_view(state: &AppState, message: &Value) -> Value {
-    let external_room_id = message
-        .get("roomid")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    room_view_from_target(
-        state,
-        &external_room_id,
-        None,
-        external_room_id.ends_with("@chatroom"),
+fn context_token_for_target(state: &AppState, target: &str) -> String {
+    signed_payload::encode(
+        &state.api_token,
+        &ContextToken {
+            target: target.to_string(),
+        },
     )
-}
-
-fn room_view_from_target(
-    state: &AppState,
-    external_room_id: &str,
-    display_name: Option<&str>,
-    is_group: bool,
-) -> Value {
-    let room_type = if is_group { "group" } else { "direct" };
-    json!({
-        "id": stable_positive_id(external_room_id),
-        "tenant_id": state.tenant_id,
-        "channel": "wechat",
-        "provider_account_id": state.provider_account_id,
-        "external_room_id": external_room_id,
-        "room_type": room_type,
-        "display_name": display_name.unwrap_or(external_room_id),
-        "outbound_target": external_room_id,
-    })
-}
-
-fn context_token_for_room(state: &AppState, room: &Value) -> String {
-    let context = ContextToken {
-        v: 1,
-        tenant_id: value_str(room, "tenant_id").to_string(),
-        channel: value_str(room, "channel").to_string(),
-        provider_account_id: value_str(room, "provider_account_id").to_string(),
-        external_room_id: value_str(room, "external_room_id").to_string(),
-        room_type: value_str(room, "room_type").to_string(),
-        display_name: value_str(room, "display_name").to_string(),
-        outbound_target: value_str(room, "outbound_target").to_string(),
-    };
-    encode_signed_json(state, &context)
+    .expect("context token serializes")
 }
 
 fn decode_context_token(state: &AppState, token: &str) -> anyhow::Result<ContextToken> {
-    let context: ContextToken = decode_signed_json(state, token)?;
-    if context.v != 1 {
-        anyhow::bail!("unsupported version");
-    }
-    if context.tenant_id != state.tenant_id
-        || context.provider_account_id != state.provider_account_id
-        || context.channel != "wechat"
-    {
-        anyhow::bail!("context scope mismatch");
-    }
-    Ok(context)
-}
-
-fn encode_signed_json<T: Serialize>(state: &AppState, value: &T) -> String {
-    let payload = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(value).expect("signed protocol value serializes"));
-    let mut mac = HmacSha256::new_from_slice(state.api_token.as_bytes())
-        .expect("HMAC accepts any key length");
-    mac.update(payload.as_bytes());
-    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    format!("{payload}.{signature}")
-}
-
-fn decode_signed_json<T: DeserializeOwned>(state: &AppState, token: &str) -> anyhow::Result<T> {
-    let (payload, signature) = token
-        .trim()
-        .split_once('.')
-        .ok_or_else(|| anyhow::anyhow!("missing signature"))?;
-    let signature = URL_SAFE_NO_PAD.decode(signature)?;
-    let mut mac = HmacSha256::new_from_slice(state.api_token.as_bytes())?;
-    mac.update(payload.as_bytes());
-    mac.verify_slice(&signature)
-        .map_err(|_| anyhow::anyhow!("signature mismatch"))?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    signed_payload::decode(&state.api_token, token)
 }
 
 fn message_body(message: &Value) -> Value {
@@ -1237,18 +1192,38 @@ mod tests {
     }
 
     #[test]
+    fn remark_reminder_targets_private_sender() {
+        let message = json!({ "from": "wxid_alice", "roomid": "wxid_alice" });
+
+        assert_eq!(
+            remark_reminder_target(&message).as_deref(),
+            Some("wxid_alice")
+        );
+    }
+
+    #[test]
+    fn remark_reminder_targets_group_instead_of_member() {
+        let message = json!({ "from": "wxid_alice", "roomid": "group@chatroom" });
+
+        assert_eq!(
+            remark_reminder_target(&message).as_deref(),
+            Some("group@chatroom")
+        );
+    }
+
+    #[test]
+    fn remark_reminder_uses_stable_target_marker_and_original_name() {
+        assert_eq!(remark_reminder_marker("wxid_alice"), "wb-wxid_alice");
+        assert_eq!(
+            remark_reminder_text("wb-wxid_alice", "Alice"),
+            "wb-wxid_alice Alice"
+        );
+    }
+
+    #[test]
     fn context_token_round_trips_room_target() {
         let state = test_state();
-        let room = json!({
-            "tenant_id": "default",
-            "channel": "wechat",
-            "provider_account_id": "wx",
-            "external_room_id": "alice",
-            "room_type": "direct",
-            "display_name": "Alice",
-            "outbound_target": "alice",
-        });
-        let token = context_token_for_room(&state, &room);
+        let token = context_token_for_target(&state, "alice");
         let message = OutboundMessage {
             client_id: None,
             context_token: Some(token),
@@ -1321,8 +1296,7 @@ mod tests {
     #[test]
     fn context_token_rejects_tampering() {
         let state = test_state();
-        let room = room_view_from_target(&state, "alice", None, false);
-        let token = context_token_for_room(&state, &room);
+        let token = context_token_for_target(&state, "alice");
         let (payload, signature) = token.split_once('.').unwrap();
         let mut payload = payload.as_bytes().to_vec();
         payload[0] ^= 1;
@@ -1332,27 +1306,27 @@ mod tests {
     }
 
     #[test]
-    fn typing_ticket_round_trips_user_and_context() {
+    fn typing_ticket_round_trips_user() {
         let state = test_state();
-        let ticket = typing_ticket_for(&state, "alice", Some("ctx"));
+        let ticket = typing_ticket_for(&state, "alice");
         let decoded = decode_typing_ticket(&state, &ticket).unwrap();
 
-        assert_eq!(decoded.tenant_id, "default");
-        assert_eq!(decoded.provider_account_id, "wx");
         assert_eq!(decoded.ilink_user_id, "alice");
-        assert_eq!(decoded.context_token, "ctx");
     }
 
     #[test]
-    fn baseurl_normalization_preserves_reverse_proxy_prefix() {
-        assert_eq!(
-            normalize_base_url("https://public.example"),
-            "https://public.example"
-        );
-        assert_eq!(
-            normalize_base_url("https://public.example/webox/"),
-            "https://public.example/webox"
-        );
+    fn context_token_rejects_legacy_fields() {
+        let state = test_state();
+        let token = signed_payload::encode(
+            &state.api_token,
+            &json!({
+                "target": "alice",
+                "room_type": "direct",
+            }),
+        )
+        .unwrap();
+
+        assert!(decode_context_token(&state, &token).is_err());
     }
 
     #[test]
@@ -1428,9 +1402,7 @@ mod tests {
         let wechat = WechatState::new(std::env::temp_dir().join("webox-ilink-test"), "test-token");
         AppState {
             api_token: "token".to_string(),
-            tenant_id: "default".to_string(),
             provider_account_id: "wx".to_string(),
-            public_base_url: Some("http://127.0.0.1:8080".to_string()),
             sender: Arc::new(tokio::sync::Mutex::new(UiSender::new(wechat.clone()))),
             qr_source: QrSource::new(None),
             media_store: MediaStore::new(
@@ -1438,6 +1410,7 @@ mod tests {
             ),
             login_session: Arc::new(Mutex::new(LoginSession::default())),
             send_receipts: Arc::new(Mutex::new(Default::default())),
+            remark_reminders: Arc::new(Mutex::new(Default::default())),
             wechat,
         }
     }

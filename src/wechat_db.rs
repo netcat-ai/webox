@@ -33,11 +33,10 @@ const MAX_LOCAL_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
 type Aes256CbcDec = Decryptor<Aes256>;
 type Block = aes::cipher::Block<Aes256>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct KeyEntry {
     db_name: String,
     enc_key: String,
-    salt: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +77,13 @@ struct ImageKeyMaterial {
 #[derive(Debug, Clone)]
 pub struct Recipient {
     pub username: String,
+    pub search_term: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContactIdentity {
     pub display: String,
-    pub is_group: bool,
-    pub search_uses_remark: bool,
+    pub has_remark: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,10 +119,8 @@ struct DbCache {
 }
 
 #[derive(Clone)]
-struct Names {
-    map: HashMap<String, String>,
+struct MessageIndex {
     msg_db_keys: Vec<String>,
-    verify_flags: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,35 +168,6 @@ pub fn init_from_memory() -> Result<InitData> {
     Ok(InitData { db_dir, wxid, keys })
 }
 
-pub fn parse_keys_value(value: &Value) -> Result<HashMap<String, String>> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow!("keys 文件不是 JSON object"))?;
-    let mut keys = HashMap::new();
-    for (rel_key, item) in obj {
-        let enc_key = match item {
-            Value::String(s) => s.trim(),
-            Value::Object(map) => map.get("enc_key").and_then(Value::as_str).unwrap_or(""),
-            _ => "",
-        };
-        if !enc_key.trim().is_empty() {
-            keys.insert(rel_key.replace('\\', "/"), enc_key.trim().to_string());
-        }
-    }
-    if keys.is_empty() {
-        bail!("未找到有效 Message Key");
-    }
-    Ok(keys)
-}
-
-pub fn read_keys_file(path: &Path) -> Result<HashMap<String, String>> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("读取 keys 文件失败: {}", path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("解析 keys 文件失败: {}", path.display()))?;
-    parse_keys_value(&value)
-}
-
 pub fn poll_new_messages(
     db_dir: PathBuf,
     keys: HashMap<String, String>,
@@ -205,8 +177,8 @@ pub fn poll_new_messages(
     cache_dir: PathBuf,
 ) -> Result<PollData> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
-    let names = load_names(&mut db)?;
-    q_new_messages(&mut db, &names, state, started_at, limit)
+    let index = message_index(&db);
+    q_new_messages(&mut db, &index, state, started_at, limit)
 }
 
 pub fn baseline_message_positions(
@@ -216,12 +188,12 @@ pub fn baseline_message_positions(
     started_at: i64,
 ) -> Result<MessagePositions> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
-    let names = load_names(&mut db)?;
+    let index = message_index(&db);
     let sessions = load_session_state(&mut db)?;
     let mut positions = BTreeMap::new();
     for username in sessions.keys() {
         let mut room = BTreeMap::new();
-        for shard in find_msg_shards(&mut db, &names, username)? {
+        for shard in find_msg_shards(&mut db, &index, username)? {
             room.insert(
                 shard.rel_key,
                 max_message_position(&shard.path, &shard.table)?.unwrap_or(MessagePosition {
@@ -265,6 +237,40 @@ pub fn has_outgoing_text(
     )
 }
 
+pub fn outgoing_text_contains(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    roomid: &str,
+    needle: &str,
+) -> Result<bool> {
+    let mut db = DbCache::new(db_dir, cache_dir, keys)?;
+    let index = message_index(&db);
+    for shard in find_msg_shards(&mut db, &index, roomid)? {
+        let conn = Connection::open(&shard.path)?;
+        let sql = format!(
+            "SELECT local_type, message_content, WCDB_CT_message_content
+             FROM [{}] WHERE status = 2 AND origin_source = 1
+             ORDER BY create_time DESC, local_id DESC",
+            shard.table
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                get_content_bytes(row, 1),
+                row.get::<_, i64>(2).unwrap_or(0),
+            ))
+        })?;
+        for row in rows.flatten() {
+            if is_text_message(row.0) && decompress_message(&row.1, row.2).contains(needle) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub fn room_message_positions(
     db_dir: PathBuf,
     keys: HashMap<String, String>,
@@ -272,9 +278,9 @@ pub fn room_message_positions(
     roomid: &str,
 ) -> Result<RoomMessagePositions> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
-    let names = load_names(&mut db)?;
+    let index = message_index(&db);
     let mut positions = BTreeMap::new();
-    for shard in find_msg_shards(&mut db, &names, roomid)? {
+    for shard in find_msg_shards(&mut db, &index, roomid)? {
         positions.insert(
             shard.rel_key,
             max_message_position(&shard.path, &shard.table)?.unwrap_or_default(),
@@ -292,8 +298,8 @@ fn has_outgoing_payload(
     matches: impl Fn(i64, &str) -> bool,
 ) -> Result<bool> {
     let mut db = DbCache::new(db_dir, cache_dir, keys)?;
-    let names = load_names(&mut db)?;
-    for shard in find_msg_shards(&mut db, &names, roomid)? {
+    let index = message_index(&db);
+    for shard in find_msg_shards(&mut db, &index, roomid)? {
         let position = positions.get(&shard.rel_key).copied().unwrap_or_default();
         let conn = Connection::open(&shard.path)?;
         let sql = format!(
@@ -373,8 +379,8 @@ pub fn read_image_media(
         return Ok(None);
     }
     let mut db = DbCache::new(db_dir.clone(), cache_dir, keys)?;
-    let names = load_names(&mut db)?;
-    let shards = find_msg_shards(&mut db, &names, roomid)?;
+    let index = message_index(&db);
+    let shards = find_msg_shards(&mut db, &index, roomid)?;
     let account_dir = db_dir
         .parent()
         .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?
@@ -425,8 +431,8 @@ fn read_video_media(
         return Ok(None);
     }
     let mut db = DbCache::new(db_dir.clone(), cache_dir, keys)?;
-    let names = load_names(&mut db)?;
-    let shards = find_msg_shards(&mut db, &names, roomid)?;
+    let index = message_index(&db);
+    let shards = find_msg_shards(&mut db, &index, roomid)?;
     let account_dir = db_dir
         .parent()
         .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?
@@ -459,8 +465,8 @@ fn read_file_media(
         return Ok(None);
     }
     let mut db = DbCache::new(db_dir.clone(), cache_dir, keys)?;
-    let names = load_names(&mut db)?;
-    let shards = find_msg_shards(&mut db, &names, roomid)?;
+    let index = message_index(&db);
+    let shards = find_msg_shards(&mut db, &index, roomid)?;
     let account_dir = db_dir
         .parent()
         .ok_or_else(|| anyhow!("db_storage 目录缺少账号父目录"))?;
@@ -511,29 +517,20 @@ fn recipient_display_name(username: &str, nick: &str, remark: &str, alias: &str)
     username.trim().to_string()
 }
 
-fn recipient_from_contact_row(
-    username: String,
-    nick: String,
-    remark: String,
-    alias: String,
-) -> Recipient {
-    let search_uses_remark = !remark.trim().is_empty();
-    let display = recipient_display_name(&username, &nick, &remark, &alias);
-    let is_group = username.contains("@chatroom");
-    Recipient {
+fn recipient_from_remark(username: String, remark: String) -> Option<Recipient> {
+    let search_term = remark.trim();
+    (!search_term.is_empty()).then(|| Recipient {
         username,
-        display,
-        is_group,
-        search_uses_remark,
-    }
+        search_term: search_term.to_string(),
+    })
 }
 
-pub fn resolve_recipient_by_username(
+pub fn contact_identity(
     db_dir: PathBuf,
     keys: HashMap<String, String>,
     cache_dir: PathBuf,
     raw: &str,
-) -> Result<Option<Recipient>> {
+) -> Result<Option<ContactIdentity>> {
     let username = raw.trim();
     if username.is_empty() {
         return Ok(None);
@@ -543,12 +540,51 @@ pub fn resolve_recipient_by_username(
         return Ok(None);
     };
     let conn = Connection::open(path)?;
-    let recipient = conn
+    conn.query_row(
+        "SELECT nick_name, remark, alias FROM contact WHERE delete_flag=0 AND username=?1 LIMIT 1",
+        [username],
+        |row| {
+            let nick = row.get::<_, String>(0).unwrap_or_default();
+            let remark = row.get::<_, String>(1).unwrap_or_default();
+            let alias = row.get::<_, String>(2).unwrap_or_default();
+            Ok(ContactIdentity {
+                display: recipient_display_name(username, &nick, &remark, &alias),
+                has_remark: !remark.trim().is_empty(),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn resolve_recipient_by_username(
+    db_dir: PathBuf,
+    keys: HashMap<String, String>,
+    cache_dir: PathBuf,
+    raw: &str,
+    current_user_id: &str,
+) -> Result<Option<Recipient>> {
+    let username = raw.trim();
+    if username.is_empty() {
+        return Ok(None);
+    }
+    if username == "filehelper" {
+        return Ok(Some(Recipient {
+            username: username.to_string(),
+            search_term: "文件传输助手".to_string(),
+        }));
+    }
+    let mut db = DbCache::new(db_dir, cache_dir, keys)?;
+    let Some(path) = db.get("contact/contact.db")? else {
+        return Ok(None);
+    };
+    let conn = Connection::open(path)?;
+    let contact = conn
         .query_row(
         "SELECT username, nick_name, remark, alias FROM contact WHERE delete_flag=0 AND username=?1 LIMIT 1",
         [username],
         |row| {
-            Ok(recipient_from_contact_row(
+            Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1).unwrap_or_default(),
                 row.get::<_, String>(2).unwrap_or_default(),
@@ -557,19 +593,25 @@ pub fn resolve_recipient_by_username(
         },
     )
     .optional()?;
-    let Some(recipient) = recipient else {
+    let Some((username, nick, remark, alias)) = contact else {
         return Ok(None);
     };
-    if recipient.is_group && !recipient.search_uses_remark {
-        bail!("群聊必须设置唯一备注作为发送搜索词");
+    if username == current_user_id {
+        return Ok(Some(Recipient {
+            search_term: recipient_display_name(&username, &nick, &remark, &alias),
+            username,
+        }));
     }
+    let Some(recipient) = recipient_from_remark(username, remark) else {
+        bail!("联系人或群聊必须设置唯一备注作为发送搜索词");
+    };
     let duplicate: Option<String> = conn
         .query_row(
             "SELECT username FROM contact
              WHERE delete_flag=0 AND username<>?2
                AND (username=?1 OR nick_name=?1 OR remark=?1 OR alias=?1)
              LIMIT 1",
-            [&recipient.display, &recipient.username],
+            [&recipient.search_term, &recipient.username],
             |row| row.get(0),
         )
         .optional()?;
@@ -647,7 +689,6 @@ fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
                 entries.push(KeyEntry {
                     db_name: db_name.clone(),
                     enc_key: key_hex.clone(),
-                    salt: salt_hex.clone(),
                 });
             }
         }
@@ -956,36 +997,7 @@ impl DbCache {
     }
 }
 
-fn load_names(db: &mut DbCache) -> Result<Names> {
-    let mut map = HashMap::new();
-    let mut verify_flags = HashMap::new();
-    if let Some(path) = db.get("contact/contact.db")? {
-        let conn = Connection::open(path)?;
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT username, nick_name, remark, verify_flag FROM contact")
-        {
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1).unwrap_or_default(),
-                    row.get::<_, String>(2).unwrap_or_default(),
-                    row.get::<_, i64>(3).unwrap_or(0),
-                ))
-            })?;
-            for row in rows.flatten() {
-                let (uname, nick, remark, vf) = row;
-                let display = if !remark.is_empty() {
-                    remark
-                } else if !nick.is_empty() {
-                    nick
-                } else {
-                    uname.clone()
-                };
-                verify_flags.insert(uname.clone(), vf);
-                map.insert(uname, display);
-            }
-        };
-    }
+fn message_index(db: &DbCache) -> MessageIndex {
     let mut msg_db_keys: Vec<String> = db
         .all_keys
         .keys()
@@ -993,16 +1005,12 @@ fn load_names(db: &mut DbCache) -> Result<Names> {
         .cloned()
         .collect();
     msg_db_keys.sort();
-    Ok(Names {
-        map,
-        msg_db_keys,
-        verify_flags,
-    })
+    MessageIndex { msg_db_keys }
 }
 
 fn q_new_messages(
     db: &mut DbCache,
-    names: &Names,
+    index: &MessageIndex,
     mut state: MessagePositions,
     started_at: i64,
     limit: usize,
@@ -1031,13 +1039,11 @@ fn q_new_messages(
     let mut events = Vec::new();
 
     for uname in &changed {
-        let shards = find_msg_shards(db, names, uname)?;
+        let shards = find_msg_shards(db, index, uname)?;
         if shards.is_empty() {
             continue;
         }
-        let display = names.display(uname);
-        let chat_type = chat_type_of(uname, names);
-        let is_group = chat_type == "group";
+        let is_group = uname.ends_with("@chatroom");
         for shard in &shards {
             let position = state
                 .get(uname)
@@ -1052,10 +1058,7 @@ fn q_new_messages(
                 &shard.table,
                 &shard.rel_key,
                 uname,
-                &display,
-                chat_type,
                 is_group,
-                &names.map,
                 position,
                 per_table_limit,
             )
@@ -1115,10 +1118,14 @@ fn load_session_state(db: &mut DbCache) -> Result<HashMap<String, i64>> {
     Ok(sessions)
 }
 
-fn find_msg_shards(db: &mut DbCache, names: &Names, username: &str) -> Result<Vec<MessageShard>> {
+fn find_msg_shards(
+    db: &mut DbCache,
+    index: &MessageIndex,
+    username: &str,
+) -> Result<Vec<MessageShard>> {
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     let mut results = Vec::new();
-    for rel_key in &names.msg_db_keys {
+    for rel_key in &index.msg_db_keys {
         let Some(path) = db.get(rel_key)? else {
             continue;
         };
@@ -1155,16 +1162,12 @@ fn find_msg_shards(db: &mut DbCache, names: &Names, username: &str) -> Result<Ve
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn query_new_table(
     db_path: &Path,
     table: &str,
     shard: &str,
     username: &str,
-    _display: &str,
-    _chat_type: &str,
     is_group: bool,
-    names: &HashMap<String, String>,
     position: MessagePosition,
     limit: usize,
 ) -> Result<Vec<MessageEvent>> {
@@ -1205,7 +1208,6 @@ fn query_new_table(
         .collect();
 
     let mut out = Vec::new();
-    let empty_group_names = HashMap::new();
     for (
         local_id,
         server_id,
@@ -1232,15 +1234,6 @@ fn query_new_table(
             continue;
         }
         let content = decompress_message(&content_bytes, ct);
-        let _sender_display = sender_label(
-            real_sender_id,
-            &content,
-            is_group,
-            username,
-            &id2u,
-            names,
-            &empty_group_names,
-        );
         let from = sender_username(real_sender_id, &content, is_group, username, &id2u);
         let text = fmt_content(local_id, local_type, &content, is_group);
         let quote = quote_for_message(local_type, &content, is_group);
@@ -2286,35 +2279,6 @@ fn is_hex_like(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
-impl Names {
-    fn display(&self, username: &str) -> String {
-        self.map
-            .get(username)
-            .cloned()
-            .unwrap_or_else(|| username.to_string())
-    }
-
-    fn is_verified(&self, username: &str) -> bool {
-        self.verify_flags.get(username).copied().unwrap_or(0) != 0
-    }
-}
-
-fn chat_type_of(username: &str, names: &Names) -> &'static str {
-    if username.contains("@chatroom") {
-        return "group";
-    }
-    if username == "brandsessionholder" || username == "@placeholder_foldgroup" {
-        return "folded";
-    }
-    if names.is_verified(username) || username.starts_with("gh_") || username.starts_with("biz_") {
-        return "official_account";
-    }
-    if username.starts_with('@') {
-        return "official_account";
-    }
-    "private"
-}
-
 fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
     let mut map = HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT rowid, user_name FROM Name2Id") {
@@ -2329,32 +2293,6 @@ fn load_id2u(conn: &Connection) -> HashMap<i64, String> {
             });
     }
     map
-}
-
-fn sender_label(
-    real_sender_id: i64,
-    content: &str,
-    is_group: bool,
-    chat_username: &str,
-    id2u: &HashMap<i64, String>,
-    names: &HashMap<String, String>,
-    group_nicknames: &HashMap<String, String>,
-) -> String {
-    let sender_uname = id2u.get(&real_sender_id).cloned().unwrap_or_default();
-    if is_group {
-        if !sender_uname.is_empty() && sender_uname != chat_username {
-            return sender_display(&sender_uname, names, group_nicknames);
-        }
-        if content.contains(":\n") {
-            let raw = content.split(":\n").next().unwrap_or("");
-            return sender_display(raw, names, group_nicknames);
-        }
-        return String::new();
-    }
-    if !sender_uname.is_empty() && sender_uname != chat_username {
-        return names.get(&sender_uname).cloned().unwrap_or(sender_uname);
-    }
-    String::new()
 }
 
 fn sender_username(
@@ -2378,18 +2316,6 @@ fn sender_username(
         return sender_uname;
     }
     chat_username.to_string()
-}
-
-fn sender_display(
-    username: &str,
-    names: &HashMap<String, String>,
-    group_nicknames: &HashMap<String, String>,
-) -> String {
-    group_nicknames
-        .get(username)
-        .or_else(|| names.get(username))
-        .cloned()
-        .unwrap_or_else(|| username.to_string())
 }
 
 fn get_content_bytes(row: &rusqlite::Row<'_>, idx: usize) -> Vec<u8> {
@@ -2915,10 +2841,7 @@ mod tests {
             "Msg_test",
             "message/msg_0.db",
             "alice",
-            "Alice",
-            "private",
             false,
-            &HashMap::new(),
             MessagePosition {
                 create_time: 999,
                 local_id: 0,
@@ -2959,10 +2882,7 @@ mod tests {
             "Msg_test",
             "message/msg_0.db",
             "alice",
-            "Alice",
-            "private",
             false,
-            &HashMap::new(),
             MessagePosition {
                 create_time: 1000,
                 local_id: 1,
@@ -2977,16 +2897,14 @@ mod tests {
     }
 
     #[test]
-    fn recipient_from_contact_keeps_internal_username() {
-        let recipient = recipient_from_contact_row(
-            "24933085811@chatroom".to_string(),
-            "姑姑的钻粉只此一群❤️".to_string(),
-            String::new(),
-            String::new(),
-        );
+    fn recipient_requires_a_remark_and_keeps_internal_username() {
+        let recipient =
+            recipient_from_remark("24933085811@chatroom".to_string(), "唯一备注".to_string())
+                .unwrap();
         assert_eq!(recipient.username, "24933085811@chatroom");
-        assert_eq!(recipient.display, "姑姑的钻粉只此一群❤️");
-        assert!(recipient.is_group);
+        assert_eq!(recipient.search_term, "唯一备注");
+
+        assert!(recipient_from_remark("wxid_test".to_string(), String::new()).is_none());
     }
 
     #[test]
@@ -3312,6 +3230,87 @@ mod tests {
 
         assert_eq!(appmsg_type(xml), Some(6));
         assert_eq!(msgtype_for_message(49, xml, false, false), "file");
+    }
+
+    #[test]
+    fn filehelper_uses_the_stable_builtin_search_name() {
+        let recipient = resolve_recipient_by_username(
+            PathBuf::new(),
+            HashMap::new(),
+            PathBuf::new(),
+            "filehelper",
+            "wxid_self",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(recipient.username, "filehelper");
+        assert_eq!(recipient.search_term, "文件传输助手");
+    }
+
+    #[test]
+    #[ignore = "requires a live WeChat database"]
+    fn live_current_user_is_present_in_contacts() {
+        let db_dir = PathBuf::from(std::env::var("WEBOX_LIVE_DB_DIR").unwrap());
+        let key_file = PathBuf::from(std::env::var("WEBOX_LIVE_KEY_FILE").unwrap());
+        let user_id = std::env::var("WEBOX_LIVE_USER_ID").unwrap();
+        let key_doc: Value = serde_json::from_slice(&fs::read(key_file).unwrap()).unwrap();
+        let keys: HashMap<String, String> = key_doc["keys"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
+            .collect();
+        let cache_dir =
+            std::env::temp_dir().join(format!("webox-self-contact-live-{}", uuid::Uuid::new_v4()));
+
+        let identity =
+            contact_identity(db_dir.clone(), keys.clone(), cache_dir.clone(), &user_id).unwrap();
+        let recipient =
+            resolve_recipient_by_username(db_dir, keys, cache_dir.clone(), &user_id, &user_id)
+                .unwrap();
+
+        fs::remove_dir_all(cache_dir).ok();
+        assert!(
+            identity.is_some(),
+            "current user is missing from contact.db"
+        );
+        assert!(recipient.is_some(), "current user has no UI search term");
+    }
+
+    #[test]
+    #[ignore = "requires a live WeChat database"]
+    fn live_outgoing_history_contains_probes() {
+        let db_dir = PathBuf::from(std::env::var("WEBOX_LIVE_DB_DIR").unwrap());
+        let key_file = PathBuf::from(std::env::var("WEBOX_LIVE_KEY_FILE").unwrap());
+        let room_id =
+            std::env::var("WEBOX_LIVE_ROOM_ID").unwrap_or_else(|_| "filehelper".to_string());
+        let key_doc: Value = serde_json::from_slice(&fs::read(key_file).unwrap()).unwrap();
+        let keys: HashMap<String, String> = key_doc["keys"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
+            .collect();
+        let cache_dir =
+            std::env::temp_dir().join(format!("webox-filehelper-live-{}", uuid::Uuid::new_v4()));
+        for probe in std::env::var("WEBOX_LIVE_EXPECTED_TEXTS")
+            .unwrap()
+            .split('|')
+        {
+            assert!(
+                outgoing_text_contains(
+                    db_dir.clone(),
+                    keys.clone(),
+                    cache_dir.clone(),
+                    &room_id,
+                    probe,
+                )
+                .unwrap(),
+                "{room_id} history is missing probe {probe}"
+            );
+        }
+        fs::remove_dir_all(cache_dir).ok();
     }
 
     #[test]

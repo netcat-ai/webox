@@ -42,24 +42,12 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
         bail!("text is empty or too long");
     }
     let recipient = wechat.resolve_recipient(&to)?;
-    if recipient.is_group && !recipient.search_uses_remark {
-        bail!("group send requires a unique remark to avoid selecting the wrong chat");
-    }
 
     let client_msg_id = Uuid::new_v4().simple().to_string();
     let before_send = wechat.room_message_positions(&recipient.username)?;
-    let b64_to = STANDARD.encode(recipient.display.as_bytes());
+    let b64_to = STANDARD.encode(recipient.search_term.as_bytes());
     let b64_text = STANDARD.encode(text.as_bytes());
-    let mut script = ui_script_prelude();
-    script.extend([
-        open_chat_script(&b64_to),
-        format!("set_clip {}", shell_quote_single(&b64_text)),
-        "paste_clip".to_string(),
-        "sleep 0.2".to_string(),
-        "xdotool key --clearmodifiers Return".to_string(),
-        "sleep 0.5".to_string(),
-    ]);
-    let script = script.join("; ");
+    let script = send_text_script(&b64_to, &b64_text);
 
     if env::var("WEBOX_UI_SEND_DRY_RUN").ok().as_deref() == Some("1") {
         return Ok(receipt(client_msg_id));
@@ -76,6 +64,21 @@ fn send_text_blocking(wechat: &WechatState, to: String, text: String) -> Result<
         thread::sleep(Duration::from_millis(500));
     }
     bail!("send verification failed: message was not found in WeChat db")
+}
+
+fn send_text_script(search_b64: &str, text_b64: &str) -> String {
+    let mut script = ui_script_prelude();
+    script.extend([
+        open_chat_script(search_b64),
+        format!("set_clip {}", shell_quote_single(text_b64)),
+        "paste_clip".to_string(),
+        "sleep 0.2".to_string(),
+        "xdotool key --clearmodifiers Return".to_string(),
+        "sleep 0.5".to_string(),
+        "xdotool key --clearmodifiers ctrl+2".to_string(),
+        "sleep 0.2".to_string(),
+    ]);
+    script.join("; ")
 }
 
 fn ui_script_prelude() -> Vec<String> {
@@ -171,5 +174,14 @@ mod tests {
         assert!(!script.contains("getwindowgeometry"));
         assert!(!script.contains("mousemove"));
         assert!(!script.contains("click"));
+    }
+
+    #[test]
+    fn send_sequence_returns_to_contacts_after_return() {
+        let script = send_text_script("target", "message");
+        let send = script.rfind("key --clearmodifiers Return").unwrap();
+        let neutral = script.rfind("key --clearmodifiers ctrl+2").unwrap();
+
+        assert!(send < neutral);
     }
 }

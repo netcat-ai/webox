@@ -73,6 +73,19 @@ start_display() {
   gosu webox openbox &
   register_critical openbox "$!"
 
+  gosu webox x11vnc \
+    -display "$DISPLAY" \
+    -forever \
+    -shared \
+    -nopw \
+    -noshm \
+    -listen 127.0.0.1 \
+    -rfbport 5900 &
+  register_critical x11vnc "$!"
+
+  websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 &
+  register_critical novnc "$!"
+
   local xsettings="${WEBOX_STATE_DIR}/xsettingsd.conf"
   cat > "$xsettings" <<'EOF'
 Xft/Antialias 1

@@ -57,9 +57,10 @@ check_runtime_base() {
     fi
     test "$(getent passwd webox | cut -d: -f6)" = "/webox/state/home"
     getcap /webox/weagent/bin/weagent | grep "cap_sys_ptrace=ep" >/dev/null
-    for cmd in Xvfb ffmpeg openbox xdotool xclip gosu tini; do
+    for cmd in Xvfb ffmpeg openbox websockify x11vnc xdotool xclip gosu tini; do
       command -v "$cmd" >/dev/null
     done
+    test -f /usr/share/novnc/vnc.html
     ldconfig -p | grep "libpulse\\.so\\.0" >/dev/null
     ldconfig -p | grep "libpulse-simple\\.so\\.0" >/dev/null
   '
