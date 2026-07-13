@@ -1,12 +1,22 @@
 ARG RUST_BUILDER_IMAGE=rust:1.96-bookworm
 ARG DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim
 
-FROM ${RUST_BUILDER_IMAGE} AS build
+FROM ${RUST_BUILDER_IMAGE} AS chef
+RUN cargo install cargo-chef --version 0.1.77 --locked
 WORKDIR /src
+
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+    cargo chef cook --release --locked --recipe-path recipe.json
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    touch src/main.rs && \
     cargo build --release --locked --bin weagent && \
     mkdir -p /out && cp target/release/weagent /out/weagent
 
