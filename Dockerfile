@@ -62,14 +62,9 @@ RUN set -eux; \
       /usr/share/man/* \
       /usr/share/locale/*
 
-COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY --from=novnc-assets /out/ /usr/share/novnc/
-COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 
-RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
-    setcap cap_sys_ptrace=ep /webox/weagent/bin/weagent
-
-FROM runtime-base AS runtime
+FROM runtime-base AS runtime-wechat
 
 RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
     set -eux; \
@@ -87,6 +82,14 @@ RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
     dpkg-deb -x "$deb" /webox/wechat; \
     dpkg-deb -f "$deb" Version > /webox/wechat/.webox-version; \
     test -x /webox/wechat/opt/wechat/wechat
+
+FROM runtime-wechat AS runtime
+
+COPY --from=build /out/weagent /webox/weagent/bin/weagent
+COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
+
+RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \
+    setcap cap_sys_ptrace=ep /webox/weagent/bin/weagent
 
 VOLUME ["/webox/state"]
 EXPOSE 8080 6080
