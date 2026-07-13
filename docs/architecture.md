@@ -1,24 +1,24 @@
 # 架构
 
-`webox` 的目标不是复刻 WechatOnCloud，也不是内置一个通用消息中台。它只解决一个问题：
+`webox` 只解决一个问题：
 
 > 在单个容器里运行 Linux WeChat，并把这个真实客户端投影成标准 iLink 接口。
 
-## 第一性原理
+## 设计原则
 
 1. 对外契约只有 iLink。
-   第三方 AI agent 不应该知道 WOC、tinybridge、msghub 或 `/agent/*`。
+   客户端不需要了解 WeChat 本地数据库、桌面自动化或容器内部实现。
 
 2. WeChat Linux 客户端是真实终端。
    发消息通过 UI 自动化驱动客户端；收消息从 WeChat 本地 DB 解密读取。
 
 3. `weagent` 不维护独立消息事实库。
-   消息事实源是 WeChat DB；二维码图像事实源是 WeChat 登录窗口；发送任务初版只需要进程内串行执行。
+   消息事实源是 WeChat DB；二维码图像事实源是 WeChat 登录窗口；发送任务在进程内串行执行。
 
-4. 参考项目只提供证据，不决定架构。
-   `woc-agent-rs` 参考 WeChat DB 与 UI 自动化能力；`tinyclaw/msghub` 只参考 iLink 交互形状；`aicat` 不进入核心设计。
+4. 保持微信客户端的安全边界。
+   WeChat 直接连接上游；Webox 不修改客户端、不注入代理，也不从网络流量解析登录或聊天消息。
 
-## 目标态组件
+## 组件
 
 ```mermaid
 flowchart LR
@@ -53,8 +53,8 @@ flowchart LR
 
 ## 非目标
 
-- 不保留 WOC `/agent/init`、`/agent/poll`、`/agent/send` 作为对外 API。
-- 不复制 msghub 的 actor/room/message/task 数据库。
+- 不提供 iLink 之外的自定义消息 API。
+- 不维护独立的用户、会话、消息或任务数据库。
 - 不从 WeChat 网络流量解析登录或聊天消息。
 - 不把本地媒体上传缓存扩展成通用对象存储或消息附件库。
 - 不引入控制面、租户系统、通用消息中台或 AI runner。
@@ -102,7 +102,7 @@ WeChat local DB
 - `msg/notifystart` 和 `msg/notifystop` 接收标准 SDK 生命周期通知，不参与本地 DB 游标。
 - 服务端不维护独立 ack 状态。
 - 未备注目标的提醒发送到当前登录用户会话，使用 `wb-{target_id}` 查询历史去重；待发送目标在进程内合并并重试，不阻塞 getupdates 返回。
-- 如果标准 iLink 明确要求持久上下文状态，再增加最小状态；不能预先引入 msghub-style mailbox。
+- 除 iLink 协议需要的最小状态外，不维护额外的消息队列或确认状态。
 
 ### 发消息
 
@@ -119,7 +119,7 @@ iLink sendmessage
   -> return iLink ret=0
 ```
 
-初版发送策略：
+发送策略：
 
 - 单进程内串行发送，避免多个 UI 操作互相打断。
 - 只使用 `msg.context_token` 中的 room target；不接受显式 `msg.to_user_id` 直发，避免绕开 iLink 上下文。
@@ -129,9 +129,8 @@ iLink sendmessage
 - `image_item`、`voice_item`、`video_item` 和 `file_item` 明确返回 HTTP 501；外部 URL 作为普通文本发送。
 - `msg.client_id` 是发送幂等键；有界内存缓存会拦截 SDK 并发重试，并拒绝同一键对应不同内容，不额外引入应用数据库。
 - 语音和输入状态没有可靠 Linux WeChat UI 动作，明确返回不支持，不伪造协议成功。
-- 联系人和群聊目标必须有备注，否则拒绝发送；文件传输助手和当前登录用户是内部稳定目标。UI 搜索后直接用 Return 选择第一个结果。
+- 联系人和群聊目标必须有备注，否则拒绝发送；文件传输助手和当前登录用户使用稳定的内置目标。UI 搜索后直接用 Return 选择第一个结果。
 - 部署方必须保证备注能让目标会话排在第一个搜索结果，weagent 无法从本地联系人库证明 UI 搜索结果唯一。
-- 仅当需要容器重启后恢复 pending send 时，再增加最小本地 spool。
 
 ### 媒体接收
 
@@ -180,10 +179,3 @@ container starts
 初始化器是唯一允许提取 key 的组件。二维码状态、`getupdates` 和 `sendmessage` 不会隐式触发扫描，避免请求时延和
 多个并发请求重复初始化。ready 状态下每 30 秒低频验证一次 DB key；DB 读取失败会立即清除 ready，初始化器随后重新验证或
 从微信内存提取，避免运行中密钥轮换后永久卡在伪 ready 状态。退出登录后 ready 状态也会自动清除。
-
-## 验证状态
-
-- WeChat 4.1.1.7 ARM64 已完成真实容器二维码、登录、内存 key 提取和 15 个本地 DB key 读取验证。
-- 标准 `/ilink/bot/getupdates` 已用真实消息验证 `context_token` 和文本投影；精确分片游标有单元与数据库查询回归测试。
-- 最新 `corespeed-io/wechatbot` Rust SDK 已对当前候选镜像完成取码和 `wait` 状态轮询验证。
-- 待运行验证：当前候选镜像扫码后的自动初始化、真实收消息，以及依次向“小金鱼”“测试群”发送文本。

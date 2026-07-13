@@ -1,4 +1,5 @@
-// Portions of this module are adapted from jackwener/wx-cli (Apache-2.0).
+// Portions of this module are adapted from jackwener/wx-cli (Apache-2.0) and modified for Webox.
+// See LICENSES/Apache-2.0.txt and THIRD_PARTY_NOTICES.md.
 // The agent keeps this code in-process so message state and HTTP cursors stay owned by webox.
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
