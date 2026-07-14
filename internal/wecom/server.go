@@ -32,7 +32,7 @@ const (
 type Server struct {
 	botID     string
 	botSecret string
-	wechat    *wechat.State
+	messages  messageSource
 	sendQueue chan<- sender.Job
 	logger    *slog.Logger
 
@@ -40,6 +40,11 @@ type Server struct {
 	cursorMu         sync.Mutex
 	pollCursor       string
 	upgrader         websocket.Upgrader
+}
+
+type messageSource interface {
+	IsInitialized() bool
+	PollMessages(string, int) (wechat.PollResult, error)
 }
 
 type wireFrame struct {
@@ -68,9 +73,9 @@ type incomingMessage struct {
 	err  error
 }
 
-func New(botID, botSecret string, state *wechat.State, sendQueue chan<- sender.Job, logger *slog.Logger) *Server {
+func New(botID, botSecret string, messages messageSource, sendQueue chan<- sender.Job, logger *slog.Logger) *Server {
 	return &Server{
-		botID: botID, botSecret: botSecret, wechat: state, sendQueue: sendQueue, logger: logger,
+		botID: botID, botSecret: botSecret, messages: messages, sendQueue: sendQueue, logger: logger,
 		upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
 	}
 }
@@ -268,13 +273,13 @@ func (server *Server) enqueue(target, content string) error {
 }
 
 func (server *Server) pushWechatMessages(connection *websocket.Conn, replies map[string]replyContext) bool {
-	if !server.wechat.IsInitialized() {
+	if !server.messages.IsInitialized() {
 		return true
 	}
 	server.cursorMu.Lock()
 	cursor := server.pollCursor
 	server.cursorMu.Unlock()
-	result, err := server.wechat.PollMessages(cursor, 100)
+	result, err := server.messages.PollMessages(cursor, 100)
 	if err != nil {
 		server.logger.Warn("could not poll WeChat messages", "error", err)
 		return true

@@ -4,9 +4,16 @@
 
 Webox 从微信本地数据库读取消息，通过 UI 自动化发送文本；不修改微信客户端，也不代理微信网络流量。
 
-## 快速开始
+## 前置要求
 
-要求 Docker 支持运行 Linux `amd64` 或 `arm64` 容器。
+- Docker 支持运行 Linux `amd64` 或 `arm64` 容器。
+- 已安装并初始化 OpenClaw，版本不低于 `2026.3.28`。
+- 准备一个专门登录 Webox 的微信账号，以及另一个用于收发测试消息的微信账号。
+- 在 Webox 登录的微信中，给测试联系人和测试群聊分别设置唯一备注。Webox 需要用备注在微信界面中定位回复目标。
+
+不要使用承担支付、工作或重要社交关系的主微信账号做首次验证。
+
+## 1. 启动 Webox
 
 ```bash
 docker run -d \
@@ -28,7 +35,19 @@ http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale
 
 桌面端口默认只监听本机且没有额外密码。远程访问请使用 SSH 隧道，不要直接暴露到公网。
 
-## 接入 OpenClaw
+扫码并在手机确认后，等待微信数据库初始化完成：
+
+```bash
+until curl -fsS http://127.0.0.1:38080/healthz | grep -q '"ready":true'; do
+  echo "waiting for WeChat login and initialization..."
+  sleep 2
+done
+echo "Webox is ready"
+```
+
+如果容器复用了登录状态，微信可能只要求在手机确认登录；需要重新扫码时，打开上面的桌面地址并在微信登录窗口切换账号。
+
+## 2. 接入 OpenClaw
 
 安装企业微信官方插件：
 
@@ -40,16 +59,57 @@ openclaw plugins install @wecom/wecom-openclaw-plugin
 
 ```bash
 openclaw config set channels.wecom.enabled true
+openclaw config set channels.wecom.connectionMode websocket
 openclaw config set channels.wecom.botId webox
 openclaw config set channels.wecom.secret change-this-secret
 openclaw config set channels.wecom.websocketUrl ws://127.0.0.1:38080/wecom
 openclaw config set channels.wecom.sendThinkingMessage false
+openclaw config set channels.wecom.dmPolicy open
+openclaw config set channels.wecom.allowFrom '["*"]' --strict-json
+openclaw config set channels.wecom.groupPolicy open
 openclaw gateway restart
 ```
 
 `botId` 和 `secret` 必须与 Webox 的 `WEBOX_BOT_ID`、`WEBOX_BOT_SECRET` 一致。
 
 Webox 接受企业微信的流式回复帧，但不会向微信逐段发送：`finish=false` 只更新内存缓存，`finish=true` 才发送一条完整消息。
+
+确认插件已连接并通过鉴权：
+
+```bash
+docker logs webox 2>&1 | grep 'wecom websocket connected'
+openclaw logs --plain --limit 200 | grep 'Authentication successful'
+```
+
+两条命令都应有输出。第一条证明 OpenClaw 已连接 Webox，第二条证明 Bot ID 和密钥正确。
+
+## 3. 验证私聊
+
+1. 在 Webox 登录的微信中，给测试联系人设置唯一备注，例如 `Webox私聊测试`。
+2. 使用另一个微信账号，向 Webox 账号私聊发送：`只回复 WEBOX_DM_OK`。
+3. 确认该私聊收到 OpenClaw 回复。
+4. 确认 Webox 完成了微信端发送验证：
+
+```bash
+docker logs --since 5m webox 2>&1 | grep 'WeChat text sent'
+```
+
+## 4. 验证群聊
+
+1. 建立一个同时包含 Webox 账号和测试账号的群聊。
+2. 在 Webox 登录的微信中给该群设置唯一备注，例如 `Webox群聊测试`。
+3. 使用测试账号在群内发送：`只回复 WEBOX_GROUP_OK`。
+4. 确认回复出现在同一个群聊，并再次检查 `WeChat text sent` 日志。
+
+私聊和群聊均收到回复，且两次发送都有 `WeChat text sent`，才算完成端到端验证。`scripts/preflight-container.sh` 只检查镜像依赖，不能代替消息验收。
+
+## 故障排查
+
+- `/healthz` 中 `ready=false`：尚未扫码、手机未确认，或微信数据库仍在初始化；打开 `6080` 桌面查看微信状态。
+- OpenClaw 没有 `Authentication successful`：核对两端 Bot ID、密钥和 `websocketUrl`，然后重启 gateway。
+- 能收到消息但微信没有回复：确认联系人或群聊设置了非空且唯一的备注，检查 `docker logs webox` 中的发送错误。
+- 只收到私聊或只收到群聊：检查 `dmPolicy`、`allowFrom` 和 `groupPolicy` 是否与上面的配置一致。
+- 曾安装旧的 `@netcat-ai/openclaw-weixin`：不要把它指向 Webox 的 `38080` 端口；Webox 当前对接的是 `@wecom/wecom-openclaw-plugin` WebSocket 协议。
 
 ## 多微信账号
 
@@ -82,7 +142,7 @@ docker pull ghcr.io/netcat-ai/webox:main
 docker rm -f webox
 ```
 
-然后重新执行“快速开始”中的 `docker run`。微信可能在容器重启后要求手机再次确认登录。
+然后重新执行“启动 Webox”中的 `docker run`。微信可能在容器重启后要求手机再次确认登录。
 
 ## 从源码构建
 
