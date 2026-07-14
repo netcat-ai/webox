@@ -2,8 +2,8 @@
 
 `webox` 构建依赖两个 Docker Hub base image：
 
-- `rust:1.96-bookworm`
-- `debian:bookworm`
+- `golang:1.26-bookworm`
+- `debian:bookworm-slim`
 
 默认 Dockerfile 和 Compose 配置使用官方 Docker Hub 和 Debian apt 源，依赖 Docker daemon 的全局代理。
 
@@ -12,8 +12,8 @@
 当前默认 `.env.example`：
 
 ```dotenv
-RUST_BUILDER_IMAGE=rust:1.96-bookworm
-DEBIAN_RUNTIME_IMAGE=debian:bookworm
+GO_BUILDER_IMAGE=golang:1.26-bookworm
+DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim
 ```
 
 默认不覆盖 Debian apt 源：
@@ -26,8 +26,8 @@ APT_DEBIAN_SECURITY_MIRROR=
 如果仅 Debian apt 较慢，可以使用阿里云 apt 镜像，同时继续从官方 Docker Registry 拉取基础镜像：
 
 ```dotenv
-RUST_BUILDER_IMAGE=rust:1.96-bookworm
-DEBIAN_RUNTIME_IMAGE=debian:bookworm
+GO_BUILDER_IMAGE=golang:1.26-bookworm
+DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim
 APT_DEBIAN_MIRROR=http://mirrors.aliyun.com/debian
 APT_DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ```
@@ -35,7 +35,7 @@ APT_DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 项目不通过第三方 registry 反向代理重写基础镜像地址。先验证官方镜像是否可用：
 
 ```bash
-docker buildx imagetools inspect "$RUST_BUILDER_IMAGE"
+docker buildx imagetools inspect "$GO_BUILDER_IMAGE"
 docker buildx imagetools inspect "$DEBIAN_RUNTIME_IMAGE"
 ```
 

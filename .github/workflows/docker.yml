@@ -24,8 +24,29 @@ env:
   WECHAT_DOWNLOAD_BASE: https://dldir1v6.qq.com/weixin/Universal/Linux
 
 jobs:
+  test:
+    name: Test Go agent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: test
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:

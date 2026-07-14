@@ -3,6 +3,8 @@ services:
     image: ${WEBOX_IMAGE:-ghcr.io/netcat-ai/webox:main}
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - WEBOX_BOT_ID=${WEBOX_BOT_ID:-webox}
+      - WEBOX_BOT_SECRET=${WEBOX_BOT_SECRET:-webox-local-token}
     volumes:
       - ${WEBOX_STATE_DIR:-./data/state}:/webox/state
     ports:
