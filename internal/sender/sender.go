@@ -54,7 +54,6 @@ func (service *Service) SendText(ctx context.Context, target, text string) (Rece
 	script := sendTextScript(
 		base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm)),
 		base64.StdEncoding.EncodeToString([]byte(text)),
-		recipient.Username == "filehelper",
 	)
 	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
 		return receipt, nil
@@ -79,10 +78,10 @@ func (service *Service) SendText(ctx context.Context, target, text string) (Rece
 	return Receipt{}, errors.New("send verification failed: message was not found in WeChat db")
 }
 
-func sendTextScript(searchBase64, textBase64 string, fileHelper bool) string {
+func sendTextScript(searchBase64, textBase64 string) string {
 	script := uiScriptPrelude()
 	script = append(script,
-		openChatScript(searchBase64, fileHelper),
+		openChatScript(searchBase64),
 		"set_clip "+shellQuoteSingle(textBase64),
 		"paste_clip",
 		"sleep 0.2",
@@ -117,20 +116,16 @@ func uiScriptPrelude() []string {
 	}
 }
 
-func openChatScript(queryBase64 string, fileHelper bool) string {
-	selectResult := `xdotool key --clearmodifiers Return; sleep 1.5`
-	if fileHelper {
-		selectResult = `xdotool mousemove --window "$win" 155 325; ` +
-			`xdotool click --repeat 2 --delay 120 1; sleep 1.5`
-	}
+func openChatScript(queryBase64 string) string {
 	return fmt.Sprintf(
 		`main_win="$(xdotool search --onlyvisible --class 'wechat' 2>/dev/null | tail -n1 || true)"; `+
 			`if [ -n "$main_win" ]; then win="$main_win"; xdotool windowactivate "$win"; xdotool windowraise "$win" 2>/dev/null || true; sleep 0.2; fi; `+
 			`xdotool key --clearmodifiers Escape; sleep 0.1; `+
 			`xdotool key --clearmodifiers ctrl+f; sleep 0.3; `+
 			`xdotool key --clearmodifiers ctrl+a BackSpace; sleep 0.2; `+
-			`set_clip %s; paste_clip; sleep 1.8; %s`,
-		shellQuoteSingle(queryBase64), selectResult,
+			`set_clip %s; paste_clip; sleep 1.8; `+
+			`xdotool key --clearmodifiers Return; sleep 1.5`,
+		shellQuoteSingle(queryBase64),
 	)
 }
 
