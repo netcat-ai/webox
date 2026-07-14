@@ -1,6 +1,7 @@
 data/
 bin/
 target/
+coverage.out
 *.log
 .DS_Store
 .env

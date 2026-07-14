@@ -4,7 +4,7 @@ services:
     build:
       context: .
       args:
-        RUST_BUILDER_IMAGE: ${RUST_BUILDER_IMAGE:-rust:1.96-bookworm}
+        GO_BUILDER_IMAGE: ${GO_BUILDER_IMAGE:-golang:1.26-bookworm}
         DEBIAN_RUNTIME_IMAGE: ${DEBIAN_RUNTIME_IMAGE:-debian:bookworm-slim}
         APT_DEBIAN_MIRROR: ${APT_DEBIAN_MIRROR:-}
         APT_DEBIAN_SECURITY_MIRROR: ${APT_DEBIAN_SECURITY_MIRROR:-}
