@@ -223,6 +223,27 @@ impl WechatState {
         Ok(true)
     }
 
+    pub fn dismiss_post_login_overlay(&self) -> Result<bool> {
+        let Some(window) = wechat_main_window() else {
+            return Ok(false);
+        };
+        let status = Command::new("xdotool")
+            .args([
+                "windowactivate",
+                "--sync",
+                &window,
+                "key",
+                "--clearmodifiers",
+                "Escape",
+            ])
+            .status()
+            .context("run xdotool for post-login overlay")?;
+        if !status.success() {
+            bail!("xdotool could not dismiss post-login overlay");
+        }
+        Ok(true)
+    }
+
     pub fn refresh_login_qrcode(&self) -> Result<bool> {
         let Some(window) = wechat_login_window() else {
             return Ok(false);
@@ -497,30 +518,19 @@ fn validation_due(last_validation_at: u64, current_time: u64) -> bool {
 }
 
 fn wechat_main_window_ready() -> Option<bool> {
-    if std::env::var("DISPLAY").ok()?.trim().is_empty() {
-        return None;
-    }
-    let output = Command::new("xdotool")
-        .args([
-            "search",
-            "--onlyvisible",
-            "--class",
-            "wechat",
-            "getwindowgeometry",
-            "--shell",
-            "%@",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return Some(false);
-    }
-    Some(window_geometry_has_main_window(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    let geometry = visible_wechat_window_geometry()?;
+    Some(window_geometry_has_main_window(&geometry))
+}
+
+fn wechat_main_window() -> Option<String> {
+    main_window_from_geometry(&visible_wechat_window_geometry()?)
 }
 
 fn wechat_login_window() -> Option<String> {
+    login_window_from_geometry(&visible_wechat_window_geometry()?)
+}
+
+fn visible_wechat_window_geometry() -> Option<String> {
     if std::env::var("DISPLAY").ok()?.trim().is_empty() {
         return None;
     }
@@ -537,9 +547,9 @@ fn wechat_login_window() -> Option<String> {
         .output()
         .ok()?;
     if !output.status.success() {
-        return None;
+        return Some(String::new());
     }
-    login_window_from_geometry(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn login_window_from_geometry(output: &str) -> Option<String> {
@@ -563,20 +573,28 @@ fn login_window_from_geometry(output: &str) -> Option<String> {
 }
 
 fn window_geometry_has_main_window(output: &str) -> bool {
+    main_window_from_geometry(output).is_some()
+}
+
+fn main_window_from_geometry(output: &str) -> Option<String> {
+    let mut window = None;
     let mut width = None;
     for line in output.lines() {
-        if let Some(value) = line.strip_prefix("WIDTH=") {
+        if let Some(value) = line.strip_prefix("WINDOW=") {
+            window = Some(value.to_string());
+            width = None;
+        } else if let Some(value) = line.strip_prefix("WIDTH=") {
             width = value.parse::<u32>().ok();
         } else if let Some(value) = line.strip_prefix("HEIGHT=") {
             let height = value.parse::<u32>().ok();
             if width.is_some_and(|width| width >= 700) && height.is_some_and(|height| height >= 500)
             {
-                return true;
+                return window;
             }
             width = None;
         }
     }
-    false
+    None
 }
 
 fn non_empty_cursor(value: &str) -> Option<&str> {
@@ -709,9 +727,9 @@ mod tests {
         assert!(!window_geometry_has_main_window(
             "WINDOW=1\nWIDTH=280\nHEIGHT=380\n"
         ));
-        assert!(window_geometry_has_main_window(
-            "WINDOW=1\nWIDTH=280\nHEIGHT=380\nWINDOW=2\nWIDTH=980\nHEIGHT=710\n"
-        ));
+        let geometry = "WINDOW=1\nWIDTH=280\nHEIGHT=380\nWINDOW=2\nWIDTH=980\nHEIGHT=710\n";
+        assert!(window_geometry_has_main_window(geometry));
+        assert_eq!(main_window_from_geometry(geometry).as_deref(), Some("2"));
     }
 
     #[test]

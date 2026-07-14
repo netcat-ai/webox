@@ -21,6 +21,27 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
+#[derive(Default)]
+struct PostLoginUiState {
+    dismissed: bool,
+}
+
+impl PostLoginUiState {
+    fn should_dismiss(&mut self, state: InitializationState) -> bool {
+        match state {
+            InitializationState::WaitingForLogin => {
+                self.dismissed = false;
+                false
+            }
+            InitializationState::Ready => !self.dismissed,
+        }
+    }
+
+    fn mark_dismissed(&mut self) {
+        self.dismissed = true;
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -75,11 +96,33 @@ fn spawn_wechat_initializer(
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let mut ready_logged = false;
         let mut no_qr_checks = 0_u8;
+        let mut post_login_ui = PostLoginUiState::default();
         loop {
             let state = wechat.clone();
             let init = tokio::task::spawn_blocking(move || state.initialize_if_ready()).await;
             match init {
                 Ok(Ok(InitializationState::Ready)) => {
+                    if post_login_ui.should_dismiss(InitializationState::Ready) {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        let state = wechat.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            state.dismiss_post_login_overlay()
+                        })
+                        .await
+                        {
+                            Ok(Ok(true)) => {
+                                post_login_ui.mark_dismissed();
+                                tracing::info!("dismissed post-login WeChat overlay");
+                            }
+                            Ok(Ok(false)) => {}
+                            Ok(Err(err)) => {
+                                tracing::warn!(error = %err, "could not dismiss post-login WeChat overlay")
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "post-login overlay task failed")
+                            }
+                        }
+                    }
                     if !ready_logged {
                         tracing::info!("wechat automatic initialization is ready");
                         ready_logged = true;
@@ -88,6 +131,7 @@ fn spawn_wechat_initializer(
                 }
                 Ok(Ok(InitializationState::WaitingForLogin)) => {
                     ready_logged = false;
+                    post_login_ui.should_dismiss(InitializationState::WaitingForLogin);
                     let qr_visible = match qr_source.latest().await {
                         Ok(qr) => qr.is_some(),
                         Err(error) => {
@@ -185,6 +229,27 @@ mod tests {
     use serde_json::Value;
     use std::fs;
     use tower::ServiceExt;
+
+    #[test]
+    fn post_login_escape_runs_once_per_login_session() {
+        let mut ui = PostLoginUiState::default();
+
+        assert!(!ui.should_dismiss(InitializationState::WaitingForLogin));
+        assert!(ui.should_dismiss(InitializationState::Ready));
+        ui.mark_dismissed();
+        assert!(!ui.should_dismiss(InitializationState::Ready));
+
+        assert!(!ui.should_dismiss(InitializationState::WaitingForLogin));
+        assert!(ui.should_dismiss(InitializationState::Ready));
+    }
+
+    #[test]
+    fn post_login_escape_retries_until_it_succeeds() {
+        let mut ui = PostLoginUiState::default();
+
+        assert!(ui.should_dismiss(InitializationState::Ready));
+        assert!(ui.should_dismiss(InitializationState::Ready));
+    }
 
     #[tokio::test]
     async fn health_does_not_expose_internal_cursor() {
