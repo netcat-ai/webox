@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -14,13 +13,11 @@ import (
 	"time"
 
 	"github.com/netcat-ai/webox/internal/config"
+	"github.com/netcat-ai/webox/internal/ilink"
 	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/wechat"
-	"github.com/netcat-ai/webox/internal/wecom"
 )
-
-const sendQueueCapacity = 64
 
 type postLoginUIState struct {
 	dismissed bool
@@ -56,22 +53,24 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sendQueue := make(chan sender.Job, sendQueueCapacity)
+	qr := qrsource.New(configuration.QRScreenshotPath)
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		runInitializer(ctx, wechatState, qrsource.New(configuration.QRScreenshotPath), logger)
-	}()
-	go func() {
-		defer workers.Done()
-		runSender(ctx, sender.New(wechatState), sendQueue, logger)
+		runInitializer(ctx, wechatState, qr, logger)
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthHandler(wechatState))
-	mux.Handle("GET /wecom", wecom.New(configuration.BotID, configuration.BotSecret, wechatState, sendQueue, logger))
-	server := &http.Server{Handler: requestLogger(mux, logger), ReadHeaderTimeout: 5 * time.Second}
+	protocol := ilink.New(
+		configuration.APIToken,
+		configuration.ProviderAccountID,
+		configuration.PublicBaseURL,
+		wechatState,
+		sender.New(wechatState),
+		qr,
+		logger,
+	)
+	server := &http.Server{Handler: requestLogger(protocol.Handler(), logger), ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", configuration.ListenAddr)
 	if err != nil {
 		stop()
@@ -158,29 +157,6 @@ func runInitializer(ctx context.Context, state *wechat.State, source qrsource.So
 		if !wait(ctx, time.Second) {
 			return
 		}
-	}
-}
-
-func runSender(ctx context.Context, service *sender.Service, queue <-chan sender.Job, logger *slog.Logger) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case job := <-queue:
-			receipt, err := service.SendText(ctx, job.Target, job.Content)
-			if err != nil {
-				logger.Error("could not send WeChat text", "target", job.Target, "error", err)
-				continue
-			}
-			logger.Info("WeChat text sent", "target", job.Target, "client_msg_id", receipt.ClientMessageID)
-		}
-	}
-}
-
-func healthHandler(state *wechat.State) http.HandlerFunc {
-	return func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(response).Encode(map[string]any{"ok": true, "ready": state.IsInitialized()})
 	}
 }
 

@@ -10,12 +10,13 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	BotID            string
-	BotSecret        string
-	CursorKey        string
-	QRScreenshotPath string
-	StateDir         string
+	ListenAddr        string
+	APIToken          string
+	ProviderAccountID string
+	PublicBaseURL     string
+	CursorKey         string
+	QRScreenshotPath  string
+	StateDir          string
 }
 
 func Load() (Config, error) {
@@ -24,13 +25,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	apiToken, err := loadOrCreateID(stateDir, "api-token", "")
+	if err != nil {
+		return Config{}, err
+	}
+	providerAccountID, err := loadOrCreateID(stateDir, "provider-account-id", "webox-")
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		ListenAddr:       normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
-		BotID:            envOr("WEBOX_BOT_ID", "webox"),
-		BotSecret:        envOr("WEBOX_BOT_SECRET", "webox-local-token"),
-		CursorKey:        cursorKey,
-		QRScreenshotPath: strings.TrimSpace(envOr("WEBOX_QR_SCREENSHOT_PATH", "/webox/runtime/xvfb/Xvfb_screen0")),
-		StateDir:         stateDir,
+		ListenAddr:        normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
+		APIToken:          apiToken,
+		ProviderAccountID: providerAccountID,
+		PublicBaseURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("WEBOX_PUBLIC_BASE_URL")), "/"),
+		CursorKey:         cursorKey,
+		QRScreenshotPath:  strings.TrimSpace(envOr("WEBOX_QR_SCREENSHOT_PATH", "/webox/runtime/xvfb/Xvfb_screen0")),
+		StateDir:          stateDir,
 	}, nil
 }
 

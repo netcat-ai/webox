@@ -27,6 +27,12 @@ func TestCursorRoundTripAndRejectLegacyFields(t *testing.T) {
 	if decoded.Positions["room"]["message/message_0.db"].LocalID != 42 {
 		t.Fatalf("unexpected cursor: %#v", decoded)
 	}
+	if err := state.ValidatePollCursor(encoded); err != nil {
+		t.Fatalf("valid cursor rejected: %v", err)
+	}
+	if err := state.ValidatePollCursor(encoded + "x"); err == nil {
+		t.Fatal("tampered cursor accepted")
+	}
 	legacy, err := signedpayload.Encode(state.cursorKey, map[string]any{
 		"v": 3, "source": "db", "started_at": 100, "positions": map[string]any{},
 	})
@@ -35,6 +41,9 @@ func TestCursorRoundTripAndRejectLegacyFields(t *testing.T) {
 	}
 	if err := signedpayload.Decode(state.cursorKey, legacy, &decoded); err == nil {
 		t.Fatal("legacy cursor accepted")
+	}
+	if err := state.ValidatePollCursor(legacy); err == nil {
+		t.Fatal("legacy cursor validation succeeded")
 	}
 }
 

@@ -36,7 +36,6 @@ type State struct {
 	cursorKey string
 
 	initialized      atomic.Bool
-	hadReadySession  atomic.Bool
 	lastValidationAt atomic.Int64
 	dbMu             sync.Mutex
 	errorMu          sync.Mutex
@@ -73,6 +72,20 @@ func (state *State) EnsureStateDir() error {
 
 func (state *State) IsInitialized() bool {
 	return state.initialized.Load()
+}
+
+func (state *State) ValidatePollCursor(rawCursor string) error {
+	if strings.TrimSpace(rawCursor) == "" {
+		return nil
+	}
+	var cursor dbCursor
+	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
+		return fmt.Errorf("decode get_updates_buf: %w", err)
+	}
+	if cursor.StartedAt <= 0 {
+		return errors.New("unsupported get_updates_buf")
+	}
+	return nil
 }
 
 func (state *State) InitializeIfReady() (InitializationState, error) {
@@ -117,7 +130,6 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 		}
 	}
 	state.initialized.Store(true)
-	state.hadReadySession.Store(true)
 	state.lastValidationAt.Store(time.Now().Unix())
 	state.setError("")
 	return Ready, nil
@@ -135,6 +147,17 @@ func (state *State) ClickSavedAccountLogin() (bool, error) {
 	}
 	if output, err := exec.Command("xdotool", "mousemove", "--window", window, "140", "290", "click", "1").CombinedOutput(); err != nil {
 		return false, fmt.Errorf("click saved-account login button: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return true, nil
+}
+
+func (state *State) RefreshLoginQRCode() (bool, error) {
+	window := wechatLoginWindow()
+	if window == "" {
+		return false, nil
+	}
+	if output, err := exec.Command("xdotool", "mousemove", "--window", window, "140", "130", "click", "1").CombinedOutput(); err != nil {
+		return false, fmt.Errorf("click expired QR refresh area: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return true, nil
 }

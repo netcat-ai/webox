@@ -25,11 +25,6 @@ type Receipt struct {
 	ClientMessageID string
 }
 
-type Job struct {
-	Target  string
-	Content string
-}
-
 func New(state *wechat.State) *Service {
 	return &Service{wechat: state}
 }
