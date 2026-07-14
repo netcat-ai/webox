@@ -31,10 +31,12 @@ openclaw config set plugins.entries.openclaw-weixin.enabled true
 
 ```bash
 openclaw config set channels.openclaw-weixin.baseUrl http://127.0.0.1:38080
-openclaw channels login --channel openclaw-weixin
+openclaw channels login --channel openclaw-weixin --account webox
 ```
 
 用微信扫描终端中的二维码并在手机上确认。登录后 Webox 会自动完成初始化，无需调用额外接口。Gateway、配对和渠道配置见 [OpenClaw 微信插件文档](https://github.com/Tencent/openclaw-weixin/blob/main/README.zh_CN.md)。
+
+`--account webox` 用于创建新的登录入口，避免 OpenClaw 复用已有官方账号及其服务地址。每个 Webox 实例应使用不同的账号名。
 
 > 必须由 OpenClaw 发起本次扫码登录，否则 OpenClaw 无法保存 Webox 签发的 token。
 
@@ -66,7 +68,7 @@ docker run -d \
 
 ```bash
 openclaw config set channels.openclaw-weixin.baseUrl http://127.0.0.1:38081
-openclaw channels login --channel openclaw-weixin
+openclaw channels login --channel openclaw-weixin --account webox-a
 ```
 
 不要让多个容器共享状态目录。多账号使用 OpenClaw 时建议隔离私聊会话：
