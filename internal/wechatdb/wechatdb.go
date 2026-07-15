@@ -157,6 +157,9 @@ func InitFromMemory() (InitData, error) {
 	for _, entry := range entries {
 		keys[entry.dbName] = entry.key
 	}
+	if err := ValidateMessageDBKeys(dbDir, keys); err != nil {
+		return InitData{}, err
+	}
 	wxid := AccountIDFromDBDir(dbDir)
 	if wxid == "" {
 		return InitData{}, errors.New("无法从微信数据库目录识别当前账号")
@@ -633,7 +636,36 @@ func loadSessionState(cache *dbCache) (map[string]int64, error) {
 	return sessions, rows.Err()
 }
 
-func messageDBKeys(cache *dbCache) []string {
+func ValidateMessageDBKeys(dbDir string, keys map[string]string) error {
+	messageDir := filepath.Join(dbDir, "message")
+	entries, err := os.ReadDir(messageDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read WeChat message database directory: %w", err)
+	}
+	var missing []string
+	for _, entry := range entries {
+		if entry.IsDir() || !isMessageShard(entry.Name()) {
+			continue
+		}
+		relative := filepath.ToSlash(filepath.Join("message", entry.Name()))
+		if strings.TrimSpace(keys[relative]) == "" {
+			missing = append(missing, relative)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("missing WeChat message database key: %s", strings.Join(missing, ", "))
+}
+
+func messageDBKeys(cache *dbCache) ([]string, error) {
+	if err := ValidateMessageDBKeys(cache.dbDir, cache.keys); err != nil {
+		return nil, err
+	}
 	var keys []string
 	for key := range cache.keys {
 		if strings.HasPrefix(key, "message/") && isMessageShard(filepath.Base(key)) {
@@ -641,13 +673,17 @@ func messageDBKeys(cache *dbCache) []string {
 		}
 	}
 	sort.Strings(keys)
-	return keys
+	return keys, nil
 }
 
 func findMessageShards(cache *dbCache, username string) ([]messageShard, error) {
 	table := fmt.Sprintf("Msg_%x", md5.Sum([]byte(username)))
 	var shards []messageShard
-	for _, relative := range messageDBKeys(cache) {
+	keys, err := messageDBKeys(cache)
+	if err != nil {
+		return nil, err
+	}
+	for _, relative := range keys {
 		path, found, err := cache.get(relative)
 		if err != nil {
 			return nil, err

@@ -289,6 +289,9 @@ func (state *State) readKey() (keyFile, error) {
 	if strings.TrimSpace(material.WXID) == "" || strings.TrimSpace(material.DBDir) == "" || len(material.Keys) == 0 {
 		return keyFile{}, errors.New("wechat key file has no database keys")
 	}
+	if err := wechatdb.ValidateMessageDBKeys(material.DBDir, material.Keys); err != nil {
+		return keyFile{}, err
+	}
 	return material, nil
 }
 

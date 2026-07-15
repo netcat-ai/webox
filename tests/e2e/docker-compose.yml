@@ -1,0 +1,36 @@
+services:
+  webox-sut:
+    image: ${WEBOX_E2E_IMAGE:-webox:local}
+    container_name: ${WEBOX_E2E_SUT_CONTAINER:-webox-sut}
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - sut-state:/webox/state
+    ports:
+      - "${WEBOX_E2E_SUT_HTTP_HOST:-127.0.0.1}:${WEBOX_E2E_SUT_HTTP_PORT:-38080}:8080"
+      - "${WEBOX_E2E_SUT_DESKTOP_HOST:-127.0.0.1}:${WEBOX_E2E_SUT_DESKTOP_PORT:-6080}:6080"
+    shm_size: "1gb"
+    cap_add:
+      - SYS_PTRACE
+    restart: unless-stopped
+
+  webox-peer:
+    image: ${WEBOX_E2E_IMAGE:-webox:local}
+    container_name: ${WEBOX_E2E_PEER_CONTAINER:-webox-peer}
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - peer-state:/webox/state
+    ports:
+      - "${WEBOX_E2E_PEER_HTTP_HOST:-127.0.0.1}:${WEBOX_E2E_PEER_HTTP_PORT:-38081}:8080"
+      - "${WEBOX_E2E_PEER_DESKTOP_HOST:-127.0.0.1}:${WEBOX_E2E_PEER_DESKTOP_PORT:-6081}:6080"
+    shm_size: "1gb"
+    cap_add:
+      - SYS_PTRACE
+    restart: unless-stopped
+
+volumes:
+  sut-state:
+    name: ${WEBOX_E2E_SUT_VOLUME:-webox-e2e-sut-state}
+  peer-state:
+    name: ${WEBOX_E2E_PEER_VOLUME:-webox-e2e-peer-state}

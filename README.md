@@ -88,6 +88,17 @@ docker logs --since 5m webox 2>&1 | grep 'WeChat text sent'
 
 私聊和群聊都收到唯一回复，且两次发送均有成功日志，才算完成端到端验证。`scripts/preflight-container.sh` 只检查镜像依赖，不能代替真实消息验收。
 
+### 自动化真实 E2E
+
+`tests/e2e` 提供双微信账号的自动私聊闭环。首次为两个专用测试账号扫码并设置唯一备注后，runner 会自动完成 Peer UI 发消息、SUT iLink 收取与回复、Peer iLink 最终验收，并在失败时收集容器日志和微信桌面截图：
+
+```bash
+docker compose -f tests/e2e/docker-compose.yml up -d
+go run ./tests/e2e --peer-target Webox被测账号
+```
+
+完整的一次性准备和状态清理说明见 [`tests/e2e/README.md`](tests/e2e/README.md)。
+
 ## iLink 接口
 
 Go agent 提供以下路由：
