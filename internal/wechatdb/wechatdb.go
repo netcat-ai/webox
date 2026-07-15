@@ -936,11 +936,7 @@ func applyWAL(walPath, outPath string, key []byte) error {
 			continue
 		}
 		page := data[position+walFrameHeader : position+frameSize]
-		decryptNumber := pageNumber
-		if pageNumber == 1 {
-			decryptNumber = 2
-		}
-		decrypted, err := decryptPage(key, page, decryptNumber)
+		decrypted, err := decryptPage(key, page, pageNumber)
 		if err != nil {
 			return err
 		}
