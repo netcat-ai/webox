@@ -271,6 +271,38 @@ func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, curre
 	return &Recipient{Username: storedUsername, SearchTerm: searchTerm}, nil
 }
 
+func conversationRemarkFromDB(path, username string) (string, error) {
+	db, err := openSQLite(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+	var remark sql.NullString
+	err = db.QueryRow(
+		"SELECT remark FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
+		strings.TrimSpace(username),
+	).Scan(&remark)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(remark.String), nil
+}
+
+func ConversationRemark(dbDir string, keys map[string]string, cacheDir, username string) (string, error) {
+	cache, err := newDBCache(dbDir, cacheDir, keys)
+	if err != nil {
+		return "", err
+	}
+	path, found, err := cache.get("contact/contact.db")
+	if err != nil || !found {
+		return "", err
+	}
+	return conversationRemarkFromDB(path, username)
+}
+
 func RoomMessagePositionsFor(dbDir string, keys map[string]string, cacheDir, roomID string) (RoomMessagePositions, error) {
 	cache, err := newDBCache(dbDir, cacheDir, keys)
 	if err != nil {

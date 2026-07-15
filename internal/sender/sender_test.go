@@ -11,13 +11,15 @@ func TestShellQuoteSingle(t *testing.T) {
 	}
 }
 
-func TestOpenChatUsesFirstSearchResult(t *testing.T) {
+func TestOpenChatUsesFirstSearchResultAndFocusesComposer(t *testing.T) {
 	script := openChatScript("query")
 	if !strings.Contains(script, "set_clip 'query'; paste_clip; sleep 1.8") ||
-		!strings.Contains(script, "key --clearmodifiers Return; sleep 1.5") {
+		!strings.Contains(script, "key --clearmodifiers Return; sleep 1.5") ||
+		!strings.Contains(script, `xdotool getwindowgeometry --shell "$win"`) ||
+		!strings.Contains(script, `xdotool mousemove --window "$win" "$composer_x" "$composer_y" click 1`) {
 		t.Fatalf("unexpected script: %s", script)
 	}
-	for _, forbidden := range []string{"Down", "mousemove", "click"} {
+	for _, forbidden := range []string{"Down"} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("script contains %q", forbidden)
 		}

@@ -21,6 +21,7 @@ import (
 const (
 	maxPollLimit        = 500
 	keyValidationPeriod = 30 * time.Second
+	agentRemarkPrefix   = "wb-"
 )
 
 type InitializationState int
@@ -31,9 +32,10 @@ const (
 )
 
 type State struct {
-	stateDir  string
-	keyFile   string
-	cursorKey string
+	stateDir            string
+	keyFile             string
+	cursorKey           string
+	remarkFilterEnabled bool
 
 	initialized      atomic.Bool
 	lastValidationAt atomic.Int64
@@ -58,12 +60,51 @@ type PollResult struct {
 	Messages []map[string]any
 }
 
-func New(stateDir, cursorKey string) *State {
-	return &State{
-		stateDir:  stateDir,
-		keyFile:   filepath.Join(stateDir, "wechat.key"),
-		cursorKey: cursorKey,
+func filterMessagesByRemarkPrefix(
+	messages []map[string]any,
+	lookup func(string) (string, error),
+) ([]map[string]any, error) {
+	filtered := make([]map[string]any, 0, len(messages))
+	remarks := make(map[string]string)
+	for _, message := range messages {
+		roomID, ok := message["roomid"].(string)
+		roomID = strings.TrimSpace(roomID)
+		if !ok || roomID == "" {
+			continue
+		}
+		remark, found := remarks[roomID]
+		if !found {
+			var err error
+			remark, err = lookup(roomID)
+			if err != nil {
+				return nil, err
+			}
+			remarks[roomID] = remark
+		}
+		if strings.HasPrefix(strings.TrimSpace(remark), agentRemarkPrefix) {
+			filtered = append(filtered, message)
+		}
 	}
+	return filtered, nil
+}
+
+func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
+	return &State{
+		stateDir:            stateDir,
+		keyFile:             filepath.Join(stateDir, "wechat.key"),
+		cursorKey:           cursorKey,
+		remarkFilterEnabled: remarkFilterEnabled,
+	}
+}
+
+func (state *State) applyRemarkFilter(
+	messages []map[string]any,
+	lookup func(string) (string, error),
+) ([]map[string]any, error) {
+	if !state.remarkFilterEnabled {
+		return messages, nil
+	}
+	return filterMessagesByRemarkPrefix(messages, lookup)
 }
 
 func (state *State) EnsureStateDir() error {
@@ -211,12 +252,18 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 		}
 		return left.room < right.room
 	})
+	messages, err := state.applyRemarkFilter(data.Messages, func(roomID string) (string, error) {
+		return wechatdb.ConversationRemark(material.DBDir, material.Keys, state.cacheDir(), roomID)
+	})
+	if err != nil {
+		return PollResult{}, state.dbError("filter WeChat messages by conversation remark", err)
+	}
 	cursor.Positions = data.NewState
 	encoded, err := state.encodeCursor(cursor)
 	if err != nil {
 		return PollResult{}, err
 	}
-	return PollResult{Cursor: encoded, Messages: data.Messages}, nil
+	return PollResult{Cursor: encoded, Messages: messages}, nil
 }
 
 func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, error) {

@@ -4,6 +4,7 @@ services:
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - WEBOX_PUBLIC_BASE_URL=${WEBOX_PUBLIC_BASE_URL:-}
+      - WEBOX_REMARK_FILTER_ENABLED=${WEBOX_REMARK_FILTER_ENABLED:-true}
     volumes:
       - ${WEBOX_STATE_DIR:-./data/state}:/webox/state
     ports:

@@ -213,6 +213,9 @@ func TestOpenClawGroupUsesUniqueRemarkAndRequiresAgentReplyInSameChatroom(t *tes
 	if result.GroupID != "e2e-room@chatroom" {
 		t.Fatalf("group_id=%q", result.GroupID)
 	}
+	if !strings.Contains(result.RequestText, "虾虾") {
+		t.Fatalf("group request does not exercise the OpenClaw mention pattern: %q", result.RequestText)
+	}
 	if driver.target != "woc-50261801724" || driver.text != result.RequestText {
 		t.Fatalf("peer send target=%q text=%q", driver.target, driver.text)
 	}

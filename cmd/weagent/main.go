@@ -46,7 +46,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	wechatState := wechat.New(configuration.StateDir, configuration.CursorKey)
+	wechatState := wechat.New(configuration.StateDir, configuration.CursorKey, configuration.RemarkFilterEnabled)
 	if err := wechatState.EnsureStateDir(); err != nil {
 		return err
 	}

@@ -152,7 +152,7 @@ func (runner *Runner) RunOpenClawGroup(ctx context.Context) (Result, error) {
 		return Result{}, errors.New("establish peer baseline: response has no cursor")
 	}
 	replyText := uniqueTextWithPrefix("WEBOX_OPENCLAW_GROUP_E2E_")
-	requestText := "Reply with exactly this token and nothing else: " + replyText
+	requestText := "虾虾，reply with exactly this token and nothing else: " + replyText
 	runner.progress("sending OpenClaw group prompt for " + replyText)
 	if err := runner.driver.Send(ctx, runner.config.PeerTarget, requestText); err != nil {
 		return Result{}, fmt.Errorf("send peer OpenClaw group prompt: %w", err)

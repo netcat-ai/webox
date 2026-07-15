@@ -63,4 +63,20 @@ func TestLoadCreatesStableILinkIdentity(t *testing.T) {
 	if first.PublicBaseURL != "https://webox.example.test/base" {
 		t.Fatalf("public base URL=%q", first.PublicBaseURL)
 	}
+	if !first.RemarkFilterEnabled {
+		t.Fatal("remark filter should be enabled by default")
+	}
+}
+
+func TestLoadCanDisableRemarkFilter(t *testing.T) {
+	t.Setenv("WEBOX_WEAGENT_STATE_DIR", t.TempDir())
+	t.Setenv("WEBOX_REMARK_FILTER_ENABLED", "false")
+
+	configuration, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.RemarkFilterEnabled {
+		t.Fatal("remark filter should be disabled")
+	}
 }
