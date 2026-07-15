@@ -37,6 +37,8 @@ type Result struct {
 	ReplyText      string
 	IncomingID     string
 	ReplyMessageID string
+	GroupID        string
+	ReplyFrom      string
 }
 
 type Runner struct {
@@ -70,18 +72,8 @@ func New(config Config, driver PeerDriver) (*Runner, error) {
 func (runner *Runner) RunDirect(ctx context.Context) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, runner.config.Timeout)
 	defer cancel()
-	runner.progress("checking SUT and peer readiness")
-	for _, endpoint := range []struct {
-		name   string
-		client *iLinkClient
-	}{{"SUT", runner.sut}, {"peer", runner.peer}} {
-		ready, err := endpoint.client.ready(ctx)
-		if err != nil {
-			return Result{}, fmt.Errorf("check %s health: %w", endpoint.name, err)
-		}
-		if !ready {
-			return Result{}, fmt.Errorf("%s is not ready; complete WeChat login before running E2E", endpoint.name)
-		}
+	if err := runner.checkReadiness(ctx); err != nil {
+		return Result{}, err
 	}
 	runner.progress("establishing both message baselines; this can take up to 35 seconds")
 	sutCursor, peerCursor, err := runner.baselines(ctx)
@@ -112,6 +104,91 @@ func (runner *Runner) RunDirect(ctx context.Context) (Result, error) {
 		RequestText: requestText, ReplyText: replyText,
 		IncomingID: incoming.MessageID, ReplyMessageID: reply.MessageID,
 	}, nil
+}
+
+func (runner *Runner) RunOpenClawDirect(ctx context.Context) (Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, runner.config.Timeout)
+	defer cancel()
+	if err := runner.checkReadiness(ctx); err != nil {
+		return Result{}, err
+	}
+	runner.progress("establishing peer message baseline; this can take up to 35 seconds")
+	updates, err := runner.peer.getUpdates(ctx, "")
+	if err != nil {
+		return Result{}, fmt.Errorf("establish peer baseline: %w", err)
+	}
+	if strings.TrimSpace(updates.Cursor) == "" {
+		return Result{}, errors.New("establish peer baseline: response has no cursor")
+	}
+	replyText := uniqueTextWithPrefix("WEBOX_OPENCLAW_E2E_")
+	requestText := "Reply with exactly this token and nothing else: " + replyText
+	runner.progress("sending OpenClaw prompt for " + replyText)
+	if err := runner.driver.Send(ctx, runner.config.PeerTarget, requestText); err != nil {
+		return Result{}, fmt.Errorf("send peer OpenClaw prompt: %w", err)
+	}
+	runner.progress("waiting for peer to receive the OpenClaw agent reply")
+	reply, _, err := runner.peer.waitForText(ctx, updates.Cursor, replyText)
+	if err != nil {
+		return Result{}, fmt.Errorf("wait for OpenClaw agent reply: %w", err)
+	}
+	if strings.HasSuffix(reply.GroupID, "@chatroom") {
+		return Result{}, fmt.Errorf("matching reply is not a direct message: group_id=%q", reply.GroupID)
+	}
+	return Result{RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID}, nil
+}
+
+func (runner *Runner) RunOpenClawGroup(ctx context.Context) (Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, runner.config.Timeout)
+	defer cancel()
+	if err := runner.checkReadiness(ctx); err != nil {
+		return Result{}, err
+	}
+	runner.progress("establishing peer message baseline; this can take up to 35 seconds")
+	updates, err := runner.peer.getUpdates(ctx, "")
+	if err != nil {
+		return Result{}, fmt.Errorf("establish peer baseline: %w", err)
+	}
+	if strings.TrimSpace(updates.Cursor) == "" {
+		return Result{}, errors.New("establish peer baseline: response has no cursor")
+	}
+	replyText := uniqueTextWithPrefix("WEBOX_OPENCLAW_GROUP_E2E_")
+	requestText := "Reply with exactly this token and nothing else: " + replyText
+	runner.progress("sending OpenClaw group prompt for " + replyText)
+	if err := runner.driver.Send(ctx, runner.config.PeerTarget, requestText); err != nil {
+		return Result{}, fmt.Errorf("send peer OpenClaw group prompt: %w", err)
+	}
+	runner.progress("waiting for peer to receive the OpenClaw group reply")
+	reply, _, err := runner.peer.waitForText(ctx, updates.Cursor, replyText)
+	if err != nil {
+		return Result{}, fmt.Errorf("wait for OpenClaw group reply: %w", err)
+	}
+	if !strings.HasSuffix(reply.GroupID, "@chatroom") {
+		return Result{}, fmt.Errorf("matching reply is not a group message: group_id=%q", reply.GroupID)
+	}
+	if reply.SessionID != reply.GroupID {
+		return Result{}, fmt.Errorf("group reply session mismatch: session_id=%q group_id=%q", reply.SessionID, reply.GroupID)
+	}
+	return Result{
+		RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID,
+		GroupID: reply.GroupID, ReplyFrom: reply.FromUserID,
+	}, nil
+}
+
+func (runner *Runner) checkReadiness(ctx context.Context) error {
+	runner.progress("checking SUT and peer readiness")
+	for _, endpoint := range []struct {
+		name   string
+		client *iLinkClient
+	}{{"SUT", runner.sut}, {"peer", runner.peer}} {
+		ready, err := endpoint.client.ready(ctx)
+		if err != nil {
+			return fmt.Errorf("check %s health: %w", endpoint.name, err)
+		}
+		if !ready {
+			return fmt.Errorf("%s is not ready; complete WeChat login before running E2E", endpoint.name)
+		}
+	}
+	return nil
 }
 
 func (runner *Runner) progress(message string) {
@@ -197,6 +274,9 @@ type message struct {
 	MessageID    string `json:"msgid"`
 	Text         string `json:"text"`
 	ContextToken string `json:"context_token"`
+	FromUserID   string `json:"from_user_id"`
+	SessionID    string `json:"session_id"`
+	GroupID      string `json:"group_id"`
 }
 
 func newILinkClient(rawURL, token string) (*iLinkClient, error) {
@@ -305,9 +385,13 @@ func (client *iLinkClient) post(ctx context.Context, path string, body, response
 }
 
 func uniqueText() string {
+	return uniqueTextWithPrefix("WEBOX_E2E_")
+}
+
+func uniqueTextWithPrefix(prefix string) string {
 	random := make([]byte, 6)
 	if _, err := rand.Read(random); err != nil {
-		return "WEBOX_E2E_" + time.Now().UTC().Format("20060102T150405.000000000")
+		return prefix + time.Now().UTC().Format("20060102T150405.000000000")
 	}
-	return "WEBOX_E2E_" + time.Now().UTC().Format("20060102T150405") + "_" + hex.EncodeToString(random)
+	return prefix + time.Now().UTC().Format("20060102T150405") + "_" + hex.EncodeToString(random)
 }

@@ -64,6 +64,12 @@ func TestDockerPeerDriverPassesTargetAndTextWithoutShellInterpolation(t *testing
 	if !bytes.Contains(stdin, []byte("xdotool")) || !bytes.Contains(stdin, []byte("xclip")) {
 		t.Fatalf("peer script does not drive WeChat UI: %q", stdin)
 	}
+	if !bytes.Contains(stdin, []byte(`xdotool key --clearmodifiers Return`)) {
+		t.Fatalf("peer script does not select the unique remark result with Enter: %q", stdin)
+	}
+	if bytes.Contains(stdin, []byte(`mousemove --window "$win" 150`)) {
+		t.Fatalf("peer script still selects search results by fixed coordinates: %q", stdin)
+	}
 }
 
 func TestDirectRoundTripCrossesBothILinkEndpoints(t *testing.T) {
@@ -122,6 +128,96 @@ func TestDirectRoundTripRejectsPeerThatIsNotReady(t *testing.T) {
 	}
 	if driver.target != "" {
 		t.Fatalf("peer driver was called for target %q", driver.target)
+	}
+}
+
+func TestOpenClawDirectWaitsForAgentReplyThroughPeerEndpoint(t *testing.T) {
+	state := newRoundTripState()
+	sut := httptest.NewServer(http.HandlerFunc(state.handleSUT))
+	defer sut.Close()
+	peer := httptest.NewServer(http.HandlerFunc(state.handleOpenClawPeer))
+	defer peer.Close()
+	driver := &fakePeerDriver{state: state}
+
+	testRunner, err := runner.New(runner.Config{
+		SUTURL: sut.URL, PeerURL: peer.URL,
+		SUTToken: "sut-token", PeerToken: "peer-token",
+		PeerTarget: "Webox私聊测试", Timeout: 2 * time.Second,
+	}, driver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := testRunner.RunOpenClawDirect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(result.ReplyText, "WEBOX_OPENCLAW_E2E_") {
+		t.Fatalf("reply=%q", result.ReplyText)
+	}
+	if !strings.Contains(result.RequestText, result.ReplyText) {
+		t.Fatalf("request=%q reply=%q", result.RequestText, result.ReplyText)
+	}
+	if driver.target != "Webox私聊测试" || driver.text != result.RequestText {
+		t.Fatalf("peer send target=%q text=%q", driver.target, driver.text)
+	}
+	if state.sutPolls != 0 {
+		t.Fatalf("OpenClaw scenario consumed SUT messages itself: polls=%d", state.sutPolls)
+	}
+}
+
+func TestOpenClawDirectRejectsGroupReply(t *testing.T) {
+	state := newRoundTripState()
+	sut := httptest.NewServer(http.HandlerFunc(state.handleSUT))
+	defer sut.Close()
+	peer := httptest.NewServer(http.HandlerFunc(state.handleOpenClawGroupPeer))
+	defer peer.Close()
+	driver := &fakePeerDriver{state: state}
+
+	testRunner, err := runner.New(runner.Config{
+		SUTURL: sut.URL, PeerURL: peer.URL,
+		SUTToken: "sut-token", PeerToken: "peer-token",
+		PeerTarget: "Webox私聊测试", Timeout: 2 * time.Second,
+	}, driver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = testRunner.RunOpenClawDirect(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not a direct message") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestOpenClawGroupUsesUniqueRemarkAndRequiresAgentReplyInSameChatroom(t *testing.T) {
+	state := newRoundTripState()
+	sut := httptest.NewServer(http.HandlerFunc(state.handleSUT))
+	defer sut.Close()
+	peer := httptest.NewServer(http.HandlerFunc(state.handleOpenClawGroupPeer))
+	defer peer.Close()
+	driver := &fakePeerDriver{state: state}
+
+	testRunner, err := runner.New(runner.Config{
+		SUTURL: sut.URL, PeerURL: peer.URL,
+		SUTToken: "sut-token", PeerToken: "peer-token",
+		PeerTarget: "woc-50261801724", Timeout: 2 * time.Second,
+	}, driver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := testRunner.RunOpenClawGroup(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(result.ReplyText, "WEBOX_OPENCLAW_GROUP_E2E_") {
+		t.Fatalf("reply=%q", result.ReplyText)
+	}
+	if result.GroupID != "e2e-room@chatroom" {
+		t.Fatalf("group_id=%q", result.GroupID)
+	}
+	if driver.target != "woc-50261801724" || driver.text != result.RequestText {
+		t.Fatalf("peer send target=%q text=%q", driver.target, driver.text)
+	}
+	if state.sutPolls != 0 {
+		t.Fatalf("OpenClaw scenario consumed SUT messages itself: polls=%d", state.sutPolls)
 	}
 }
 
@@ -232,6 +328,67 @@ func (state *roundTripState) handlePeer(response http.ResponseWriter, request *h
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
 		"msgs": []any{map[string]any{"msgid": "reply-1", "text": state.replyText, "context_token": "peer-context"}},
+	})
+}
+
+func (state *roundTripState) handleOpenClawPeer(response http.ResponseWriter, request *http.Request) {
+	if request.URL.Path == "/healthz" {
+		writeJSON(response, map[string]any{"ok": true, "ready": state.peerReady})
+		return
+	}
+	if !validAuth(request, "peer-token") {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	state.mu.Lock()
+	state.peerPolls++
+	poll := state.peerPolls
+	state.mu.Unlock()
+	if poll == 1 {
+		writeJSON(response, map[string]any{"ret": 0, "msgs": []any{}, "get_updates_buf": "peer-baseline"})
+		return
+	}
+	<-state.peerSent
+	state.mu.Lock()
+	requestText := state.requestText
+	state.mu.Unlock()
+	parts := strings.Fields(requestText)
+	replyText := parts[len(parts)-1]
+	writeJSON(response, map[string]any{
+		"ret": 0, "get_updates_buf": "peer-next",
+		"msgs": []any{map[string]any{"msgid": "agent-reply-1", "text": replyText, "context_token": "peer-context"}},
+	})
+}
+
+func (state *roundTripState) handleOpenClawGroupPeer(response http.ResponseWriter, request *http.Request) {
+	if request.URL.Path == "/healthz" {
+		writeJSON(response, map[string]any{"ok": true, "ready": state.peerReady})
+		return
+	}
+	if !validAuth(request, "peer-token") {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	state.mu.Lock()
+	state.peerPolls++
+	poll := state.peerPolls
+	state.mu.Unlock()
+	if poll == 1 {
+		writeJSON(response, map[string]any{"ret": 0, "msgs": []any{}, "get_updates_buf": "peer-baseline"})
+		return
+	}
+	<-state.peerSent
+	state.mu.Lock()
+	requestText := state.requestText
+	state.mu.Unlock()
+	parts := strings.Fields(requestText)
+	replyText := parts[len(parts)-1]
+	writeJSON(response, map[string]any{
+		"ret": 0, "get_updates_buf": "peer-next",
+		"msgs": []any{map[string]any{
+			"msgid": "agent-group-reply-1", "text": replyText, "context_token": "peer-context",
+			"group_id": "e2e-room@chatroom", "session_id": "e2e-room@chatroom",
+		}},
 	})
 }
 

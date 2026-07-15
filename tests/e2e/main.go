@@ -29,7 +29,7 @@ func main() {
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("webox-e2e", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	scenario := flags.String("scenario", "direct", "E2E scenario (currently: direct)")
+	scenario := flags.String("scenario", "direct", "E2E scenario: direct, openclaw-direct, or openclaw-group")
 	sutURL := flags.String("sut-url", envOr("WEBOX_E2E_SUT_URL", "http://127.0.0.1:38080"), "SUT iLink base URL")
 	peerURL := flags.String("peer-url", envOr("WEBOX_E2E_PEER_URL", "http://127.0.0.1:38081"), "peer iLink base URL")
 	sutContainer := flags.String("sut-container", envOr("WEBOX_E2E_SUT_CONTAINER", "webox-sut"), "SUT Docker container")
@@ -43,7 +43,7 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) int 
 	} else if err != nil {
 		return 2
 	}
-	if *scenario != "direct" {
+	if *scenario != "direct" && *scenario != "openclaw-direct" && *scenario != "openclaw-group" {
 		fmt.Fprintf(stderr, "unsupported scenario %q\n", *scenario)
 		return 2
 	}
@@ -77,7 +77,14 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	result, err := testRunner.RunDirect(ctx)
+	var result runner.Result
+	if *scenario == "openclaw-direct" {
+		result, err = testRunner.RunOpenClawDirect(ctx)
+	} else if *scenario == "openclaw-group" {
+		result, err = testRunner.RunOpenClawGroup(ctx)
+	} else {
+		result, err = testRunner.RunDirect(ctx)
+	}
 	if err != nil {
 		artifactCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()

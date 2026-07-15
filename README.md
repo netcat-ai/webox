@@ -64,6 +64,14 @@ done
 openclaw gateway restart
 ```
 
+显式允许 agent 的普通回复由当前会话通道发回微信。否则某些 OpenClaw 运行环境会使用 `message_tool_only`，agent 虽然生成了正文，通道却不会自动发送：
+
+```bash
+openclaw config set messages.visibleReplies automatic
+openclaw config set messages.groupChat.visibleReplies automatic
+openclaw gateway restart
+```
+
 `--account webox` 用于避免复用其他 iLink 服务的账号、token 和 `baseUrl`。每个 Webox 实例使用不同的账号名。
 
 如果微信已经提前登录，而 OpenClaw 没有保存过这个 Webox volume 对应的 token，登录接口不会把 token 直接交给匿名调用者。请在 noVNC 中退出或切换微信账号，让登录二维码重新出现，再执行上面的 `openclaw channels login`。如果 OpenClaw 已保存相同 token，则插件可直接恢复，无需重新扫码。
@@ -90,11 +98,13 @@ docker logs --since 5m webox 2>&1 | grep 'WeChat text sent'
 
 ### 自动化真实 E2E
 
-`tests/e2e` 提供双微信账号的自动私聊闭环。首次为两个专用测试账号扫码并设置唯一备注后，runner 会自动完成 Peer UI 发消息、SUT iLink 收取与回复、Peer iLink 最终验收，并在失败时收集容器日志和微信桌面截图：
+`tests/e2e` 提供双微信账号的自动闭环，覆盖 iLink 私聊、OpenClaw 私聊和 OpenClaw 群聊。首次为两个专用测试账号扫码并在 Peer 端设置唯一联系人/群备注后，runner 会自动完成 Peer UI 发消息、SUT 或 OpenClaw 回复、Peer iLink 最终验收，并在失败时收集容器日志和微信桌面截图：
 
 ```bash
 docker compose -f tests/e2e/docker-compose.yml up -d
 go run ./tests/e2e --peer-target Webox被测账号
+go run ./tests/e2e --scenario openclaw-direct --peer-target Webox被测账号
+go run ./tests/e2e --scenario openclaw-group --peer-target Webox测试群
 ```
 
 完整的一次性准备和状态清理说明见 [`tests/e2e/README.md`](tests/e2e/README.md)。

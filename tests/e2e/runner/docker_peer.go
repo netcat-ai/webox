@@ -104,9 +104,15 @@ sleep 0.3
 xdotool key --clearmodifiers ctrl+a BackSpace
 set_clip "$target_b64"
 paste_clip
-sleep 1.8
+sleep 2.5
+# Peer targets are unique contact/group remarks. The matching local result is
+# therefore the first selectable result; Enter avoids brittle screen coordinates.
 xdotool key --clearmodifiers Return
 sleep 1.5
+# Selecting a search result does not consistently transfer keyboard focus to the
+# composer. Click a stable point inside the chat input area before pasting.
+xdotool mousemove --window "$win" 640 620 click 1
+sleep 0.2
 set_clip "$text_b64"
 paste_clip
 sleep 0.2
