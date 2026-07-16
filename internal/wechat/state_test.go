@@ -18,8 +18,8 @@ func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 		{"roomid": "noise@chatroom"},
 	}
 	remarks := map[string]string{
-		"wxid-direct":     "wb-alice",
-		"family@chatroom": "wb-family",
+		"wxid-direct":     "webox.alice",
+		"family@chatroom": "webox.family",
 		"noise@chatroom":  "other",
 	}
 
@@ -48,7 +48,7 @@ func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
 
 	filtered, err := filterMessagesByRemarkPrefix(messages, func(roomID string) (string, error) {
 		lookupCalls++
-		return "wb-direct", nil
+		return "webox.direct", nil
 	})
 	if err != nil {
 		t.Fatal(err)

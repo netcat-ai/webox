@@ -17,7 +17,7 @@ func TestConversationRemarkReadsTheExplicitContactRemark(t *testing.T) {
 	)`)
 	mustExec(t, db,
 		"INSERT INTO contact(username, nick_name, remark, alias, delete_flag) VALUES (?, ?, ?, ?, ?)",
-		"family@chatroom", "Family", "wb-family", "family", 0,
+		"family@chatroom", "Family", "webox.family", "family", 0,
 	)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -27,7 +27,7 @@ func TestConversationRemarkReadsTheExplicitContactRemark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remark != "wb-family" {
+	if remark != "webox.family" {
 		t.Fatalf("remark=%q", remark)
 	}
 }

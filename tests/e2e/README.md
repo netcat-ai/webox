@@ -33,8 +33,8 @@ docker compose -f tests/e2e/docker-compose.yml up -d
 两个账号需要互为联系人，并在两端设置唯一备注：
 
 - 在 Peer 微信中给 SUT 设置备注，例如 `Webox被测账号`。该值传给 runner 的 `--peer-target`。
-- 在 SUT 微信中给 Peer 设置以 `wb-` 开头的唯一备注，例如 `wb-peer`。SUT 默认只接收 `wb-` 会话，并用该备注定位回复。
-- 群聊测试需要建立只包含两个测试账号的群；SUT 端群备注必须以 `wb-` 开头，Peer 端只需非空且唯一。运行时传入 Peer 端的群备注。
+- 在 SUT 微信中给 Peer 设置以 `webox.` 开头的唯一备注，例如 `webox.peer`。SUT 默认只接收 `webox.` 会话，并用该备注定位回复。
+- 群聊测试需要建立只包含两个测试账号的群；SUT 端群备注必须以 `webox.` 开头，Peer 端只需非空且唯一。运行时传入 Peer 端的群备注。
 
 E2E compose 在 SUT 上保持备注过滤开启，在 Peer 观察端关闭过滤，以便 Peer 的 iLink 接口验收所有测试回复。
 

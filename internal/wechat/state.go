@@ -21,7 +21,7 @@ import (
 const (
 	maxPollLimit        = 500
 	keyValidationPeriod = 30 * time.Second
-	agentRemarkPrefix   = "wb-"
+	agentRemarkPrefix   = "webox."
 )
 
 type InitializationState int

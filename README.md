@@ -9,7 +9,7 @@ Webox 的 agent 使用 Go 实现：从微信本地数据库读取消息，通过
 - Docker 支持运行 Linux `amd64` 或 `arm64` 容器。
 - 已安装并初始化 OpenClaw，版本不低于 `2026.3.28`。
 - 准备一个专门登录 Webox 的微信账号，以及另一个用于收发测试消息的微信账号。
-- 在 Webox 登录的微信中，给允许 Agent 处理的联系人和群聊设置以 `wb-` 开头的唯一备注。Webox 默认只向 iLink 输出这些会话的消息，并使用备注在微信界面中定位回复目标。
+- 在 Webox 登录的微信中，给允许 Agent 处理的联系人和群聊设置以 `webox.` 开头的唯一备注。Webox 默认只向 iLink 输出这些会话的消息，并使用备注在微信界面中定位回复目标。
 
 不要使用承担支付、工作或重要社交关系的主微信账号做首次验证。
 
@@ -80,7 +80,7 @@ openclaw config set messages.groupChat.mentionPatterns '["虾虾"]' --strict-jso
 openclaw gateway restart
 ```
 
-因此私聊只要备注为 `wb-` 前缀即可触发；群聊还需要 @机器人，或消息正文包含“虾虾”。
+因此私聊只要备注为 `webox.` 前缀即可触发；群聊还需要 @机器人，或消息正文包含“虾虾”。
 
 `--account webox` 用于避免复用其他 iLink 服务的账号、token 和 `baseUrl`。每个 Webox 实例使用不同的账号名。
 
@@ -88,7 +88,7 @@ openclaw gateway restart
 
 ## 3. 验证私聊
 
-1. 在 Webox 登录的微信中，给测试联系人设置唯一备注，例如 `wb-私聊测试`。
+1. 在 Webox 登录的微信中，给测试联系人设置唯一备注，例如 `webox.私聊测试`。
 2. 使用另一个微信账号向 Webox 账号发送：`只回复 WEBOX_DM_OK`。
 3. 确认该会话只收到一条 `WEBOX_DM_OK`，不应再出现 `✅ 已收到`。
 4. 检查 Webox 已完成 UI 发送和数据库回读验证：
@@ -100,7 +100,7 @@ docker logs --since 5m webox 2>&1 | grep 'WeChat text sent'
 ## 4. 验证群聊
 
 1. 建立一个同时包含 Webox 账号和测试账号的群聊。
-2. 在 Webox 登录的微信中给该群设置唯一备注，例如 `wb-群聊测试`。
+2. 在 Webox 登录的微信中给该群设置唯一备注，例如 `webox.群聊测试`。
 3. 使用测试账号在群内 @机器人发送：`虾虾，只回复 WEBOX_GROUP_OK`。
 4. 确认同一个群聊只收到一条回复，并再次检查 `WeChat text sent` 日志。
 
@@ -147,7 +147,7 @@ X-WECHAT-UIN: <base64(random_uint32)>
 
 token 和 provider account ID 自动生成并持久化在 `/webox/state/weagent`。反向代理部署可用 `WEBOX_PUBLIC_BASE_URL=https://webox.example.com` 覆盖二维码确认响应中的 `baseurl`。
 
-Webox 默认启用备注过滤，仅输出备注以 `wb-` 开头的私聊和群聊消息。如需把 Webox 作为不带该安全边界的通用 iLink 服务，可在启动容器时设置：
+Webox 默认启用备注过滤，仅输出备注以 `webox.` 开头的私聊和群聊消息。如需把 Webox 作为不带该安全边界的通用 iLink 服务，可在启动容器时设置：
 
 ```bash
 -e WEBOX_REMARK_FILTER_ENABLED=false
