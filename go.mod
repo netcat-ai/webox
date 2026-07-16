@@ -3,7 +3,6 @@ module github.com/netcat-ai/webox
 go 1.26
 
 require (
-	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.18.4
 	github.com/makiuchi-d/gozxing v0.1.1
 	github.com/mattn/go-sqlite3 v1.14.32

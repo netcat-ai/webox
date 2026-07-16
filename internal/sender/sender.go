@@ -25,11 +25,6 @@ type Receipt struct {
 	ClientMessageID string
 }
 
-type Job struct {
-	Target  string
-	Content string
-}
-
 func New(state *wechat.State) *Service {
 	return &Service{wechat: state}
 }
@@ -124,7 +119,10 @@ func openChatScript(queryBase64 string) string {
 			`xdotool key --clearmodifiers ctrl+f; sleep 0.3; `+
 			`xdotool key --clearmodifiers ctrl+a BackSpace; sleep 0.2; `+
 			`set_clip %s; paste_clip; sleep 1.8; `+
-			`xdotool key --clearmodifiers Return; sleep 1.5`,
+			`xdotool key --clearmodifiers Return; sleep 1.5; `+
+			`eval "$(xdotool getwindowgeometry --shell "$win")"; `+
+			`composer_x="$((WIDTH * 55 / 100))"; composer_y="$((HEIGHT * 85 / 100))"; `+
+			`xdotool mousemove --window "$win" "$composer_x" "$composer_y" click 1; sleep 0.2`,
 		shellQuoteSingle(queryBase64),
 	)
 }

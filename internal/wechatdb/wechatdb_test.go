@@ -5,6 +5,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
+	"encoding/binary"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -84,6 +86,57 @@ func TestDecryptPageRestoresSQLitePayload(t *testing.T) {
 	}
 	if !bytes.Equal(decrypted[:pageSize-reserveSize], plain[:pageSize-reserveSize]) {
 		t.Fatal("decrypted page does not match plaintext")
+	}
+}
+
+func TestApplyWALDecryptsFirstPageAsSQLiteHeader(t *testing.T) {
+	key := bytes.Repeat([]byte{0x21}, 32)
+	plain := make([]byte, pageSize)
+	copy(plain, sqliteHeader)
+	for index := 16; index < pageSize-reserveSize; index++ {
+		plain[index] = byte(index % 251)
+	}
+	iv := bytes.Repeat([]byte{0x42}, aes.BlockSize)
+	encrypted := make([]byte, pageSize)
+	copy(encrypted[:saltSize], bytes.Repeat([]byte{0x11}, saltSize))
+	copy(encrypted[pageSize-reserveSize:], iv)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(
+		encrypted[saltSize:pageSize-reserveSize],
+		plain[16:pageSize-reserveSize],
+	)
+
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "message.db")
+	if err := os.WriteFile(outputPath, make([]byte, pageSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const salt1, salt2 = uint32(0x10203040), uint32(0x50607080)
+	wal := make([]byte, walHeaderSize+walFrameHeader+pageSize)
+	binary.BigEndian.PutUint32(wal[16:20], salt1)
+	binary.BigEndian.PutUint32(wal[20:24], salt2)
+	frameHeader := wal[walHeaderSize : walHeaderSize+walFrameHeader]
+	binary.BigEndian.PutUint32(frameHeader[:4], 1)
+	binary.BigEndian.PutUint32(frameHeader[8:12], salt1)
+	binary.BigEndian.PutUint32(frameHeader[12:16], salt2)
+	copy(wal[walHeaderSize+walFrameHeader:], encrypted)
+	walPath := filepath.Join(directory, "message.db-wal")
+	if err := os.WriteFile(walPath, wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyWAL(walPath, outputPath, key); err != nil {
+		t.Fatal(err)
+	}
+	decrypted, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decrypted[:pageSize-reserveSize], plain[:pageSize-reserveSize]) {
+		t.Fatal("WAL page 1 was not decrypted as a SQLite first page")
 	}
 }
 

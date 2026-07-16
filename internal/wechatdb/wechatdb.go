@@ -157,6 +157,9 @@ func InitFromMemory() (InitData, error) {
 	for _, entry := range entries {
 		keys[entry.dbName] = entry.key
 	}
+	if err := ValidateMessageDBKeys(dbDir, keys); err != nil {
+		return InitData{}, err
+	}
 	wxid := AccountIDFromDBDir(dbDir)
 	if wxid == "" {
 		return InitData{}, errors.New("无法从微信数据库目录识别当前账号")
@@ -216,9 +219,6 @@ func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, curre
 	if username == "" {
 		return nil, nil
 	}
-	if username == "filehelper" {
-		return &Recipient{Username: username, SearchTerm: "文件传输助手"}, nil
-	}
 	cache, err := newDBCache(dbDir, cacheDir, keys)
 	if err != nil {
 		return nil, err
@@ -266,6 +266,38 @@ func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, curre
 		return nil, err
 	}
 	return &Recipient{Username: storedUsername, SearchTerm: searchTerm}, nil
+}
+
+func conversationRemarkFromDB(path, username string) (string, error) {
+	db, err := openSQLite(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+	var remark sql.NullString
+	err = db.QueryRow(
+		"SELECT remark FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
+		strings.TrimSpace(username),
+	).Scan(&remark)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(remark.String), nil
+}
+
+func ConversationRemark(dbDir string, keys map[string]string, cacheDir, username string) (string, error) {
+	cache, err := newDBCache(dbDir, cacheDir, keys)
+	if err != nil {
+		return "", err
+	}
+	path, found, err := cache.get("contact/contact.db")
+	if err != nil || !found {
+		return "", err
+	}
+	return conversationRemarkFromDB(path, username)
 }
 
 func RoomMessagePositionsFor(dbDir string, keys map[string]string, cacheDir, roomID string) (RoomMessagePositions, error) {
@@ -633,7 +665,36 @@ func loadSessionState(cache *dbCache) (map[string]int64, error) {
 	return sessions, rows.Err()
 }
 
-func messageDBKeys(cache *dbCache) []string {
+func ValidateMessageDBKeys(dbDir string, keys map[string]string) error {
+	messageDir := filepath.Join(dbDir, "message")
+	entries, err := os.ReadDir(messageDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read WeChat message database directory: %w", err)
+	}
+	var missing []string
+	for _, entry := range entries {
+		if entry.IsDir() || !isMessageShard(entry.Name()) {
+			continue
+		}
+		relative := filepath.ToSlash(filepath.Join("message", entry.Name()))
+		if strings.TrimSpace(keys[relative]) == "" {
+			missing = append(missing, relative)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("missing WeChat message database key: %s", strings.Join(missing, ", "))
+}
+
+func messageDBKeys(cache *dbCache) ([]string, error) {
+	if err := ValidateMessageDBKeys(cache.dbDir, cache.keys); err != nil {
+		return nil, err
+	}
 	var keys []string
 	for key := range cache.keys {
 		if strings.HasPrefix(key, "message/") && isMessageShard(filepath.Base(key)) {
@@ -641,13 +702,17 @@ func messageDBKeys(cache *dbCache) []string {
 		}
 	}
 	sort.Strings(keys)
-	return keys
+	return keys, nil
 }
 
 func findMessageShards(cache *dbCache, username string) ([]messageShard, error) {
 	table := fmt.Sprintf("Msg_%x", md5.Sum([]byte(username)))
 	var shards []messageShard
-	for _, relative := range messageDBKeys(cache) {
+	keys, err := messageDBKeys(cache)
+	if err != nil {
+		return nil, err
+	}
+	for _, relative := range keys {
 		path, found, err := cache.get(relative)
 		if err != nil {
 			return nil, err
@@ -936,11 +1001,7 @@ func applyWAL(walPath, outPath string, key []byte) error {
 			continue
 		}
 		page := data[position+walFrameHeader : position+frameSize]
-		decryptNumber := pageNumber
-		if pageNumber == 1 {
-			decryptNumber = 2
-		}
-		decrypted, err := decryptPage(key, page, decryptNumber)
+		decrypted, err := decryptPage(key, page, pageNumber)
 		if err != nil {
 			return err
 		}
