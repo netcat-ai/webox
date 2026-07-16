@@ -219,9 +219,6 @@ func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, curre
 	if username == "" {
 		return nil, nil
 	}
-	if username == "filehelper" {
-		return &Recipient{Username: username, SearchTerm: "文件传输助手"}, nil
-	}
 	cache, err := newDBCache(dbDir, cacheDir, keys)
 	if err != nil {
 		return nil, err
