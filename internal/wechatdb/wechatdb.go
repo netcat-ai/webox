@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -902,7 +903,7 @@ func normalizedMessage(localType int64, content string, group bool) (string, str
 		return "text", stripGroupPrefix(content, group)
 	}
 	if base == 49 && strings.Contains(content, "<refermsg>") {
-		return "text", cleanXMLText(extractXMLText(stripGroupPrefix(content, group), "title"))
+		return "text", quotedMessageText(stripGroupPrefix(content, group))
 	}
 	labels := map[int64]struct{ kind, text string }{
 		3: {"image", "[图片]"}, 34: {"voice", "[语音]"}, 42: {"card", "[名片]"},
@@ -914,6 +915,89 @@ func normalizedMessage(localType int64, content string, group bool) (string, str
 		return value.kind, value.text
 	}
 	return "unknown", stripGroupPrefix(content, group)
+}
+
+type quotedMessage struct {
+	AppMessage struct {
+		Title     string          `xml:"title"`
+		Reference quotedReference `xml:"refermsg"`
+	} `xml:"appmsg"`
+}
+
+type quotedReference struct {
+	Type    int64  `xml:"type"`
+	Content string `xml:"content"`
+}
+
+type linkedMessage struct {
+	AppMessage struct {
+		Title string `xml:"title"`
+		URL   string `xml:"url"`
+	} `xml:"appmsg"`
+}
+
+func quotedMessageText(document string) string {
+	var message quotedMessage
+	if err := xml.Unmarshal([]byte(document), &message); err != nil {
+		return cleanXMLText(extractXMLText(document, "title"))
+	}
+	current := cleanXMLText(message.AppMessage.Title)
+	reference := quotedReferenceText(message.AppMessage.Reference)
+	if reference == "" {
+		return current
+	}
+	if current == "" {
+		return reference
+	}
+	return current + "\n" + reference
+}
+
+func quotedReferenceText(reference quotedReference) string {
+	switch baseType(reference.Type) {
+	case 1:
+		content := cleanXMLText(reference.Content)
+		if content == "" {
+			return ""
+		}
+		return "[引用消息] " + content
+	case 3:
+		return "[引用消息][图片]"
+	case 34:
+		return "[引用消息][语音]"
+	case 42:
+		return "[引用消息][名片]"
+	case 43:
+		return "[引用消息][视频]"
+	case 47:
+		return "[引用消息][表情]"
+	case 48:
+		return "[引用消息][位置]"
+	case 49:
+		return quotedLinkText(reference.Content)
+	case 50:
+		return "[引用消息][通话]"
+	case 10000:
+		return "[引用消息][系统消息]"
+	case 10002:
+		return "[引用消息][撤回了一条消息]"
+	default:
+		return ""
+	}
+}
+
+func quotedLinkText(content string) string {
+	result := "[引用消息][链接]"
+	var message linkedMessage
+	if err := xml.Unmarshal([]byte(strings.TrimSpace(content)), &message); err != nil {
+		return result
+	}
+	if title := cleanXMLText(message.AppMessage.Title); title != "" {
+		result += " " + title
+	}
+	if link := strings.TrimSpace(message.AppMessage.URL); link != "" {
+		result += "\n" + link
+	}
+	return result
 }
 
 func senderUsername(realSenderID int64, content string, group bool, chatUsername string, idToUsername map[int64]string) string {

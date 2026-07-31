@@ -11,6 +11,70 @@ import (
 	"testing"
 )
 
+func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "text",
+			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><type>57</type><refermsg>` +
+				`<type>1</type><content><![CDATA[这车油耗多少]]></content></refermsg></appmsg></msg>`,
+			want: "虾虾 回答一下\n[引用消息] 这车油耗多少",
+		},
+		{
+			name: "image",
+			content: `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
+				`<type>3</type><content><![CDATA[<msg><img aeskey="secret" /></msg>]]></content></refermsg></appmsg></msg>`,
+			want: "虾虾 看看这个\n[引用消息][图片]",
+		},
+		{
+			name: "link",
+			content: `<msg><appmsg><title><![CDATA[虾虾 总结一下]]></title><type>57</type><refermsg>` +
+				`<type>49</type><content><![CDATA[<msg><appmsg><title>文章标题</title>` +
+				`<url>https://example.com/article?id=1&amp;from=wechat</url></appmsg></msg>]]></content>` +
+				`</refermsg></appmsg></msg>`,
+			want: "虾虾 总结一下\n[引用消息][链接] 文章标题\nhttps://example.com/article?id=1&from=wechat",
+		},
+		{
+			name: "malformed reference",
+			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><type>57</type>` +
+				`<refermsg><type>1</type></refermsg></appmsg></msg>`,
+			want: "虾虾 回答一下",
+		},
+		{
+			name: "malformed xml",
+			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
+				`<type>1</type><content><![CDATA[不完整的引用]]></content>`,
+			want: "虾虾 回答一下",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			kind, got := normalizedMessage(49, test.content, false)
+			if kind != "text" {
+				t.Fatalf("kind=%q want text", kind)
+			}
+			if got != test.want {
+				t.Fatalf("content=%q want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing.T) {
+	content := "wxid_sender:\n" +
+		`<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
+		`<type>1</type><content><![CDATA[群里的问题]]></content></refermsg></appmsg></msg>`
+
+	kind, got := normalizedMessage(49, content, true)
+	if kind != "text" || got != "虾虾 回答一下\n[引用消息] 群里的问题" {
+		t.Fatalf("normalizedMessage()=(%q, %q)", kind, got)
+	}
+}
+
 func TestQueryAdvancesOutgoingRowsAndEmitsIncomingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
