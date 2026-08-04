@@ -16,6 +16,7 @@ import (
 	"github.com/netcat-ai/webox/internal/ilink"
 	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
+	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
 )
 
@@ -50,6 +51,10 @@ func run(logger *slog.Logger) error {
 	if err := wechatState.EnsureStateDir(); err != nil {
 		return err
 	}
+	media, err := sharedmedia.New(configuration.MediaDir)
+	if err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -65,8 +70,9 @@ func run(logger *slog.Logger) error {
 		configuration.APIToken,
 		configuration.ProviderAccountID,
 		configuration.PublicBaseURL,
+		media,
 		wechatState,
-		sender.New(wechatState),
+		sender.New(wechatState, media),
 		qr,
 		logger,
 	)

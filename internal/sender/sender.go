@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
 )
 
@@ -19,14 +20,15 @@ const maxTextLength = 5000
 
 type Service struct {
 	wechat *wechat.State
+	media  *sharedmedia.Store
 }
 
 type Receipt struct {
 	ClientMessageID string
 }
 
-func New(state *wechat.State) *Service {
-	return &Service{wechat: state}
+func New(state *wechat.State, media *sharedmedia.Store) *Service {
+	return &Service{wechat: state, media: media}
 }
 
 func (service *Service) SendText(ctx context.Context, target, text string) (Receipt, error) {
@@ -73,6 +75,55 @@ func (service *Service) SendText(ctx context.Context, target, text string) (Rece
 	return Receipt{}, errors.New("send verification failed: message was not found in WeChat db")
 }
 
+func (service *Service) SendImage(ctx context.Context, target, sharedPath string) (Receipt, error) {
+	target = strings.TrimSpace(target)
+	if target == "" || len(target) > 200 {
+		return Receipt{}, errors.New("recipient is empty or too long")
+	}
+	if service.media == nil {
+		return Receipt{}, errors.New("shared media store is unavailable")
+	}
+	path, contentType, err := service.media.ResolveOutbox(sharedPath)
+	if err != nil {
+		return Receipt{}, err
+	}
+	recipient, err := service.wechat.ResolveRecipient(target)
+	if err != nil {
+		return Receipt{}, err
+	}
+	beforeSend, err := service.wechat.RoomMessagePositions(recipient.Username)
+	if err != nil {
+		return Receipt{}, err
+	}
+	receipt := Receipt{ClientMessageID: randomID()}
+	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
+		return receipt, nil
+	}
+	script := sendImageScript(
+		base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm)),
+		path,
+		contentType,
+	)
+	if err := runUIScript(ctx, "80s", script, "send image"); err != nil {
+		return Receipt{}, err
+	}
+	for range 20 {
+		found, err := service.wechat.HasImageMessageAfter(beforeSend, recipient.Username)
+		if err != nil {
+			return Receipt{}, fmt.Errorf("verify sent image in WeChat db: %w", err)
+		}
+		if found {
+			return receipt, nil
+		}
+		select {
+		case <-ctx.Done():
+			return Receipt{}, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return Receipt{}, errors.New("send verification failed: image was not found in WeChat db")
+}
+
 func sendTextScript(searchBase64, textBase64 string) string {
 	script := uiScriptPrelude()
 	script = append(script,
@@ -82,6 +133,23 @@ func sendTextScript(searchBase64, textBase64 string) string {
 		"sleep 0.2",
 		"xdotool key --clearmodifiers Return",
 		"sleep 0.5",
+		"xdotool key --clearmodifiers ctrl+2",
+		"sleep 0.2",
+	)
+	return strings.Join(script, "; ")
+}
+
+func sendImageScript(searchBase64, imagePath, contentType string) string {
+	script := uiScriptPrelude()
+	script = append(script,
+		openChatScript(searchBase64),
+		"cleanup_clip",
+		"xclip -selection clipboard -target "+shellQuoteSingle(contentType)+" -loops 5 -i "+shellQuoteSingle(imagePath)+" >/dev/null 2>&1 & clip_pid=$!",
+		"sleep 0.25",
+		"paste_clip",
+		"sleep 1",
+		"xdotool key --clearmodifiers Return",
+		"sleep 0.7",
 		"xdotool key --clearmodifiers ctrl+2",
 		"sleep 0.2",
 	)
@@ -119,10 +187,7 @@ func openChatScript(queryBase64 string) string {
 			`xdotool key --clearmodifiers ctrl+f; sleep 0.3; `+
 			`xdotool key --clearmodifiers ctrl+a BackSpace; sleep 0.2; `+
 			`set_clip %s; paste_clip; sleep 1.8; `+
-			`xdotool key --clearmodifiers Return; sleep 1.5; `+
-			`eval "$(xdotool getwindowgeometry --shell "$win")"; `+
-			`composer_x="$((WIDTH * 55 / 100))"; composer_y="$((HEIGHT * 85 / 100))"; `+
-			`xdotool mousemove --window "$win" "$composer_x" "$composer_y" click 1; sleep 0.2`,
+			`xdotool key --clearmodifiers Return; sleep 1.5`,
 		shellQuoteSingle(queryBase64),
 	)
 }

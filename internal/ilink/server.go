@@ -17,8 +17,10 @@ import (
 
 	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
+	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechat"
+	"github.com/netcat-ai/webox/internal/wechatdb"
 )
 
 const (
@@ -35,10 +37,12 @@ type messageSource interface {
 	RefreshLoginQRCode() (bool, error)
 	ValidatePollCursor(string) error
 	PollMessages(string, int) (wechat.PollResult, error)
+	ReadImage(string, string) (*wechatdb.MediaFile, error)
 }
 
-type textSender interface {
+type messageSender interface {
 	SendText(context.Context, string, string) (sender.Receipt, error)
+	SendImage(context.Context, string, string) (sender.Receipt, error)
 }
 
 type qrSource interface {
@@ -49,8 +53,9 @@ type Server struct {
 	apiToken          string
 	providerAccountID string
 	publicBaseURL     string
+	media             *sharedmedia.Store
 	messages          messageSource
-	sender            textSender
+	sender            messageSender
 	qr                qrSource
 	logger            *slog.Logger
 
@@ -103,11 +108,11 @@ type typingTicket struct {
 	UserID string `json:"ilink_user_id"`
 }
 
-func New(apiToken, providerAccountID, publicBaseURL string, messages messageSource, sender textSender, qr qrSource, logger *slog.Logger) *Server {
+func New(apiToken, providerAccountID, publicBaseURL string, media *sharedmedia.Store, messages messageSource, sender messageSender, qr qrSource, logger *slog.Logger) *Server {
 	return &Server{
 		apiToken: apiToken, providerAccountID: providerAccountID,
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
-		messages:      messages, sender: sender, qr: qr, logger: logger,
+		media:         media, messages: messages, sender: sender, qr: qr, logger: logger,
 		cache:       sendReceiptCache{entries: make(map[string]cachedSend)},
 		pollTimeout: getUpdatesTimeout, pollInterval: getUpdatesInterval, qrTimeout: qrAcquireTimeout,
 	}
@@ -290,7 +295,13 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		if len(result.Messages) != 0 || !time.Now().Before(deadline) {
 			messages := make([]map[string]any, 0, len(result.Messages))
 			for _, message := range result.Messages {
-				messages = append(messages, server.standardMessage(message))
+				view, err := server.standardMessage(message)
+				if err != nil {
+					server.logger.Warn("could not materialize WeChat message", "error", err)
+					writeError(response, http.StatusInternalServerError, err.Error())
+					return
+				}
+				messages = append(messages, view)
 			}
 			writeJSON(response, http.StatusOK, map[string]any{
 				"ret": 0, "msgs": messages, "get_updates_buf": cursor,
@@ -308,7 +319,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
-func (server *Server) standardMessage(message map[string]any) map[string]any {
+func (server *Server) standardMessage(message map[string]any) (map[string]any, error) {
 	externalID := stringValue(message["msgid"])
 	createdAt := integerValue(message["msgtime"])
 	roomID := stringValue(message["roomid"])
@@ -321,6 +332,21 @@ func (server *Server) standardMessage(message map[string]any) map[string]any {
 	}
 	text := messageDisplayText(message)
 	senderID := stringValue(message["from"])
+	items := []map[string]any{{
+		"type": textItemType, "create_time_ms": createdAt, "is_completed": true,
+		"msg_id": externalID, "text_item": map[string]any{"text": text},
+	}}
+	sharedPath := ""
+	if messageType(message) == "image" {
+		sharedPath, err = server.materializeInboundImage(roomID, externalID)
+		if err != nil {
+			return nil, err
+		}
+		items = []map[string]any{{
+			"type": imageItemType, "create_time_ms": createdAt, "is_completed": true,
+			"msg_id": externalID, "image_item": map[string]any{"shared_path": sharedPath},
+		}}
+	}
 	view := map[string]any{
 		"seq": integerOr(message["local_id"], messageID), "message_id": messageID,
 		"msgid": externalID, "client_id": externalID,
@@ -328,16 +354,22 @@ func (server *Server) standardMessage(message map[string]any) map[string]any {
 		"create_time_ms": createdAt, "update_time_ms": createdAt, "session_id": roomID,
 		"message_type": 1, "message_state": 2,
 		"context_token": server.contextToken(roomID), "text": text,
-		"item_list": []map[string]any{{
-			"type": textItemType, "create_time_ms": createdAt, "is_completed": true,
-			"msg_id": externalID, "text_item": map[string]any{"text": text},
-		}},
+		"item_list":      items,
 		"wechat_msgtype": messageType(message),
+	}
+	if sharedPath != "" {
+		view["shared_path"] = sharedPath
+	}
+	if name := strings.TrimSpace(stringValue(message["conversation_name"])); name != "" {
+		view["conversation_name"] = name
+	}
+	if remark := strings.TrimSpace(stringValue(message["conversation_remark"])); remark != "" {
+		view["conversation_remark"] = remark
 	}
 	if strings.HasSuffix(roomID, "@chatroom") {
 		view["group_id"] = roomID
 	}
-	return view
+	return view, nil
 }
 
 func (server *Server) sendMessage(response http.ResponseWriter, request *http.Request) {
@@ -353,10 +385,18 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeJSON(response, http.StatusOK, sessionUnavailable(""))
 		return
 	}
+	var imageItem map[string]any
 	for _, item := range body.Message.Items {
-		for _, key := range []string{"image_item", "voice_item", "file_item", "video_item"} {
+		if _, found := item["image_item"]; found {
+			if imageItem != nil {
+				writeError(response, http.StatusBadRequest, "only one image item can be sent per request")
+				return
+			}
+			imageItem = item
+		}
+		for _, key := range []string{"voice_item", "file_item", "video_item"} {
 			if _, found := item[key]; found {
-				writeError(response, http.StatusNotImplemented, "binary media sending is not supported; send an external URL as text")
+				writeError(response, http.StatusNotImplemented, "only text and image sending are supported")
 				return
 			}
 		}
@@ -369,11 +409,6 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 	target, err := server.outboundTarget(body.Message.ContextToken)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	text := outboundText(body.Message)
-	if text == "" {
-		writeError(response, http.StatusBadRequest, "msg.text or text item is required")
 		return
 	}
 	fingerprint := messageFingerprint(body.Message)
@@ -390,10 +425,26 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 			return
 		}
 	}
-	receipt, err := server.sender.SendText(request.Context(), target, text)
-	if err != nil {
-		server.logger.Error("could not send WeChat text", "target", target, "error", err)
-		writeError(response, http.StatusInternalServerError, err.Error())
+	var receipt sender.Receipt
+	var sendErr error
+	if imageItem != nil {
+		sharedPath, resolveErr := outboundImagePath(imageItem)
+		if resolveErr != nil {
+			writeError(response, http.StatusBadRequest, resolveErr.Error())
+			return
+		}
+		receipt, sendErr = server.sender.SendImage(request.Context(), target, sharedPath)
+	} else {
+		text := outboundText(body.Message)
+		if text == "" {
+			writeError(response, http.StatusBadRequest, "msg.text, text item, or image item is required")
+			return
+		}
+		receipt, sendErr = server.sender.SendText(request.Context(), target, text)
+	}
+	if sendErr != nil {
+		server.logger.Error("could not send WeChat message", "target", target, "error", sendErr)
+		writeError(response, http.StatusInternalServerError, sendErr.Error())
 		return
 	}
 	resultID := receipt.ClientMessageID
@@ -401,7 +452,7 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		resultID = clientID
 		server.rememberSend(clientID, fingerprint, resultID)
 	}
-	server.logger.Info("WeChat text sent", "target", target, "client_msg_id", resultID)
+	server.logger.Info("WeChat message sent", "target", target, "client_msg_id", resultID)
 	writeJSON(response, http.StatusOK, sendSuccess(resultID))
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,17 +76,24 @@ func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing
 	}
 }
 
-func TestQueryAdvancesOutgoingRowsAndEmitsIncomingRows(t *testing.T) {
+func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
-	mustExec(t, db,
-		"INSERT INTO [Msg_test] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		1, 101, 1, 1000, 0, "outgoing", 0, 2, 1,
-	)
-	mustExec(t, db,
-		"INSERT INTO [Msg_test] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		2, 102, 1, 1000, 0, "incoming", 0, 3, 2,
-	)
+	rows := []struct {
+		id, status, origin int
+		text               string
+	}{
+		{id: 1, status: 2, origin: 1, text: "local outgoing"},
+		{id: 2, status: 3, origin: 2, text: "remote incoming"},
+		{id: 3, status: 4, origin: 2, text: "system state"},
+		{id: 4, status: 3, origin: 0, text: "other source"},
+	}
+	for _, row := range rows {
+		mustExec(t, db,
+			"INSERT INTO [Msg_test] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			row.id, 100+row.id, 1, 1000, 0, row.text, 0, row.status, row.origin,
+		)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +104,14 @@ func TestQueryAdvancesOutgoingRowsAndEmitsIncomingRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0].message != nil || events[0].position.LocalID != 1 {
-		t.Fatalf("unexpected outgoing event: %#v", events)
+	if len(events) != len(rows) {
+		t.Fatalf("events=%d want %d: %#v", len(events), len(rows), events)
 	}
-	text := events[1].message["text"].(map[string]any)["content"]
-	if text != "incoming" || events[1].position.LocalID != 2 {
-		t.Fatalf("unexpected incoming event: %#v", events[1])
+	for index, event := range events {
+		text := event.message["text"].(map[string]any)["content"]
+		if text != rows[index].text || event.position.LocalID != int64(rows[index].id) {
+			t.Fatalf("event[%d]=%#v want text=%q", index, event, rows[index].text)
+		}
 	}
 }
 
@@ -201,6 +211,51 @@ func TestApplyWALDecryptsFirstPageAsSQLiteHeader(t *testing.T) {
 	}
 	if !bytes.Equal(decrypted[:pageSize-reserveSize], plain[:pageSize-reserveSize]) {
 		t.Fatal("WAL page 1 was not decrypted as a SQLite first page")
+	}
+}
+
+func TestDecodeV2ImageRestoresEncryptedAndXORTails(t *testing.T) {
+	key := imageKeyMaterial{xor: 0x5a}
+	copy(key.aes[:], []byte("0123456789abcdef"))
+	aesPlain := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'a', 'e', 's'}
+	rawPlain := []byte("-raw-")
+	xorPlain := []byte("tail")
+	padding := aes.BlockSize - len(aesPlain)%aes.BlockSize
+	padded := append(bytes.Clone(aesPlain), bytes.Repeat([]byte{byte(padding)}, padding)...)
+	block, err := aes.NewCipher(key.aes[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := make([]byte, len(padded))
+	for offset := 0; offset < len(padded); offset += aes.BlockSize {
+		block.Encrypt(ciphertext[offset:offset+aes.BlockSize], padded[offset:offset+aes.BlockSize])
+	}
+	encoded := make([]byte, v2ImageHeaderSize)
+	copy(encoded, v2ImageMagic)
+	binary.LittleEndian.PutUint32(encoded[6:10], uint32(len(aesPlain)))
+	binary.LittleEndian.PutUint32(encoded[10:14], uint32(len(xorPlain)))
+	encoded = append(encoded, ciphertext...)
+	encoded = append(encoded, rawPlain...)
+	for _, value := range xorPlain {
+		encoded = append(encoded, value^key.xor)
+	}
+	decoded, err := decodeV2Image(encoded, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append(bytes.Clone(aesPlain), rawPlain...), xorPlain...)
+	if !bytes.Equal(decoded, want) {
+		t.Fatalf("decoded=%x want=%x", decoded, want)
+	}
+}
+
+func TestResourceMD5PrefersPackedMarker(t *testing.T) {
+	value := "0123456789abcdef0123456789abcdef"
+	packed := append([]byte("prefix"), []byte{0x12, 0x22, 0x0a, 0x20}...)
+	packed = append(packed, value...)
+	packed = append(packed, []byte("suffix")...)
+	if got := resourceMD5(packed); got != value {
+		t.Fatalf("resourceMD5=%q want %q packed=%s", got, value, hex.EncodeToString(packed))
 	}
 }
 

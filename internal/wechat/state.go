@@ -88,6 +88,36 @@ func filterMessagesByRemarkPrefix(
 	return filtered, nil
 }
 
+func addConversationMetadata(
+	messages []map[string]any,
+	lookup func(string) (wechatdb.ConversationMetadata, error),
+) (map[string]wechatdb.ConversationMetadata, error) {
+	metadataByRoom := make(map[string]wechatdb.ConversationMetadata)
+	for _, message := range messages {
+		roomID, ok := message["roomid"].(string)
+		roomID = strings.TrimSpace(roomID)
+		if !ok || roomID == "" {
+			continue
+		}
+		metadata, found := metadataByRoom[roomID]
+		if !found {
+			var err error
+			metadata, err = lookup(roomID)
+			if err != nil {
+				return nil, err
+			}
+			metadataByRoom[roomID] = metadata
+		}
+		if metadata.Name != "" {
+			message["conversation_name"] = metadata.Name
+		}
+		if metadata.Remark != "" {
+			message["conversation_remark"] = metadata.Remark
+		}
+	}
+	return metadataByRoom, nil
+}
+
 func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
 	return &State{
 		stateDir:            stateDir,
@@ -252,8 +282,17 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 		}
 		return left.room < right.room
 	})
+	metadataByRoom, err := addConversationMetadata(data.Messages, func(roomID string) (wechatdb.ConversationMetadata, error) {
+		return wechatdb.ConversationMetadataFor(material.DBDir, material.Keys, state.cacheDir(), roomID)
+	})
+	if err != nil {
+		if state.remarkFilterEnabled {
+			return PollResult{}, state.dbError("read WeChat conversation metadata", err)
+		}
+		metadataByRoom = map[string]wechatdb.ConversationMetadata{}
+	}
 	messages, err := state.applyRemarkFilter(data.Messages, func(roomID string) (string, error) {
-		return wechatdb.ConversationRemark(material.DBDir, material.Keys, state.cacheDir(), roomID)
+		return metadataByRoom[roomID].Remark, nil
 	})
 	if err != nil {
 		return PollResult{}, state.dbError("filter WeChat messages by conversation remark", err)
@@ -309,6 +348,34 @@ func (state *State) HasTextMessageAfter(positions wechatdb.RoomMessagePositions,
 		return false, state.dbError("verify outgoing WeChat text", err)
 	}
 	return found, nil
+}
+
+func (state *State) HasImageMessageAfter(positions wechatdb.RoomMessagePositions, target string) (bool, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	material, err := state.readyMaterial()
+	if err != nil {
+		return false, err
+	}
+	found, err := wechatdb.HasOutgoingImage(material.DBDir, material.Keys, state.cacheDir(), target, positions)
+	if err != nil {
+		return false, state.dbError("verify outgoing WeChat image", err)
+	}
+	return found, nil
+}
+
+func (state *State) ReadImage(roomID, messageID string) (*wechatdb.MediaFile, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	material, err := state.readyMaterial()
+	if err != nil {
+		return nil, err
+	}
+	media, err := wechatdb.ReadImage(material.DBDir, material.Keys, state.cacheDir(), roomID, messageID)
+	if err != nil {
+		return nil, state.dbError("read WeChat image", err)
+	}
+	return media, nil
 }
 
 func (state *State) readyMaterial() (keyFile, error) {

@@ -18,6 +18,7 @@ type Config struct {
 	CursorKey           string
 	QRScreenshotPath    string
 	StateDir            string
+	MediaDir            string
 	RemarkFilterEnabled bool
 }
 
@@ -47,6 +48,7 @@ func Load() (Config, error) {
 		CursorKey:           cursorKey,
 		QRScreenshotPath:    strings.TrimSpace(envOr("WEBOX_QR_SCREENSHOT_PATH", "/webox/runtime/xvfb/Xvfb_screen0")),
 		StateDir:            stateDir,
+		MediaDir:            envOr("WEBOX_MEDIA_DIR", filepath.Join(filepath.Dir(stateDir), "media")),
 		RemarkFilterEnabled: remarkFilterEnabled,
 	}, nil
 }

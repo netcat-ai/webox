@@ -75,6 +75,28 @@ func TestDisabledRemarkFilterDoesNotReadRemarksOrDropMessages(t *testing.T) {
 	}
 }
 
+func TestConversationMetadataIsAddedOncePerRoom(t *testing.T) {
+	messages := []map[string]any{
+		{"roomid": "family@chatroom"},
+		{"roomid": "family@chatroom"},
+		{"roomid": "wxid-direct"},
+	}
+	lookupCalls := 0
+	metadata, err := addConversationMetadata(messages, func(roomID string) (wechatdb.ConversationMetadata, error) {
+		lookupCalls++
+		return wechatdb.ConversationMetadata{Name: "name:" + roomID, Remark: "webox." + roomID}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookupCalls != 2 || len(metadata) != 2 {
+		t.Fatalf("lookupCalls=%d metadata=%#v", lookupCalls, metadata)
+	}
+	if messages[0]["conversation_name"] != "name:family@chatroom" || messages[0]["conversation_remark"] != "webox.family@chatroom" {
+		t.Fatalf("message=%#v", messages[0])
+	}
+}
+
 func TestCursorRoundTripAndRejectLegacyFields(t *testing.T) {
 	state := New(t.TempDir(), "test-token", true)
 	cursor := dbCursor{

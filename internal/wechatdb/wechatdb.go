@@ -65,6 +65,11 @@ type Recipient struct {
 	SearchTerm string
 }
 
+type ConversationMetadata struct {
+	Name   string
+	Remark string
+}
+
 type keyEntry struct {
 	dbName string
 	key    string
@@ -301,6 +306,41 @@ func ConversationRemark(dbDir string, keys map[string]string, cacheDir, username
 	return conversationRemarkFromDB(path, username)
 }
 
+func conversationMetadataFromDB(path, username string) (ConversationMetadata, error) {
+	db, err := openSQLite(path)
+	if err != nil {
+		return ConversationMetadata{}, err
+	}
+	defer func() { _ = db.Close() }()
+	var nickname, remark, alias sql.NullString
+	err = db.QueryRow(
+		"SELECT nick_name, remark, alias FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
+		strings.TrimSpace(username),
+	).Scan(&nickname, &remark, &alias)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ConversationMetadata{}, nil
+	}
+	if err != nil {
+		return ConversationMetadata{}, err
+	}
+	return ConversationMetadata{
+		Name:   conversationDisplayName(nickname.String, remark.String, alias.String),
+		Remark: strings.TrimSpace(remark.String),
+	}, nil
+}
+
+func ConversationMetadataFor(dbDir string, keys map[string]string, cacheDir, username string) (ConversationMetadata, error) {
+	cache, err := newDBCache(dbDir, cacheDir, keys)
+	if err != nil {
+		return ConversationMetadata{}, err
+	}
+	path, found, err := cache.get("contact/contact.db")
+	if err != nil || !found {
+		return ConversationMetadata{}, err
+	}
+	return conversationMetadataFromDB(path, username)
+}
+
 func RoomMessagePositionsFor(dbDir string, keys map[string]string, cacheDir, roomID string) (RoomMessagePositions, error) {
 	cache, err := newDBCache(dbDir, cacheDir, keys)
 	if err != nil {
@@ -362,6 +402,39 @@ func HasOutgoingText(dbDir string, keys map[string]string, cacheDir, roomID stri
 		}
 		_ = rows.Close()
 		_ = db.Close()
+	}
+	return false, nil
+}
+
+func HasOutgoingImage(dbDir string, keys map[string]string, cacheDir, roomID string, positions RoomMessagePositions) (bool, error) {
+	cache, err := newDBCache(dbDir, cacheDir, keys)
+	if err != nil {
+		return false, err
+	}
+	shards, err := findMessageShards(cache, roomID)
+	if err != nil {
+		return false, err
+	}
+	for _, shard := range shards {
+		position := positions[shard.relativePath]
+		db, err := openSQLite(shard.path)
+		if err != nil {
+			return false, err
+		}
+		query := fmt.Sprintf(`SELECT 1 FROM [%s]
+            WHERE ((create_time > ?) OR (create_time = ? AND local_id > ?))
+              AND (local_type & 4294967295) = 3
+              AND status = 2 AND origin_source = 1
+            LIMIT 1`, shard.table)
+		var found int
+		err = db.QueryRow(query, position.CreateTime, position.CreateTime, position.LocalID).Scan(&found)
+		_ = db.Close()
+		if err == nil {
+			return true, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
 	}
 	return false, nil
 }
@@ -828,10 +901,10 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	defer func() { _ = db.Close() }()
 	idToUsername := loadIDToUsername(db)
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
-            message_content, WCDB_CT_message_content, status, origin_source
-         FROM [%s]
-         WHERE create_time > ? OR (create_time = ? AND local_id > ?)
-         ORDER BY create_time ASC, local_id ASC LIMIT ?`, shard.table)
+			message_content, WCDB_CT_message_content
+		 FROM [%s]
+		 WHERE create_time > ? OR (create_time = ? AND local_id > ?)
+		 ORDER BY create_time ASC, local_id ASC LIMIT ?`, shard.table)
 	rows, err := db.Query(query, position.CreateTime, position.CreateTime, position.LocalID, limit)
 	if err != nil {
 		return nil, err
@@ -840,24 +913,22 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	var events []messageEvent
 	for rows.Next() {
 		var localID, serverID, localType, timestamp, realSenderID int64
-		var contentType, status, originSource sql.NullInt64
+		var contentType sql.NullInt64
 		var content []byte
-		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType, &status, &originSource); err != nil {
+		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType); err != nil {
 			continue
 		}
+		decoded := decompressMessage(content, contentType.Int64)
+		messageType, text := normalizedMessage(localType, decoded, group)
 		event := messageEvent{
 			room: username, shard: shard.relativePath,
 			position: MessagePosition{CreateTime: timestamp, LocalID: localID},
-		}
-		if status.Int64 == 3 && originSource.Int64 == 2 {
-			decoded := decompressMessage(content, contentType.Int64)
-			messageType, text := normalizedMessage(localType, decoded, group)
-			event.message = map[string]any{
+			message: map[string]any{
 				"msgid": strconv.FormatInt(serverID, 10), "local_id": localID,
-				"action": "send", "from": senderUsername(realSenderID, decoded, group, username, idToUsername),
+				"from":   senderUsername(realSenderID, decoded, group, username, idToUsername),
 				"tolist": []any{}, "roomid": username, "msgtime": saturatingMilliseconds(timestamp),
 				"msgtype": messageType, messageType: map[string]any{"content": text},
-			}
+			},
 		}
 		events = append(events, event)
 	}
@@ -1188,6 +1259,15 @@ func fileMtime(path string) int64 {
 
 func recipientDisplayName(username, nickname, remark, alias string) string {
 	for _, value := range []string{remark, nickname, alias, username} {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func conversationDisplayName(nickname, remark, alias string) string {
+	for _, value := range []string{nickname, remark, alias} {
 		if value = strings.TrimSpace(value); value != "" {
 			return value
 		}

@@ -63,6 +63,9 @@ func TestLoadCreatesStableILinkIdentity(t *testing.T) {
 	if first.PublicBaseURL != "https://webox.example.test/base" {
 		t.Fatalf("public base URL=%q", first.PublicBaseURL)
 	}
+	if first.MediaDir != filepath.Join(filepath.Dir(dir), "media") {
+		t.Fatalf("media directory=%q", first.MediaDir)
+	}
 	if !first.RemarkFilterEnabled {
 		t.Fatal("remark filter should be enabled by default")
 	}
