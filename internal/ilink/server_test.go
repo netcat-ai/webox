@@ -58,24 +58,26 @@ type fakeSender struct {
 	text       string
 	imagePath  string
 	filePath   string
+	items      []sender.Item
 	err        error
 }
 
-func (service *fakeSender) SendFile(_ context.Context, target, sharedPath string) (sender.Receipt, error) {
-	service.fileCalls++
-	service.target, service.filePath = target, sharedPath
-	return sender.Receipt{ClientMessageID: "ui-file"}, service.err
-}
-
-func (service *fakeSender) SendImage(_ context.Context, target, sharedPath string) (sender.Receipt, error) {
-	service.imageCalls++
-	service.target, service.imagePath = target, sharedPath
-	return sender.Receipt{ClientMessageID: "ui-image"}, service.err
-}
-
-func (service *fakeSender) SendText(_ context.Context, target, text string) (sender.Receipt, error) {
+func (service *fakeSender) Send(_ context.Context, target string, items []sender.Item) (sender.Receipt, error) {
 	service.calls++
-	service.target, service.text = target, text
+	service.target = target
+	service.items = append([]sender.Item(nil), items...)
+	for _, item := range items {
+		switch item.Kind {
+		case "text":
+			service.text = item.Text
+		case "image":
+			service.imageCalls++
+			service.imagePath = item.SharedPath
+		case "file":
+			service.fileCalls++
+			service.filePath = item.SharedPath
+		}
+	}
 	return sender.Receipt{ClientMessageID: "ui-message"}, service.err
 }
 
@@ -225,6 +227,28 @@ func TestSendMessageUsesContextAndClientIDIdempotency(t *testing.T) {
 	}
 }
 
+func TestSendMessageBatchesTextImageAndFile(t *testing.T) {
+	server, messages, outbound, _ := testServer(t)
+	messages.initialized = true
+	body := map[string]any{"msg": map[string]any{
+		"client_id": "batch-1", "context_token": server.contextToken("group@chatroom"),
+		"item_list": []any{
+			map[string]any{"type": fileItemType, "file_item": map[string]any{"shared_path": "outbox/report.txt"}},
+			map[string]any{"type": textItemType, "text_item": map[string]any{"text": "文件已整理完成"}},
+			map[string]any{"type": imageItemType, "image_item": map[string]any{"shared_path": "outbox/chart.png"}},
+			map[string]any{"type": textItemType, "text_item": map[string]any{"text": "请查收"}},
+		},
+	}}
+
+	response := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
+	if response.Code != http.StatusOK || outbound.calls != 1 || len(outbound.items) != 4 {
+		t.Fatalf("status=%d sender=%#v", response.Code, outbound)
+	}
+	if outbound.items[0].Kind != "file" || outbound.items[0].SharedPath != "outbox/report.txt" || outbound.items[1].Kind != "text" || outbound.items[1].Text != "文件已整理完成" || outbound.items[2].Kind != "image" || outbound.items[2].SharedPath != "outbox/chart.png" || outbound.items[3].Kind != "text" || outbound.items[3].Text != "请查收" {
+		t.Fatalf("items=%#v", outbound.items)
+	}
+}
+
 func TestSharedImageIsSentIdempotently(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
@@ -363,12 +387,19 @@ func TestIncomingUnavailableFileDoesNotBlockPolling(t *testing.T) {
 	}
 }
 
-func TestSendMessageRejectsMissingContextAndUnsupportedBinaryMedia(t *testing.T) {
+func TestSendMessageRejectsMissingContextLegacyTextAndUnsupportedMedia(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
-	missing := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{"text": "hello"}}, true)
+	textItem := []any{map[string]any{"type": textItemType, "text_item": map[string]any{"text": "hello"}}}
+	missing := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{"item_list": textItem}}, true)
 	if missing.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", missing.Code)
+	}
+	legacy := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{
+		"context_token": server.contextToken("wxid-a"), "text": "hello",
+	}}, true)
+	if legacy.Code != http.StatusBadRequest {
+		t.Fatalf("legacy status=%d", legacy.Code)
 	}
 
 	media := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{

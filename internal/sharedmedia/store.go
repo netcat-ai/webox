@@ -97,8 +97,8 @@ func messageIDHash(messageID string) string {
 	return hex.EncodeToString(hash[:16])
 }
 
-func (store *Store) ResolveOutboxImage(sharedPath string) (string, string, error) {
-	resolved, err := store.resolve(sharedPath, false)
+func (store *Store) ResolveImage(sharedPath string) (string, string, error) {
+	resolved, err := store.resolve(sharedPath)
 	if err != nil {
 		return "", "", err
 	}
@@ -120,7 +120,7 @@ func (store *Store) ResolveOutboxImage(sharedPath string) (string, string, error
 }
 
 func (store *Store) ResolveFile(sharedPath string) (string, string, error) {
-	resolved, err := store.resolve(sharedPath, true)
+	resolved, err := store.resolve(sharedPath)
 	if err != nil {
 		return "", "", err
 	}
@@ -131,7 +131,7 @@ func (store *Store) ResolveFile(sharedPath string) (string, string, error) {
 	return resolved, filename, nil
 }
 
-func (store *Store) resolve(sharedPath string, allowInbox bool) (string, error) {
+func (store *Store) resolve(sharedPath string) (string, error) {
 	sharedPath = strings.TrimSpace(sharedPath)
 	if sharedPath == "" || filepath.IsAbs(sharedPath) {
 		return "", errors.New("shared_path must be relative")
@@ -141,7 +141,7 @@ func (store *Store) resolve(sharedPath string, allowInbox bool) (string, error) 
 		return "", errors.New("shared_path escapes the shared media directory")
 	}
 	parts := strings.Split(filepath.ToSlash(clean), "/")
-	if len(parts) < 2 || parts[0] != "outbox" && (!allowInbox || parts[0] != "inbox") {
+	if len(parts) < 2 || parts[0] != "outbox" && parts[0] != "inbox" {
 		return "", errors.New("shared_path must be under an allowed shared media directory")
 	}
 	root, err := filepath.EvalSymlinks(store.root)

@@ -28,7 +28,7 @@ func TestWriteInboxAndResolveOutbox(t *testing.T) {
 	if err := os.WriteFile(outbox, png, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	resolved, contentType, err := store.ResolveOutboxImage("outbox/reply.png")
+	resolved, contentType, err := store.ResolveImage("outbox/reply.png")
 	resolvedInfo, resolvedErr := os.Stat(resolved)
 	outboxInfo, outboxErr := os.Stat(outbox)
 	if err != nil || resolvedErr != nil || outboxErr != nil || !os.SameFile(resolvedInfo, outboxInfo) || contentType != "image/png" {
@@ -36,7 +36,7 @@ func TestWriteInboxAndResolveOutbox(t *testing.T) {
 	}
 }
 
-func TestResolveOutboxRejectsEscapesAndNonImages(t *testing.T) {
+func TestResolveImageAcceptsInboxAndRejectsEscapesAndNonImages(t *testing.T) {
 	root := t.TempDir()
 	store, err := New(root)
 	if err != nil {
@@ -46,9 +46,16 @@ func TestResolveOutboxRejectsEscapesAndNonImages(t *testing.T) {
 	if err := os.WriteFile(plain, []byte("not an image"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"../secret.png", "inbox/message.png", "outbox/plain.txt"} {
-		if _, _, err := store.ResolveOutboxImage(path); err == nil {
-			t.Fatalf("ResolveOutboxImage accepted %q", path)
+	inbox := filepath.Join(root, "inbox", "message.png")
+	if err := os.WriteFile(inbox, append([]byte("\x89PNG\r\n\x1a\n"), []byte("image")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ResolveImage("inbox/message.png"); err != nil {
+		t.Fatalf("resolve inbox image: %v", err)
+	}
+	for _, path := range []string{"../secret.png", "outbox/plain.txt"} {
+		if _, _, err := store.ResolveImage(path); err == nil {
+			t.Fatalf("ResolveImage accepted %q", path)
 		}
 	}
 }

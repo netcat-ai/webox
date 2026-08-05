@@ -42,9 +42,7 @@ type messageSource interface {
 }
 
 type messageSender interface {
-	SendText(context.Context, string, string) (sender.Receipt, error)
-	SendImage(context.Context, string, string) (sender.Receipt, error)
-	SendFile(context.Context, string, string) (sender.Receipt, error)
+	Send(context.Context, string, []sender.Item) (sender.Receipt, error)
 }
 
 type qrSource interface {
@@ -98,7 +96,6 @@ type sendMessageRequest struct {
 type outboundMessage struct {
 	ClientID     string           `json:"client_id"`
 	ContextToken string           `json:"context_token"`
-	Text         string           `json:"text"`
 	Items        []map[string]any `json:"item_list"`
 }
 
@@ -420,24 +417,14 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeJSON(response, http.StatusOK, sessionUnavailable(""))
 		return
 	}
-	var mediaItem map[string]any
-	var mediaKind string
-	for _, item := range body.Message.Items {
-		for _, kind := range []string{"image", "file"} {
-			if _, found := item[kind+"_item"]; found {
-				if mediaItem != nil {
-					writeError(response, http.StatusBadRequest, "only one image or file item can be sent per request")
-					return
-				}
-				mediaItem, mediaKind = item, kind
-			}
-		}
-		for _, key := range []string{"voice_item", "video_item"} {
-			if _, found := item[key]; found {
-				writeError(response, http.StatusNotImplemented, "only text, image, and file sending are supported")
-				return
-			}
-		}
+	items, err := outboundItems(body.Message)
+	if errors.Is(err, errUnsupportedOutboundItem) {
+		writeError(response, http.StatusNotImplemented, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
 	}
 	clientID := strings.TrimSpace(body.Message.ClientID)
 	if len(clientID) > 128 {
@@ -463,28 +450,7 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 			return
 		}
 	}
-	var receipt sender.Receipt
-	var sendErr error
-	if mediaItem != nil {
-		sharedPath, resolveErr := outboundMediaPath(mediaItem, mediaKind+"_item")
-		if resolveErr != nil {
-			writeError(response, http.StatusBadRequest, resolveErr.Error())
-			return
-		}
-		switch mediaKind {
-		case "image":
-			receipt, sendErr = server.sender.SendImage(request.Context(), target, sharedPath)
-		case "file":
-			receipt, sendErr = server.sender.SendFile(request.Context(), target, sharedPath)
-		}
-	} else {
-		text := outboundText(body.Message)
-		if text == "" {
-			writeError(response, http.StatusBadRequest, "msg.text, text item, image item, or file item is required")
-			return
-		}
-		receipt, sendErr = server.sender.SendText(request.Context(), target, text)
-	}
+	receipt, sendErr := server.sender.Send(request.Context(), target, items)
 	if sendErr != nil {
 		server.logger.Error("could not send WeChat message", "target", target, "error", sendErr)
 		writeError(response, http.StatusInternalServerError, sendErr.Error())
@@ -658,21 +624,42 @@ func containsToken(tokens []string, expected string) bool {
 	return false
 }
 
-func outboundText(message outboundMessage) string {
-	if text := strings.TrimSpace(message.Text); text != "" {
-		return text
-	}
+var errUnsupportedOutboundItem = errors.New("only text, image, and file sending are supported")
+
+func outboundItems(message outboundMessage) ([]sender.Item, error) {
+	items := make([]sender.Item, 0, len(message.Items))
 	for _, item := range message.Items {
-		if text := strings.TrimSpace(stringValue(item["text"])); text != "" {
-			return text
-		}
-		if textItem, ok := item["text_item"].(map[string]any); ok {
-			if text := strings.TrimSpace(stringValue(textItem["text"])); text != "" {
-				return text
+		switch integerValue(item["type"]) {
+		case textItemType:
+			body, ok := item["text_item"].(map[string]any)
+			if !ok {
+				return nil, errors.New("text_item must be an object")
 			}
+			text := strings.TrimSpace(stringValue(body["text"]))
+			if text == "" {
+				return nil, errors.New("text_item.text is required")
+			}
+			items = append(items, sender.Item{Kind: "text", Text: text})
+		case imageItemType:
+			sharedPath, err := outboundImagePath(item)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, sender.Item{Kind: "image", SharedPath: sharedPath})
+		case fileItemType:
+			sharedPath, err := outboundFilePath(item)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, sender.Item{Kind: "file", SharedPath: sharedPath})
+		default:
+			return nil, errUnsupportedOutboundItem
 		}
 	}
-	return ""
+	if len(items) == 0 {
+		return nil, errors.New("msg.item_list is required")
+	}
+	return items, nil
 }
 
 func messageFingerprint(message outboundMessage) string {

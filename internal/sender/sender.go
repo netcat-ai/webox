@@ -29,65 +29,32 @@ type Receipt struct {
 	ClientMessageID string
 }
 
+type Item struct {
+	Kind       string
+	Text       string
+	SharedPath string
+}
+
+type preparedItem struct {
+	Kind        string
+	Text        string
+	Path        string
+	ContentType string
+	Filename    string
+}
+
 func New(state *wechat.State, media *sharedmedia.Store) *Service {
 	return &Service{wechat: state, media: media}
 }
 
-func (service *Service) SendText(ctx context.Context, target, text string) (Receipt, error) {
-	if text == "" || len(text) > maxTextLength {
-		return Receipt{}, errors.New("text is empty or too long")
-	}
-	return service.send(ctx, target, "text", "60s",
-		func(search string) string {
-			return sendTextScript(search, base64.StdEncoding.EncodeToString([]byte(text)))
-		},
-		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
-			return service.wechat.HasTextMessageAfter(positions, username, text)
-		})
-}
-
-func (service *Service) SendImage(ctx context.Context, target, sharedPath string) (Receipt, error) {
-	if service.media == nil {
-		return Receipt{}, errors.New("shared media store is unavailable")
-	}
-	path, contentType, err := service.media.ResolveOutboxImage(sharedPath)
-	if err != nil {
-		return Receipt{}, err
-	}
-	return service.send(ctx, target, "image", "80s",
-		func(search string) string { return sendImageScript(search, path, contentType) },
-		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
-			return service.wechat.HasImageMessageAfter(positions, username)
-		})
-}
-
-func (service *Service) SendFile(ctx context.Context, target, sharedPath string) (Receipt, error) {
-	if service.media == nil {
-		return Receipt{}, errors.New("shared media store is unavailable")
-	}
-	path, filename, err := service.media.ResolveFile(sharedPath)
-	if err != nil {
-		return Receipt{}, err
-	}
-	fileURL := (&url.URL{Scheme: "file", Path: path}).String() + "\r\n"
-	return service.send(ctx, target, "file", "80s",
-		func(search string) string {
-			return sendFileScript(search, base64.StdEncoding.EncodeToString([]byte(fileURL)))
-		},
-		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
-			return service.wechat.HasFileMessageAfter(positions, username, filename)
-		})
-}
-
-func (service *Service) send(
-	ctx context.Context,
-	target, kind, timeout string,
-	script func(searchBase64 string) string,
-	verify func(wechatdb.RoomMessagePositions, string) (bool, error),
-) (Receipt, error) {
+func (service *Service) Send(ctx context.Context, target string, items []Item) (Receipt, error) {
 	target = strings.TrimSpace(target)
 	if target == "" || len(target) > 200 {
 		return Receipt{}, errors.New("recipient is empty or too long")
+	}
+	prepared, err := service.prepareItems(items)
+	if err != nil {
+		return Receipt{}, err
 	}
 	recipient, err := service.wechat.ResolveRecipient(target)
 	if err != nil {
@@ -101,13 +68,14 @@ func (service *Service) send(
 	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
 		return receipt, nil
 	}
-	if err := runUIScript(ctx, timeout, script(base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm))), "send "+kind); err != nil {
+	search := base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm))
+	if err := runUIScript(ctx, "80s", sendItemsScript(search, prepared), "send message"); err != nil {
 		return Receipt{}, err
 	}
 	for range 20 {
-		found, err := verify(positions, recipient.Username)
+		found, err := service.verifyItems(positions, recipient.Username, prepared)
 		if err != nil {
-			return Receipt{}, fmt.Errorf("verify sent %s in WeChat db: %w", kind, err)
+			return Receipt{}, fmt.Errorf("verify sent message in WeChat db: %w", err)
 		}
 		if found {
 			return receipt, nil
@@ -118,43 +86,106 @@ func (service *Service) send(
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	return Receipt{}, fmt.Errorf("send verification failed: %s was not found in WeChat db", kind)
+	return Receipt{}, errors.New("send verification failed: not every item was found in WeChat db")
 }
 
-func sendTextScript(searchBase64, textBase64 string) string {
+func (service *Service) prepareItems(items []Item) ([]preparedItem, error) {
+	if len(items) == 0 {
+		return nil, errors.New("message items are empty")
+	}
+	prepared := make([]preparedItem, 0, len(items))
+	for _, item := range items {
+		switch item.Kind {
+		case "text":
+			text := strings.TrimSpace(item.Text)
+			if text == "" || len(text) > maxTextLength {
+				return nil, errors.New("text is empty or too long")
+			}
+			prepared = append(prepared, preparedItem{Kind: "text", Text: text})
+		case "image":
+			if service.media == nil {
+				return nil, errors.New("shared media store is unavailable")
+			}
+			path, contentType, err := service.media.ResolveImage(item.SharedPath)
+			if err != nil {
+				return nil, err
+			}
+			prepared = append(prepared, preparedItem{Kind: "image", Path: path, ContentType: contentType})
+		case "file":
+			if service.media == nil {
+				return nil, errors.New("shared media store is unavailable")
+			}
+			path, filename, err := service.media.ResolveFile(item.SharedPath)
+			if err != nil {
+				return nil, err
+			}
+			prepared = append(prepared, preparedItem{Kind: "file", Path: path, Filename: filename})
+		default:
+			return nil, fmt.Errorf("unsupported message item kind %q", item.Kind)
+		}
+	}
+	return prepared, nil
+}
+
+func (service *Service) verifyItems(positions wechatdb.RoomMessagePositions, username string, items []preparedItem) (bool, error) {
+	sent, err := service.wechat.OutgoingItemsAfter(positions, username)
+	if err != nil {
+		return false, err
+	}
+	return containsItems(sent, items), nil
+}
+
+func containsItems(sent []wechatdb.OutgoingItem, expected []preparedItem) bool {
+	counts := make(map[wechatdb.OutgoingItem]int, len(sent))
+	for _, item := range sent {
+		counts[item]++
+	}
+	for _, item := range expected {
+		key := wechatdb.OutgoingItem{Kind: item.Kind}
+		if item.Kind == "text" {
+			key.Value = item.Text
+		} else if item.Kind == "file" {
+			key.Value = item.Filename
+		}
+		if counts[key] == 0 {
+			return false
+		}
+		counts[key]--
+	}
+	return true
+}
+
+func sendItemsScript(searchBase64 string, items []preparedItem) string {
 	script := uiScriptPrelude()
+	script = append(script, openChatScript(searchBase64))
+	for _, item := range items {
+		switch item.Kind {
+		case "text":
+			script = append(script,
+				"set_clip "+shellQuoteSingle(base64.StdEncoding.EncodeToString([]byte(item.Text))),
+				"paste_clip",
+				"sleep 0.2",
+			)
+		case "image":
+			script = append(script,
+				"cleanup_clip",
+				"xclip -selection clipboard -target "+shellQuoteSingle(item.ContentType)+" -loops 5 -i "+shellQuoteSingle(item.Path)+" >/dev/null 2>&1 & clip_pid=$!",
+				"sleep 0.25",
+				"paste_clip",
+				"sleep 1",
+			)
+		case "file":
+			fileURL := (&url.URL{Scheme: "file", Path: item.Path}).String() + "\r\n"
+			script = append(script,
+				"cleanup_clip",
+				"printf '%s' "+shellQuoteSingle(base64.StdEncoding.EncodeToString([]byte(fileURL)))+" | base64 -d | xclip -selection clipboard -target text/uri-list -loops 5 -i >/dev/null 2>&1 & clip_pid=$!",
+				"sleep 0.25",
+				"paste_clip",
+				"sleep 1",
+			)
+		}
+	}
 	script = append(script,
-		openChatScript(searchBase64),
-		"set_clip "+shellQuoteSingle(textBase64),
-		"paste_clip",
-		"sleep 0.2",
-		"xdotool key --clearmodifiers Return",
-		"sleep 0.5",
-		"xdotool key --clearmodifiers ctrl+2",
-		"sleep 0.2",
-	)
-	return strings.Join(script, "; ")
-}
-
-func sendImageScript(searchBase64, imagePath, contentType string) string {
-	return sendMediaScript(searchBase64,
-		"xclip -selection clipboard -target "+shellQuoteSingle(contentType)+" -loops 5 -i "+shellQuoteSingle(imagePath)+" >/dev/null 2>&1 & clip_pid=$!")
-}
-
-func sendFileScript(searchBase64, fileURLBase64 string) string {
-	return sendMediaScript(searchBase64,
-		"printf '%s' "+shellQuoteSingle(fileURLBase64)+" | base64 -d | xclip -selection clipboard -target text/uri-list -loops 5 -i >/dev/null 2>&1 & clip_pid=$!")
-}
-
-func sendMediaScript(searchBase64, loadClipboard string) string {
-	script := uiScriptPrelude()
-	script = append(script,
-		openChatScript(searchBase64),
-		"cleanup_clip",
-		loadClipboard,
-		"sleep 0.25",
-		"paste_clip",
-		"sleep 1",
 		"xdotool key --clearmodifiers Return",
 		"sleep 0.7",
 		"xdotool key --clearmodifiers ctrl+2",

@@ -352,46 +352,18 @@ func (state *State) RoomMessagePositions(target string) (wechatdb.RoomMessagePos
 	return positions, nil
 }
 
-func (state *State) HasTextMessageAfter(positions wechatdb.RoomMessagePositions, target, text string) (bool, error) {
+func (state *State) OutgoingItemsAfter(positions wechatdb.RoomMessagePositions, target string) ([]wechatdb.OutgoingItem, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, _, err := state.readyDatabase()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	found, err := database.HasOutgoingText(target, positions, text)
+	items, err := database.OutgoingItemsAfter(target, positions)
 	if err != nil {
-		return false, state.dbError("verify outgoing WeChat text", err)
+		return nil, state.dbError("verify outgoing WeChat items", err)
 	}
-	return found, nil
-}
-
-func (state *State) HasImageMessageAfter(positions wechatdb.RoomMessagePositions, target string) (bool, error) {
-	state.dbMu.Lock()
-	defer state.dbMu.Unlock()
-	database, _, err := state.readyDatabase()
-	if err != nil {
-		return false, err
-	}
-	found, err := database.HasOutgoingImage(target, positions)
-	if err != nil {
-		return false, state.dbError("verify outgoing WeChat image", err)
-	}
-	return found, nil
-}
-
-func (state *State) HasFileMessageAfter(positions wechatdb.RoomMessagePositions, target, filename string) (bool, error) {
-	state.dbMu.Lock()
-	defer state.dbMu.Unlock()
-	database, _, err := state.readyDatabase()
-	if err != nil {
-		return false, err
-	}
-	found, err := database.HasOutgoingFile(target, positions, filename)
-	if err != nil {
-		return false, state.dbError("verify outgoing WeChat file", err)
-	}
-	return found, nil
+	return items, nil
 }
 
 func (state *State) ReadImage(roomID, messageID string) (*wechatdb.MediaFile, error) {

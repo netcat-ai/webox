@@ -47,6 +47,11 @@ type MessagePosition struct {
 type MessagePositions map[string]map[string]MessagePosition
 type RoomMessagePositions map[string]MessagePosition
 
+type OutgoingItem struct {
+	Kind  string
+	Value string
+}
+
 type storedMessage struct {
 	localID   int64
 	localType int64
@@ -363,40 +368,13 @@ func (store *Store) RoomMessagePositionsFor(roomID string) (RoomMessagePositions
 	return positions, nil
 }
 
-func (store *Store) HasOutgoingText(roomID string, positions RoomMessagePositions, text string) (bool, error) {
-	group := strings.HasSuffix(roomID, "@chatroom")
-	return store.hasOutgoingMessage(roomID, positions,
-		func(localType int64, content []byte, contentType int64) bool {
-			return baseType(localType) == 1 && stripGroupPrefix(decompressMessage(content, contentType), group) == text
-		})
-}
-
-func (store *Store) HasOutgoingImage(roomID string, positions RoomMessagePositions) (bool, error) {
-	return store.hasOutgoingMessage(roomID, positions,
-		func(localType int64, _ []byte, _ int64) bool { return baseType(localType) == 3 })
-}
-
-func (store *Store) HasOutgoingFile(roomID string, positions RoomMessagePositions, filename string) (bool, error) {
-	filename = strings.TrimSpace(filename)
-	return store.hasOutgoingMessage(roomID, positions,
-		func(localType int64, content []byte, contentType int64) bool {
-			if baseType(localType) != 49 {
-				return false
-			}
-			metadata, ok := parseFileMessage(decompressMessage(content, contentType))
-			return ok && metadata.Filename == filename
-		})
-}
-
-func (store *Store) hasOutgoingMessage(
-	roomID string,
-	positions RoomMessagePositions,
-	match func(localType int64, content []byte, contentType int64) bool,
-) (bool, error) {
+func (store *Store) OutgoingItemsAfter(roomID string, positions RoomMessagePositions) ([]OutgoingItem, error) {
 	shards, err := findMessageShards(store, roomID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
+	group := strings.HasSuffix(roomID, "@chatroom")
+	var items []OutgoingItem
 	for _, shard := range shards {
 		position := positions[shard.relativePath]
 		db := shard.db
@@ -415,9 +393,17 @@ func (store *Store) hasOutgoingMessage(
 			if rows.Scan(&localType, &content, &contentType) != nil {
 				continue
 			}
-			if match(localType, content, contentType.Int64) {
-				_ = rows.Close()
-				return true, nil
+			switch baseType(localType) {
+			case 1:
+				text := decompressMessage(content, contentType.Int64)
+				items = append(items, OutgoingItem{Kind: "text", Value: stripGroupPrefix(text, group)})
+			case 3:
+				items = append(items, OutgoingItem{Kind: "image"})
+			case 49:
+				content := decompressMessage(content, contentType.Int64)
+				if metadata, ok := parseFileMessage(content); ok {
+					items = append(items, OutgoingItem{Kind: "file", Value: metadata.Filename})
+				}
 			}
 		}
 		rowsErr := rows.Err()
@@ -426,7 +412,7 @@ func (store *Store) hasOutgoingMessage(
 			continue
 		}
 	}
-	return false, nil
+	return items, nil
 }
 
 func scanKeys(dbDir string) ([]keyEntry, error) {

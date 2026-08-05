@@ -80,20 +80,21 @@ Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返�
 ## 发消息
 
 ```text
-POST sendmessage(msg.context_token, msg.client_id, text/image/file item)
+POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...])
   -> authenticate bot token
   -> verify and decode context_token
   -> check client_id idempotency
   -> resolve recipient and unique remark
   -> resolve media shared_path under /webox/state/media/inbox or outbox
-  -> activate WeChat, paste clipboard contents and send
-  -> verify the text, image, or file in the same local DB conversation
+  -> activate WeChat once, paste every item into the same composer, press Enter once
+  -> verify every expected text, image, and file in the same local DB conversation
   -> cache receipt and return ret=0
 ```
 
 服务只信任签名 `context_token` 中的目标，不信任调用方可修改的 `to_user_id`。同一 `client_id` 和相同内容重试直接返回第一次结果；同一 ID 携带不同内容会被拒绝。缓存有 1024 条上限，进程重启后清空。
 
-整个发送路径由互斥锁串行化。文本、图片和文件都通过剪贴板粘贴，不使用附件按钮、文件选择器或坐标点击。HTTP 成功
+整个发送路径由互斥锁串行化。一个 `item_list` 是一次 UI 发送：文本、图片和文件都通过剪贴板依次粘贴，最后只按一次 Enter，
+不使用附件按钮、文件选择器或坐标点击，也不维护逐 item 发送进度。HTTP 成功
 表示 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 
 ## 辅助接口
