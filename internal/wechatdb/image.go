@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -179,13 +180,48 @@ func decodeImageDat(accountDir, attachRoot, path, md5Value string) (*MediaFile, 
 		return nil, err
 	}
 	if bytes.HasPrefix(data, []byte("wxgf")) {
-		return nil, errors.New("unsupported V2 WeChat image payload: wxgf conversion is disabled")
+		data, err = convertWXGFToJPEG(data)
+		if err != nil {
+			return nil, err
+		}
 	}
 	contentType := imageContentType(data)
 	if contentType == "" {
 		return nil, errors.New("decoded WeChat image has an unsupported format")
 	}
 	return &MediaFile{Data: data, ContentType: contentType, Filename: md5Value + imageExtension(contentType)}, nil
+}
+
+func convertWXGFToJPEG(data []byte) ([]byte, error) {
+	payload := wxgfHEVCPayload(data)
+	if payload == nil {
+		return nil, errors.New("wxgf image has no HEVC payload")
+	}
+	command := exec.Command(
+		"ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "hevc", "-i", "pipe:0",
+		"-frames:v", "1", "-q:v", "2", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
+	)
+	command.Stdin = bytes.NewReader(payload)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	jpeg, err := command.Output()
+	if err != nil {
+		return nil, fmt.Errorf("convert wxgf with ffmpeg: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if imageContentType(jpeg) != "image/jpeg" {
+		return nil, errors.New("ffmpeg did not produce a JPEG image from wxgf")
+	}
+	return jpeg, nil
+}
+
+func wxgfHEVCPayload(data []byte) []byte {
+	if !bytes.HasPrefix(data, []byte("wxgf")) {
+		return nil
+	}
+	if offset := bytes.Index(data, []byte{0, 0, 0, 1}); offset >= 0 {
+		return data[offset:]
+	}
+	return nil
 }
 
 func imageKey(accountDir, attachRoot string) (imageKeyMaterial, error) {
