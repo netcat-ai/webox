@@ -38,11 +38,13 @@ type messageSource interface {
 	ValidatePollCursor(string) error
 	PollMessages(string, int) (wechat.PollResult, error)
 	ReadImage(string, string) (*wechatdb.MediaFile, error)
+	ReadFile(string, string) (*wechatdb.LocalFile, error)
 }
 
 type messageSender interface {
 	SendText(context.Context, string, string) (sender.Receipt, error)
 	SendImage(context.Context, string, string) (sender.Receipt, error)
+	SendFile(context.Context, string, string) (sender.Receipt, error)
 }
 
 type qrSource interface {
@@ -337,14 +339,39 @@ func (server *Server) standardMessage(message map[string]any) (map[string]any, e
 		"msg_id": externalID, "text_item": map[string]any{"text": text},
 	}}
 	sharedPath := ""
-	if messageType(message) == "image" {
-		sharedPath, err = server.materializeInboundImage(roomID, externalID)
-		if err != nil {
-			return nil, err
+	kind := messageType(message)
+	if kind == "image" {
+		imageSharedPath, imageErr := server.materializeInboundImage(roomID, externalID)
+		if imageErr != nil {
+			server.logger.Warn("WeChat image is unavailable", "msgid", externalID, "error", imageErr)
+		}
+		sharedPath = imageSharedPath
+		imageItem := map[string]any{"available": sharedPath != ""}
+		if sharedPath != "" {
+			imageItem["shared_path"] = sharedPath
 		}
 		items = []map[string]any{{
 			"type": imageItemType, "create_time_ms": createdAt, "is_completed": true,
-			"msg_id": externalID, "image_item": map[string]any{"shared_path": sharedPath},
+			"msg_id": externalID, "image_item": imageItem,
+		}}
+	} else if kind == "file" {
+		body, _ := message["file"].(map[string]any)
+		filename := strings.TrimSpace(stringValue(body["filename"]))
+		file, fileSharedPath, fileErr := server.materializeInboundFile(roomID, externalID)
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		if file != nil {
+			filename = file.Filename
+			sharedPath = fileSharedPath
+		}
+		fileItem := map[string]any{"filename": filename, "available": sharedPath != ""}
+		if sharedPath != "" {
+			fileItem["shared_path"] = sharedPath
+		}
+		items = []map[string]any{{
+			"type": fileItemType, "create_time_ms": createdAt, "is_completed": true,
+			"msg_id": externalID, "file_item": fileItem,
 		}}
 	}
 	view := map[string]any{
@@ -359,6 +386,14 @@ func (server *Server) standardMessage(message map[string]any) (map[string]any, e
 	}
 	if sharedPath != "" {
 		view["shared_path"] = sharedPath
+	}
+	if kind == "file" {
+		body, _ := items[0]["file_item"].(map[string]any)
+		view["filename"] = stringValue(body["filename"])
+		view["file_available"] = body["available"]
+	} else if kind == "image" {
+		body, _ := items[0]["image_item"].(map[string]any)
+		view["image_available"] = body["available"]
 	}
 	if name := strings.TrimSpace(stringValue(message["conversation_name"])); name != "" {
 		view["conversation_name"] = name
@@ -385,18 +420,21 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeJSON(response, http.StatusOK, sessionUnavailable(""))
 		return
 	}
-	var imageItem map[string]any
+	var mediaItem map[string]any
+	var mediaKind string
 	for _, item := range body.Message.Items {
-		if _, found := item["image_item"]; found {
-			if imageItem != nil {
-				writeError(response, http.StatusBadRequest, "only one image item can be sent per request")
-				return
+		for _, kind := range []string{"image", "file"} {
+			if _, found := item[kind+"_item"]; found {
+				if mediaItem != nil {
+					writeError(response, http.StatusBadRequest, "only one image or file item can be sent per request")
+					return
+				}
+				mediaItem, mediaKind = item, kind
 			}
-			imageItem = item
 		}
-		for _, key := range []string{"voice_item", "file_item", "video_item"} {
+		for _, key := range []string{"voice_item", "video_item"} {
 			if _, found := item[key]; found {
-				writeError(response, http.StatusNotImplemented, "only text and image sending are supported")
+				writeError(response, http.StatusNotImplemented, "only text, image, and file sending are supported")
 				return
 			}
 		}
@@ -427,17 +465,22 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 	}
 	var receipt sender.Receipt
 	var sendErr error
-	if imageItem != nil {
-		sharedPath, resolveErr := outboundImagePath(imageItem)
+	if mediaItem != nil {
+		sharedPath, resolveErr := outboundMediaPath(mediaItem, mediaKind+"_item")
 		if resolveErr != nil {
 			writeError(response, http.StatusBadRequest, resolveErr.Error())
 			return
 		}
-		receipt, sendErr = server.sender.SendImage(request.Context(), target, sharedPath)
+		switch mediaKind {
+		case "image":
+			receipt, sendErr = server.sender.SendImage(request.Context(), target, sharedPath)
+		case "file":
+			receipt, sendErr = server.sender.SendFile(request.Context(), target, sharedPath)
+		}
 	} else {
 		text := outboundText(body.Message)
 		if text == "" {
-			writeError(response, http.StatusBadRequest, "msg.text, text item, or image item is required")
+			writeError(response, http.StatusBadRequest, "msg.text, text item, image item, or file item is required")
 			return
 		}
 		receipt, sendErr = server.sender.SendText(request.Context(), target, text)

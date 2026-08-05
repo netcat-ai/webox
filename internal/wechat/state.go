@@ -40,6 +40,8 @@ type State struct {
 	initialized      atomic.Bool
 	lastValidationAt atomic.Int64
 	dbMu             sync.Mutex
+	database         *wechatdb.Store
+	wxid             string
 	errorMu          sync.Mutex
 	lastError        string
 }
@@ -180,12 +182,19 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 	if materialErr == nil && (material.WXID != activeWXID || wechatdb.AccountIDFromDBDir(material.DBDir) != activeWXID) {
 		materialErr = errors.New("stored WeChat database key belongs to another account")
 	}
-	if state.IsInitialized() && materialErr == nil && time.Since(time.Unix(state.lastValidationAt.Load(), 0)) < keyValidationPeriod {
-		return Ready, nil
+	if state.IsInitialized() && state.database != nil && materialErr == nil {
+		if time.Since(time.Unix(state.lastValidationAt.Load(), 0)) < keyValidationPeriod {
+			return Ready, nil
+		}
+		if _, err := state.database.CurrentSessionState(); err == nil {
+			state.lastValidationAt.Store(time.Now().Unix())
+			return Ready, nil
+		}
 	}
 	state.initialized.Store(false)
+	var database *wechatdb.Store
 	if materialErr == nil {
-		_, materialErr = wechatdb.CurrentSessionState(material.DBDir, material.Keys, state.cacheDir())
+		database, materialErr = openDatabase(material)
 	}
 	if materialErr != nil {
 		init, err := wechatdb.InitFromMemory()
@@ -193,13 +202,20 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 			return WaitingForLogin, fmt.Errorf("extract wechat message keys during automatic initialization: %w", err)
 		}
 		material = keyFile{WXID: init.WXID, DBDir: init.DBDir, Keys: init.Keys}
-		if err := state.writeKey(material); err != nil {
-			return WaitingForLogin, err
-		}
-		if _, err := wechatdb.CurrentSessionState(material.DBDir, material.Keys, state.cacheDir()); err != nil {
+		database, err = openDatabase(material)
+		if err != nil {
 			return WaitingForLogin, fmt.Errorf("validate wechat database keys: %w", err)
 		}
+		if err := state.writeKey(material); err != nil {
+			_ = database.Close()
+			return WaitingForLogin, err
+		}
 	}
+	if state.database != nil && state.database != database {
+		_ = state.database.Close()
+	}
+	state.database = database
+	state.wxid = material.WXID
 	state.initialized.Store(true)
 	state.lastValidationAt.Store(time.Now().Unix())
 	state.setError("")
@@ -247,7 +263,7 @@ func (state *State) DismissPostLoginOverlay() (bool, error) {
 func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, _, err := state.readyDatabase()
 	if err != nil {
 		return PollResult{}, err
 	}
@@ -255,7 +271,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 	var cursor dbCursor
 	if strings.TrimSpace(rawCursor) == "" {
 		cursor.StartedAt = time.Now().Unix()
-		cursor.Positions, err = wechatdb.BaselinePositions(material.DBDir, material.Keys, state.cacheDir(), cursor.StartedAt)
+		cursor.Positions, err = database.BaselinePositions(cursor.StartedAt)
 		if err != nil {
 			return PollResult{}, state.dbError("baseline WeChat messages", err)
 		}
@@ -268,7 +284,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 	if cursor.StartedAt <= 0 {
 		return PollResult{}, errors.New("unsupported get_updates_buf")
 	}
-	data, err := wechatdb.PollNewMessages(material.DBDir, material.Keys, cursor.Positions, cursor.StartedAt, limit, state.cacheDir())
+	data, err := database.PollNewMessages(cursor.Positions, cursor.StartedAt, limit)
 	if err != nil {
 		return PollResult{}, state.dbError("poll WeChat messages", err)
 	}
@@ -283,7 +299,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 		return left.room < right.room
 	})
 	metadataByRoom, err := addConversationMetadata(data.Messages, func(roomID string) (wechatdb.ConversationMetadata, error) {
-		return wechatdb.ConversationMetadataFor(material.DBDir, material.Keys, state.cacheDir(), roomID)
+		return database.ConversationMetadataFor(roomID)
 	})
 	if err != nil {
 		if state.remarkFilterEnabled {
@@ -308,11 +324,11 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, wxid, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	recipient, err := wechatdb.ResolveRecipient(material.DBDir, material.Keys, state.cacheDir(), username, material.WXID)
+	recipient, err := database.ResolveRecipient(username, wxid)
 	if err != nil {
 		return nil, state.dbError("resolve WeChat recipient", err)
 	}
@@ -325,11 +341,11 @@ func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, erro
 func (state *State) RoomMessagePositions(target string) (wechatdb.RoomMessagePositions, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	positions, err := wechatdb.RoomMessagePositionsFor(material.DBDir, material.Keys, state.cacheDir(), target)
+	positions, err := database.RoomMessagePositionsFor(target)
 	if err != nil {
 		return nil, state.dbError("read WeChat message positions", err)
 	}
@@ -339,11 +355,11 @@ func (state *State) RoomMessagePositions(target string) (wechatdb.RoomMessagePos
 func (state *State) HasTextMessageAfter(positions wechatdb.RoomMessagePositions, target, text string) (bool, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, _, err := state.readyDatabase()
 	if err != nil {
 		return false, err
 	}
-	found, err := wechatdb.HasOutgoingText(material.DBDir, material.Keys, state.cacheDir(), target, positions, text)
+	found, err := database.HasOutgoingText(target, positions, text)
 	if err != nil {
 		return false, state.dbError("verify outgoing WeChat text", err)
 	}
@@ -353,13 +369,27 @@ func (state *State) HasTextMessageAfter(positions wechatdb.RoomMessagePositions,
 func (state *State) HasImageMessageAfter(positions wechatdb.RoomMessagePositions, target string) (bool, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, _, err := state.readyDatabase()
 	if err != nil {
 		return false, err
 	}
-	found, err := wechatdb.HasOutgoingImage(material.DBDir, material.Keys, state.cacheDir(), target, positions)
+	found, err := database.HasOutgoingImage(target, positions)
 	if err != nil {
 		return false, state.dbError("verify outgoing WeChat image", err)
+	}
+	return found, nil
+}
+
+func (state *State) HasFileMessageAfter(positions wechatdb.RoomMessagePositions, target, filename string) (bool, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, _, err := state.readyDatabase()
+	if err != nil {
+		return false, err
+	}
+	found, err := database.HasOutgoingFile(target, positions, filename)
+	if err != nil {
+		return false, state.dbError("verify outgoing WeChat file", err)
 	}
 	return found, nil
 }
@@ -367,26 +397,52 @@ func (state *State) HasImageMessageAfter(positions wechatdb.RoomMessagePositions
 func (state *State) ReadImage(roomID, messageID string) (*wechatdb.MediaFile, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	material, err := state.readyMaterial()
+	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	media, err := wechatdb.ReadImage(material.DBDir, material.Keys, state.cacheDir(), roomID, messageID)
+	media, err := database.ReadImage(roomID, messageID)
 	if err != nil {
 		return nil, state.dbError("read WeChat image", err)
 	}
 	return media, nil
 }
 
-func (state *State) readyMaterial() (keyFile, error) {
-	if !state.IsInitialized() {
-		return keyFile{}, errors.New("wechat automatic initialization is not complete")
-	}
-	material, err := state.readKey()
+func (state *State) ReadFile(roomID, messageID string) (*wechatdb.LocalFile, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, _, err := state.readyDatabase()
 	if err != nil {
-		state.RecordInitError(fmt.Errorf("load WeChat database keys: %w", err))
+		return nil, err
 	}
-	return material, err
+	file, err := database.ReadFile(roomID, messageID)
+	if err != nil {
+		return nil, state.dbError("read WeChat file", err)
+	}
+	return file, nil
+}
+
+func (state *State) readyDatabase() (*wechatdb.Store, string, error) {
+	if !state.IsInitialized() {
+		return nil, "", errors.New("wechat automatic initialization is not complete")
+	}
+	if state.database == nil {
+		state.RecordInitError(errors.New("WeChat database is not open"))
+		return nil, "", errors.New("WeChat database is not open")
+	}
+	return state.database, state.wxid, nil
+}
+
+func openDatabase(material keyFile) (*wechatdb.Store, error) {
+	database, err := wechatdb.Open(material.DBDir, material.Keys)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := database.CurrentSessionState(); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	return database, nil
 }
 
 func (state *State) readKey() (keyFile, error) {
@@ -427,8 +483,6 @@ func (state *State) writeKey(material keyFile) error {
 func (state *State) encodeCursor(cursor dbCursor) (string, error) {
 	return signedpayload.Encode(state.cursorKey, cursor)
 }
-
-func (state *State) cacheDir() string { return filepath.Join(state.stateDir, "cache") }
 
 func (state *State) dbError(operation string, err error) error {
 	wrapped := fmt.Errorf("%s: %w", operation, err)

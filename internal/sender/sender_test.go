@@ -48,6 +48,23 @@ func TestSendImageUsesClipboardWithoutAttachmentOrSendButtonClicks(t *testing.T)
 	}
 }
 
+func TestSendFileUsesURIListClipboardWithoutCoordinates(t *testing.T) {
+	script := sendFileScript("target", "ZmlsZTovLy90bXAvcmVwb3J0LnBkZg0K")
+	for _, required := range []string{
+		"xclip -selection clipboard -target text/uri-list -loops 5 -i",
+		"paste_clip", "key --clearmodifiers Return", "key --clearmodifiers ctrl+2",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("script does not contain %q: %s", required, script)
+		}
+	}
+	for _, forbidden := range []string{"ctrl+l", "file_x", "send_x", "getwindowgeometry", "mousemove", "click"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("script contains file coordinate action %q", forbidden)
+		}
+	}
+}
+
 func TestUIPreludeDoesNotDependOnWindowGeometry(t *testing.T) {
 	script := strings.Join(uiScriptPrelude(), "; ")
 	for _, forbidden := range []string{"getwindowgeometry", "mousemove", "click"} {

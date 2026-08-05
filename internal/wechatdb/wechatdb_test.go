@@ -3,12 +3,12 @@ package wechatdb
 import (
 	"bytes"
 	"crypto/aes"
-	"crypto/cipher"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -76,6 +76,15 @@ func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing
 	}
 }
 
+func TestNormalizedMessageRecognizesFileAppMessage(t *testing.T) {
+	content := "wxid_sender:\n" + `<msg><appmsg><title>report.pdf</title><type>6</type>` +
+		`<appattach><totallen>42</totallen></appattach></appmsg></msg>`
+	kind, got := normalizedMessage(int64(6)*4294967296+49, content, true)
+	if kind != "file" || got != "[文件] report.pdf" {
+		t.Fatalf("normalizedMessage()=(%q, %q)", kind, got)
+	}
+}
+
 func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
@@ -94,11 +103,9 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 			row.id, 100+row.id, 1, 1000, 0, row.text, 0, row.status, row.origin,
 		)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = db.Close() }()
 	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", path: path, table: "Msg_test"},
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
 		"alice", false, MessagePosition{CreateTime: 999}, 100,
 	)
 	if err != nil {
@@ -120,11 +127,9 @@ func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 	db := createMessageDB(t, path)
 	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (1, 101, 1, 1000, 0, 'first', 0, 3, 2)")
 	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'second', 0, 3, 2)")
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = db.Close() }()
 	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", path: path, table: "Msg_test"},
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
 		"alice", false, MessagePosition{CreateTime: 1000, LocalID: 1}, 100,
 	)
 	if err != nil {
@@ -135,82 +140,59 @@ func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 	}
 }
 
-func TestDecryptPageRestoresSQLitePayload(t *testing.T) {
-	key := bytes.Repeat([]byte{0x21}, 32)
-	plain := make([]byte, pageSize)
-	copy(plain, sqliteHeader)
-	for index := 16; index < pageSize-reserveSize; index++ {
-		plain[index] = byte(index % 251)
-	}
-	iv := bytes.Repeat([]byte{0x42}, aes.BlockSize)
-	encrypted := make([]byte, pageSize)
-	copy(encrypted[:saltSize], bytes.Repeat([]byte{0x11}, saltSize))
-	copy(encrypted[pageSize-reserveSize:], iv)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(
-		encrypted[saltSize:pageSize-reserveSize],
-		plain[16:pageSize-reserveSize],
+func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (1, 0, 1, 1000, 0, 'pending', 0, 2, 1)")
+	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'ready', 0, 3, 2)")
+	defer func() { _ = db.Close() }()
+	events, err := queryNewTable(
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
+		"alice", false, MessagePosition{CreateTime: 999}, 100,
 	)
-	decrypted, err := decryptPage(key, encrypted, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(decrypted[:pageSize-reserveSize], plain[:pageSize-reserveSize]) {
-		t.Fatal("decrypted page does not match plaintext")
+	if len(events) != 1 || events[0].position.LocalID != 2 {
+		t.Fatalf("unexpected events: %#v", events)
 	}
 }
 
-func TestApplyWALDecryptsFirstPageAsSQLiteHeader(t *testing.T) {
-	key := bytes.Repeat([]byte{0x21}, 32)
-	plain := make([]byte, pageSize)
-	copy(plain, sqliteHeader)
-	for index := 16; index < pageSize-reserveSize; index++ {
-		plain[index] = byte(index % 251)
+func TestSQLCipherStoreReadsCommittedWALChanges(t *testing.T) {
+	dbDir := t.TempDir()
+	sessionDir := filepath.Join(dbDir, "session")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	iv := bytes.Repeat([]byte{0x42}, aes.BlockSize)
-	encrypted := make([]byte, pageSize)
-	copy(encrypted[:saltSize], bytes.Repeat([]byte{0x11}, saltSize))
-	copy(encrypted[pageSize-reserveSize:], iv)
-	block, err := aes.NewCipher(key)
+	path := filepath.Join(sessionDir, "session.db")
+	key := strings.Repeat("21", 32)
+	writer, err := sql.Open("sqlite3", path+"?_pragma_key=x'"+key+"'&_pragma_cipher_page_size=4096")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(
-		encrypted[saltSize:pageSize-reserveSize],
-		plain[16:pageSize-reserveSize],
-	)
+	defer func() { _ = writer.Close() }()
+	mustExec(t, writer, "PRAGMA journal_mode=WAL")
+	mustExec(t, writer, "PRAGMA wal_autocheckpoint=0")
+	mustExec(t, writer, "CREATE TABLE SessionTable (username TEXT PRIMARY KEY, last_timestamp INTEGER)")
+	mustExec(t, writer, "INSERT INTO SessionTable VALUES ('alice', 100)")
 
-	directory := t.TempDir()
-	outputPath := filepath.Join(directory, "message.db")
-	if err := os.WriteFile(outputPath, make([]byte, pageSize), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	const salt1, salt2 = uint32(0x10203040), uint32(0x50607080)
-	wal := make([]byte, walHeaderSize+walFrameHeader+pageSize)
-	binary.BigEndian.PutUint32(wal[16:20], salt1)
-	binary.BigEndian.PutUint32(wal[20:24], salt2)
-	frameHeader := wal[walHeaderSize : walHeaderSize+walFrameHeader]
-	binary.BigEndian.PutUint32(frameHeader[:4], 1)
-	binary.BigEndian.PutUint32(frameHeader[8:12], salt1)
-	binary.BigEndian.PutUint32(frameHeader[12:16], salt2)
-	copy(wal[walHeaderSize+walFrameHeader:], encrypted)
-	walPath := filepath.Join(directory, "message.db-wal")
-	if err := os.WriteFile(walPath, wal, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := applyWAL(walPath, outputPath, key); err != nil {
-		t.Fatal(err)
-	}
-	decrypted, err := os.ReadFile(outputPath)
+	store, err := Open(dbDir, map[string]string{"session/session.db": key})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(decrypted[:pageSize-reserveSize], plain[:pageSize-reserveSize]) {
-		t.Fatal("WAL page 1 was not decrypted as a SQLite first page")
+	defer func() { _ = store.Close() }()
+	state, err := store.CurrentSessionState()
+	if err != nil || state["alice"] != 100 {
+		t.Fatalf("initial state=%v err=%v", state, err)
+	}
+
+	mustExec(t, writer, "UPDATE SessionTable SET last_timestamp=200 WHERE username='alice'")
+	state, err = store.CurrentSessionState()
+	if err != nil || state["alice"] != 200 {
+		t.Fatalf("updated state=%v err=%v", state, err)
+	}
+	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("encrypted WAL was not present: info=%v err=%v", info, err)
 	}
 }
 

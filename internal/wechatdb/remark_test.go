@@ -19,11 +19,9 @@ func TestConversationRemarkReadsTheExplicitContactRemark(t *testing.T) {
 		"INSERT INTO contact(username, nick_name, remark, alias, delete_flag) VALUES (?, ?, ?, ?, ?)",
 		"family@chatroom", "Family", "webox.family", "family", 0,
 	)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = db.Close() }()
 
-	remark, err := conversationRemarkFromDB(path, "family@chatroom")
+	remark, err := conversationRemarkFromDB(db, "family@chatroom")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,11 +43,9 @@ func TestConversationMetadataPrefersNicknameAndIncludesRemark(t *testing.T) {
 		"INSERT INTO contact(username, nick_name, remark, alias, delete_flag) VALUES (?, ?, ?, ?, ?)",
 		"family@chatroom", "Family Chat", "webox.family", "family", 0,
 	)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = db.Close() }()
 
-	metadata, err := conversationMetadataFromDB(path, "family@chatroom")
+	metadata, err := conversationMetadataFromDB(db, "family@chatroom")
 	if err != nil {
 		t.Fatal(err)
 	}

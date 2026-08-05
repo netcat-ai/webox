@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
+	"github.com/netcat-ai/webox/internal/wechatdb"
 )
 
 const maxTextLength = 5000
@@ -32,66 +34,66 @@ func New(state *wechat.State, media *sharedmedia.Store) *Service {
 }
 
 func (service *Service) SendText(ctx context.Context, target, text string) (Receipt, error) {
-	target = strings.TrimSpace(target)
-	if target == "" || len(target) > 200 {
-		return Receipt{}, errors.New("recipient is empty or too long")
-	}
 	if text == "" || len(text) > maxTextLength {
 		return Receipt{}, errors.New("text is empty or too long")
 	}
-	recipient, err := service.wechat.ResolveRecipient(target)
-	if err != nil {
-		return Receipt{}, err
-	}
-	beforeSend, err := service.wechat.RoomMessagePositions(recipient.Username)
-	if err != nil {
-		return Receipt{}, err
-	}
-	receipt := Receipt{ClientMessageID: randomID()}
-	script := sendTextScript(
-		base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm)),
-		base64.StdEncoding.EncodeToString([]byte(text)),
-	)
-	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
-		return receipt, nil
-	}
-	if err := runUIScript(ctx, "60s", script, "send text"); err != nil {
-		return Receipt{}, err
-	}
-	for range 20 {
-		found, err := service.wechat.HasTextMessageAfter(beforeSend, recipient.Username, text)
-		if err != nil {
-			return Receipt{}, fmt.Errorf("verify sent text in WeChat db: %w", err)
-		}
-		if found {
-			return receipt, nil
-		}
-		select {
-		case <-ctx.Done():
-			return Receipt{}, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return Receipt{}, errors.New("send verification failed: message was not found in WeChat db")
+	return service.send(ctx, target, "text", "60s",
+		func(search string) string {
+			return sendTextScript(search, base64.StdEncoding.EncodeToString([]byte(text)))
+		},
+		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
+			return service.wechat.HasTextMessageAfter(positions, username, text)
+		})
 }
 
 func (service *Service) SendImage(ctx context.Context, target, sharedPath string) (Receipt, error) {
+	if service.media == nil {
+		return Receipt{}, errors.New("shared media store is unavailable")
+	}
+	path, contentType, err := service.media.ResolveOutboxImage(sharedPath)
+	if err != nil {
+		return Receipt{}, err
+	}
+	return service.send(ctx, target, "image", "80s",
+		func(search string) string { return sendImageScript(search, path, contentType) },
+		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
+			return service.wechat.HasImageMessageAfter(positions, username)
+		})
+}
+
+func (service *Service) SendFile(ctx context.Context, target, sharedPath string) (Receipt, error) {
+	if service.media == nil {
+		return Receipt{}, errors.New("shared media store is unavailable")
+	}
+	path, filename, err := service.media.ResolveFile(sharedPath)
+	if err != nil {
+		return Receipt{}, err
+	}
+	fileURL := (&url.URL{Scheme: "file", Path: path}).String() + "\r\n"
+	return service.send(ctx, target, "file", "80s",
+		func(search string) string {
+			return sendFileScript(search, base64.StdEncoding.EncodeToString([]byte(fileURL)))
+		},
+		func(positions wechatdb.RoomMessagePositions, username string) (bool, error) {
+			return service.wechat.HasFileMessageAfter(positions, username, filename)
+		})
+}
+
+func (service *Service) send(
+	ctx context.Context,
+	target, kind, timeout string,
+	script func(searchBase64 string) string,
+	verify func(wechatdb.RoomMessagePositions, string) (bool, error),
+) (Receipt, error) {
 	target = strings.TrimSpace(target)
 	if target == "" || len(target) > 200 {
 		return Receipt{}, errors.New("recipient is empty or too long")
 	}
-	if service.media == nil {
-		return Receipt{}, errors.New("shared media store is unavailable")
-	}
-	path, contentType, err := service.media.ResolveOutbox(sharedPath)
-	if err != nil {
-		return Receipt{}, err
-	}
 	recipient, err := service.wechat.ResolveRecipient(target)
 	if err != nil {
 		return Receipt{}, err
 	}
-	beforeSend, err := service.wechat.RoomMessagePositions(recipient.Username)
+	positions, err := service.wechat.RoomMessagePositions(recipient.Username)
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -99,18 +101,13 @@ func (service *Service) SendImage(ctx context.Context, target, sharedPath string
 	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
 		return receipt, nil
 	}
-	script := sendImageScript(
-		base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm)),
-		path,
-		contentType,
-	)
-	if err := runUIScript(ctx, "80s", script, "send image"); err != nil {
+	if err := runUIScript(ctx, timeout, script(base64.StdEncoding.EncodeToString([]byte(recipient.SearchTerm))), "send "+kind); err != nil {
 		return Receipt{}, err
 	}
 	for range 20 {
-		found, err := service.wechat.HasImageMessageAfter(beforeSend, recipient.Username)
+		found, err := verify(positions, recipient.Username)
 		if err != nil {
-			return Receipt{}, fmt.Errorf("verify sent image in WeChat db: %w", err)
+			return Receipt{}, fmt.Errorf("verify sent %s in WeChat db: %w", kind, err)
 		}
 		if found {
 			return receipt, nil
@@ -121,7 +118,7 @@ func (service *Service) SendImage(ctx context.Context, target, sharedPath string
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	return Receipt{}, errors.New("send verification failed: image was not found in WeChat db")
+	return Receipt{}, fmt.Errorf("send verification failed: %s was not found in WeChat db", kind)
 }
 
 func sendTextScript(searchBase64, textBase64 string) string {
@@ -140,11 +137,21 @@ func sendTextScript(searchBase64, textBase64 string) string {
 }
 
 func sendImageScript(searchBase64, imagePath, contentType string) string {
+	return sendMediaScript(searchBase64,
+		"xclip -selection clipboard -target "+shellQuoteSingle(contentType)+" -loops 5 -i "+shellQuoteSingle(imagePath)+" >/dev/null 2>&1 & clip_pid=$!")
+}
+
+func sendFileScript(searchBase64, fileURLBase64 string) string {
+	return sendMediaScript(searchBase64,
+		"printf '%s' "+shellQuoteSingle(fileURLBase64)+" | base64 -d | xclip -selection clipboard -target text/uri-list -loops 5 -i >/dev/null 2>&1 & clip_pid=$!")
+}
+
+func sendMediaScript(searchBase64, loadClipboard string) string {
 	script := uiScriptPrelude()
 	script = append(script,
 		openChatScript(searchBase64),
 		"cleanup_clip",
-		"xclip -selection clipboard -target "+shellQuoteSingle(contentType)+" -loops 5 -i "+shellQuoteSingle(imagePath)+" >/dev/null 2>&1 & clip_pid=$!",
+		loadClipboard,
 		"sleep 0.25",
 		"paste_clip",
 		"sleep 1",

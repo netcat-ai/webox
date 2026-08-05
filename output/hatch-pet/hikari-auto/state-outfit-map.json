@@ -1,0 +1,17 @@
+{
+  "mode": "codex-animation-state",
+  "note": "The outfit follows transient Codex pet states and returns to coat when the pet returns to idle.",
+  "rows": [
+    {"row": 0, "state": "idle", "sourcePet": "hikari-coat", "outfit": "coat"},
+    {"row": 1, "state": "running-right", "sourcePet": "hikari-coat", "outfit": "coat"},
+    {"row": 2, "state": "running-left", "sourcePet": "hikari-coat", "outfit": "coat"},
+    {"row": 3, "state": "waving", "sourcePet": "hikari-coat", "outfit": "coat"},
+    {"row": 4, "state": "jumping", "sourcePet": "hikari-sport", "outfit": "sport"},
+    {"row": 5, "state": "failed", "sourcePet": "hikari-stage", "outfit": "stage"},
+    {"row": 6, "state": "waiting", "sourcePet": "hikari-stage", "outfit": "stage"},
+    {"row": 7, "state": "running", "sourcePet": "hikari-stage", "outfit": "stage"},
+    {"row": 8, "state": "review", "sourcePet": "hikari-sport", "outfit": "sport"},
+    {"row": 9, "state": "look-directions-a", "sourcePet": "hikari-coat", "outfit": "coat"},
+    {"row": 10, "state": "look-directions-b", "sourcePet": "hikari-coat", "outfit": "coat"}
+  ]
+}

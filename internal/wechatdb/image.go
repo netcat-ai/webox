@@ -43,30 +43,26 @@ type v2ImageCandidate struct {
 	modTime int64
 }
 
-func ReadImage(dbDir string, keys map[string]string, cacheDir, roomID, messageID string) (*MediaFile, error) {
+func (store *Store) ReadImage(roomID, messageID string) (*MediaFile, error) {
 	serverID, err := strconv.ParseInt(strings.TrimSpace(messageID), 10, 64)
 	if err != nil || serverID <= 0 || strings.TrimSpace(roomID) == "" {
 		return nil, nil
 	}
-	cache, err := newDBCache(dbDir, cacheDir, keys)
+	shards, err := findMessageShards(store, roomID)
 	if err != nil {
 		return nil, err
 	}
-	shards, err := findMessageShards(cache, roomID)
-	if err != nil {
-		return nil, err
-	}
-	accountDir := filepath.Dir(dbDir)
+	accountDir := filepath.Dir(store.dbDir)
 	attachRoot := filepath.Join(accountDir, "msg", "attach")
 	for _, shard := range shards {
-		localID, createTime, content, found, err := imageMessage(shard.path, shard.table, serverID)
+		localID, createTime, content, found, err := imageMessage(shard.db, shard.table, serverID)
 		if err != nil {
 			return nil, err
 		}
 		if !found {
 			continue
 		}
-		md5Value, err := resourceImageMD5(cache, roomID, localID, createTime)
+		md5Value, err := resourceImageMD5(store, roomID, localID, createTime)
 		if err != nil {
 			return nil, err
 		}
@@ -85,45 +81,21 @@ func ReadImage(dbDir string, keys map[string]string, cacheDir, roomID, messageID
 	return nil, nil
 }
 
-func imageMessage(path, table string, serverID int64) (int64, int64, string, bool, error) {
-	db, err := openSQLite(path)
-	if err != nil {
+func imageMessage(db *sql.DB, table string, serverID int64) (int64, int64, string, bool, error) {
+	message, found, err := messageByServerID(db, table, serverID)
+	if err != nil || !found || baseType(message.localType) != 3 {
 		return 0, 0, "", false, err
 	}
-	defer func() { _ = db.Close() }()
-	query := fmt.Sprintf(`SELECT local_id, local_type, create_time, message_content, WCDB_CT_message_content
-        FROM [%s] WHERE server_id=? LIMIT 1`, table)
-	var localID, localType, createTime int64
-	var content []byte
-	var contentType sql.NullInt64
-	err = db.QueryRow(query, serverID).Scan(&localID, &localType, &createTime, &content, &contentType)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, "", false, nil
-	}
-	if err != nil {
-		return 0, 0, "", false, err
-	}
-	if baseType(localType) != 3 {
-		return 0, 0, "", false, nil
-	}
-	return localID, createTime, decompressMessage(content, contentType.Int64), true, nil
+	return message.localID, message.createdAt, message.content, true, nil
 }
 
-func resourceImageMD5(cache *dbCache, roomID string, localID, createTime int64) (string, error) {
-	path, found, err := cache.get("message/message_resource.db")
-	if err != nil || !found {
-		return "", err
-	}
-	db, err := openSQLite(path)
+func resourceImageMD5(store *Store, roomID string, localID, createTime int64) (string, error) {
+	db, chatID, err := messageResourceDB(store, roomID)
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = db.Close() }()
-	var chatID int64
-	if err := db.QueryRow("SELECT rowid FROM ChatName2Id WHERE user_name=?", roomID).Scan(&chatID); errors.Is(err, sql.ErrNoRows) {
+	if db == nil {
 		return "", nil
-	} else if err != nil {
-		return "", err
 	}
 	var packed []byte
 	err = db.QueryRow(`SELECT packed_info FROM MessageResourceInfo

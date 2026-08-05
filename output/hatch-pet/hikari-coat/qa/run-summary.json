@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "spriteVersionNumber": 2,
+  "run_dir": "/Users/fish/git/webox/output/hatch-pet/hikari-coat",
+  "spritesheet": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/final/spritesheet-extended.webp",
+  "validation": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/final/validation-extended.json",
+  "chroma_despill": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/chroma-despill-extended.json",
+  "contact_sheet": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/contact-sheet-extended.png",
+  "direction_sheet": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/look-directions.png",
+  "direction_semantics": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/direction-semantics.json",
+  "blind_direction_validation": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/direction-blind-validation.json",
+  "blind_review_resolution": null,
+  "continuity": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/look-continuity.json",
+  "review": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/review.json",
+  "final_visual_qa": "/Users/fish/git/webox/output/hatch-pet/hikari-coat/qa/final-visual-qa.json",
+  "package": "/Users/fish/.codex/pets/hikari-coat"
+}

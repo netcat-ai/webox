@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/klauspost/compress v1.18.4
 	github.com/makiuchi-d/gozxing v0.1.1
-	github.com/mattn/go-sqlite3 v1.14.32
+	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 )
 

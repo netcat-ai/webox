@@ -30,6 +30,8 @@ type fakeMessages struct {
 	refreshes   int
 	media       *wechatdb.MediaFile
 	mediaErr    error
+	file        *wechatdb.LocalFile
+	fileErr     error
 }
 
 func (source *fakeMessages) IsInitialized() bool { return source.initialized }
@@ -44,14 +46,25 @@ func (source *fakeMessages) PollMessages(string, int) (wechat.PollResult, error)
 func (source *fakeMessages) ReadImage(string, string) (*wechatdb.MediaFile, error) {
 	return source.media, source.mediaErr
 }
+func (source *fakeMessages) ReadFile(string, string) (*wechatdb.LocalFile, error) {
+	return source.file, source.fileErr
+}
 
 type fakeSender struct {
 	calls      int
 	imageCalls int
+	fileCalls  int
 	target     string
 	text       string
 	imagePath  string
+	filePath   string
 	err        error
+}
+
+func (service *fakeSender) SendFile(_ context.Context, target, sharedPath string) (sender.Receipt, error) {
+	service.fileCalls++
+	service.target, service.filePath = target, sharedPath
+	return sender.Receipt{ClientMessageID: "ui-file"}, service.err
 }
 
 func (service *fakeSender) SendImage(_ context.Context, target, sharedPath string) (sender.Receipt, error) {
@@ -252,12 +265,101 @@ func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
 	item := message["item_list"].([]any)[0].(map[string]any)
 	imageItem := item["image_item"].(map[string]any)
 	sharedPath := imageItem["shared_path"].(string)
-	if message["shared_path"] != sharedPath {
+	if message["shared_path"] != sharedPath || imageItem["available"] != true {
 		t.Fatalf("message=%#v", message)
 	}
 	written, err := os.ReadFile(filepath.Join(mediaRoot, filepath.FromSlash(sharedPath)))
 	if err != nil || !bytes.Equal(written, imageBytes) {
 		t.Fatalf("path=%q data=%x err=%v", sharedPath, written, err)
+	}
+}
+
+func TestIncomingUnavailableImageDoesNotBlockPolling(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
+		"msgid": "321", "local_id": int64(10), "from": "wxid-a", "roomid": "wxid-a",
+		"msgtime": int64(1781703356000), "msgtype": "image", "image": map[string]any{"content": "[图片]"},
+	}}}
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	message := body["msgs"].([]any)[0].(map[string]any)
+	imageItem := message["item_list"].([]any)[0].(map[string]any)["image_item"].(map[string]any)
+	if response.Code != http.StatusOK || message["shared_path"] != nil || imageItem["available"] != false {
+		t.Fatalf("status=%d message=%#v", response.Code, message)
+	}
+}
+
+func TestSharedFileIsSentIdempotently(t *testing.T) {
+	server, messages, outbound, _ := testServer(t)
+	messages.initialized = true
+	body := map[string]any{"msg": map[string]any{
+		"client_id": "file-request-1", "context_token": server.contextToken("group@chatroom"),
+		"item_list": []any{map[string]any{"type": fileItemType, "file_item": map[string]any{
+			"shared_path": "outbox/report.pdf",
+		}}},
+	}}
+	first := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
+	second := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || outbound.fileCalls != 1 {
+		t.Fatalf("first=%d second=%d fileCalls=%d", first.Code, second.Code, outbound.fileCalls)
+	}
+	if outbound.target != "group@chatroom" || outbound.filePath != "outbox/report.pdf" {
+		t.Fatalf("target=%q path=%q", outbound.target, outbound.filePath)
+	}
+}
+
+func TestIncomingFileIsCopiedToSharedDirectory(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	mediaRoot := t.TempDir()
+	mediaStore, err := sharedmedia.New(mediaRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.media = mediaStore
+	messages.initialized = true
+	source := filepath.Join(t.TempDir(), "report.pdf")
+	fileBytes := []byte("file-bytes")
+	if err := os.WriteFile(source, fileBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	messages.file = &wechatdb.LocalFile{Path: source, Filename: "report.pdf"}
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
+		"msgid": "456", "local_id": int64(8), "from": "wxid-a", "roomid": "wxid-a",
+		"msgtime": int64(1781703356000), "msgtype": "file", "file": map[string]any{
+			"content": "[文件] report.pdf", "filename": "report.pdf",
+		},
+	}}}
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	message := body["msgs"].([]any)[0].(map[string]any)
+	item := message["item_list"].([]any)[0].(map[string]any)
+	fileItem := item["file_item"].(map[string]any)
+	sharedPath := fileItem["shared_path"].(string)
+	if message["shared_path"] != sharedPath || fileItem["filename"] != "report.pdf" || fileItem["available"] != true {
+		t.Fatalf("message=%#v", message)
+	}
+	written, err := os.ReadFile(filepath.Join(mediaRoot, filepath.FromSlash(sharedPath)))
+	if err != nil || !bytes.Equal(written, fileBytes) {
+		t.Fatalf("path=%q data=%q err=%v", sharedPath, written, err)
+	}
+}
+
+func TestIncomingUnavailableFileDoesNotBlockPolling(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
+		"msgid": "789", "local_id": int64(9), "from": "wxid-a", "roomid": "wxid-a",
+		"msgtime": int64(1781703356000), "msgtype": "file", "file": map[string]any{
+			"content": "[文件] pending.zip", "filename": "pending.zip",
+		},
+	}}}
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	message := body["msgs"].([]any)[0].(map[string]any)
+	fileItem := message["item_list"].([]any)[0].(map[string]any)["file_item"].(map[string]any)
+	if response.Code != http.StatusOK || message["shared_path"] != nil || fileItem["available"] != false || fileItem["filename"] != "pending.zip" {
+		t.Fatalf("status=%d message=%#v", response.Code, message)
 	}
 }
 

@@ -5,8 +5,8 @@
 
 ## 工作原理
 
-- 收消息：读取并解析 Linux 微信的本地数据库，将文本和 V2 `.dat` 图片转换为 iLink 接口数据。
-- 发消息：根据联系人或群聊备注定位会话，通过剪贴板粘贴发送文本或共享目录中的图片。
+- 收消息：读取并解析 Linux 微信的本地数据库，将文本、V2 `.dat` 图片和文件转换为 iLink 接口数据。
+- 发消息：根据联系人或群聊备注定位会话，通过剪贴板粘贴发送文本或共享目录中的图片、文件。
 - 确认发送：再次读取本地数据库，确认消息已出现在正确的会话中。
 
 ## 风险提示
@@ -91,6 +91,6 @@ docker logs --since 5m webox 2>&1 | grep 'WeChat text sent'
 - [iLink 协议文档](https://www.wechatbot.dev/zh/protocol)
 - [WechatOnCloud](https://github.com/Gloridust/WechatOnCloud)
 - [wx-cli](https://github.com/jackwener/wx-cli)
-- [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt)
+- [SQLCipher](https://github.com/sqlcipher/sqlcipher)
 
 感谢 Xvfb、Openbox、x11vnc、noVNC、xdotool 等开源项目。

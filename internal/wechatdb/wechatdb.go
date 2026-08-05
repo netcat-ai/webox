@@ -4,12 +4,9 @@ package wechatdb
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/md5"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -26,7 +23,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
 const (
@@ -34,12 +31,7 @@ const (
 	chunkSize        = 2 * 1024 * 1024
 	pageSize         = 4096
 	saltSize         = 16
-	reserveSize      = 80
-	walHeaderSize    = 32
-	walFrameHeader   = 24
 )
-
-var sqliteHeader = []byte("SQLite format 3\x00")
 
 type InitData struct {
 	DBDir string
@@ -54,6 +46,45 @@ type MessagePosition struct {
 
 type MessagePositions map[string]map[string]MessagePosition
 type RoomMessagePositions map[string]MessagePosition
+
+type storedMessage struct {
+	localID   int64
+	localType int64
+	createdAt int64
+	content   string
+}
+
+func messageByServerID(db *sql.DB, table string, serverID int64) (storedMessage, bool, error) {
+	query := fmt.Sprintf(`SELECT local_id, local_type, create_time, message_content, WCDB_CT_message_content
+        FROM [%s] WHERE server_id=? LIMIT 1`, table)
+	var message storedMessage
+	var content []byte
+	var contentType sql.NullInt64
+	err := db.QueryRow(query, serverID).Scan(&message.localID, &message.localType, &message.createdAt, &content, &contentType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storedMessage{}, false, nil
+	}
+	if err != nil {
+		return storedMessage{}, false, err
+	}
+	message.content = decompressMessage(content, contentType.Int64)
+	return message, true, nil
+}
+
+func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
+	db, found, err := store.database("message/message_resource.db")
+	if err != nil || !found {
+		return nil, 0, err
+	}
+	var chatID int64
+	if err := db.QueryRow("SELECT rowid FROM ChatName2Id WHERE user_name=?", roomID).Scan(&chatID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	return db, chatID, nil
+}
 
 type PollData struct {
 	Messages []map[string]any
@@ -75,29 +106,16 @@ type keyEntry struct {
 	key    string
 }
 
-type mtimeEntry struct {
-	DBMtime  int64  `json:"db_mt"`
-	WALMtime int64  `json:"wal_mt"`
-	Path     string `json:"path"`
-}
-
-type cacheEntry struct {
-	dbMtime       int64
-	walMtime      int64
-	decryptedPath string
-}
-
-type dbCache struct {
-	dbDir     string
-	cacheDir  string
-	mtimeFile string
-	keys      map[string]string
-	entries   map[string]cacheEntry
+type Store struct {
+	dbDir string
+	keys  map[string]string
+	mu    sync.Mutex
+	dbs   map[string]*sql.DB
 }
 
 type messageShard struct {
 	relativePath string
-	path         string
+	db           *sql.DB
 	table        string
 	maxTimestamp int64
 }
@@ -173,34 +191,53 @@ func InitFromMemory() (InitData, error) {
 	return InitData{DBDir: dbDir, WXID: wxid, Keys: keys}, nil
 }
 
-func CurrentSessionState(dbDir string, keys map[string]string, cacheDir string) (map[string]int64, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
+func Open(dbDir string, keys map[string]string) (*Store, error) {
+	if strings.TrimSpace(dbDir) == "" {
+		return nil, errors.New("WeChat database directory is empty")
+	}
+	if err := ValidateMessageDBKeys(dbDir, keys); err != nil {
 		return nil, err
 	}
-	return loadSessionState(cache)
+	keyCopy := make(map[string]string, len(keys))
+	for relative, key := range keys {
+		keyCopy[relative] = key
+	}
+	return &Store{dbDir: dbDir, keys: keyCopy, dbs: make(map[string]*sql.DB)}, nil
 }
 
-func BaselinePositions(dbDir string, keys map[string]string, cacheDir string, startedAt int64) (MessagePositions, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return nil, err
+func (store *Store) Close() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result error
+	for relative, db := range store.dbs {
+		if err := db.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close %s: %w", relative, err))
+		}
 	}
-	sessions, err := loadSessionState(cache)
+	store.dbs = make(map[string]*sql.DB)
+	return result
+}
+
+func (store *Store) CurrentSessionState() (map[string]int64, error) {
+	return loadSessionState(store)
+}
+
+func (store *Store) BaselinePositions(startedAt int64) (MessagePositions, error) {
+	sessions, err := loadSessionState(store)
 	if err != nil {
 		return nil, err
 	}
 	positions := make(MessagePositions)
 	for username := range sessions {
 		room := make(RoomMessagePositions)
-		shards, err := findMessageShards(cache, username)
+		shards, err := findMessageShards(store, username)
 		if err != nil {
 			return nil, err
 		}
 		for _, shard := range shards {
-			position, found, err := maxMessagePosition(shard.path, shard.table)
+			position, found, err := maxMessagePosition(shard.db, shard.table)
 			if err != nil {
-				return nil, err
+				continue
 			}
 			if !found {
 				position = MessagePosition{CreateTime: startedAt}
@@ -212,32 +249,19 @@ func BaselinePositions(dbDir string, keys map[string]string, cacheDir string, st
 	return positions, nil
 }
 
-func PollNewMessages(dbDir string, keys map[string]string, state MessagePositions, startedAt int64, limit int, cacheDir string) (PollData, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return PollData{}, err
-	}
-	return queryNewMessages(cache, state, startedAt, limit)
+func (store *Store) PollNewMessages(state MessagePositions, startedAt int64, limit int) (PollData, error) {
+	return queryNewMessages(store, state, startedAt, limit)
 }
 
-func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, currentUserID string) (*Recipient, error) {
+func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, error) {
 	username := strings.TrimSpace(raw)
 	if username == "" {
 		return nil, nil
 	}
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return nil, err
-	}
-	path, found, err := cache.get("contact/contact.db")
+	db, found, err := store.database("contact/contact.db")
 	if err != nil || !found {
 		return nil, err
 	}
-	db, err := openSQLite(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = db.Close() }()
 	var storedUsername string
 	var nickname, remark, alias sql.NullString
 	err = db.QueryRow(
@@ -274,14 +298,9 @@ func ResolveRecipient(dbDir string, keys map[string]string, cacheDir, raw, curre
 	return &Recipient{Username: storedUsername, SearchTerm: searchTerm}, nil
 }
 
-func conversationRemarkFromDB(path, username string) (string, error) {
-	db, err := openSQLite(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = db.Close() }()
+func conversationRemarkFromDB(db *sql.DB, username string) (string, error) {
 	var remark sql.NullString
-	err = db.QueryRow(
+	err := db.QueryRow(
 		"SELECT remark FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
 		strings.TrimSpace(username),
 	).Scan(&remark)
@@ -294,26 +313,17 @@ func conversationRemarkFromDB(path, username string) (string, error) {
 	return strings.TrimSpace(remark.String), nil
 }
 
-func ConversationRemark(dbDir string, keys map[string]string, cacheDir, username string) (string, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return "", err
-	}
-	path, found, err := cache.get("contact/contact.db")
+func (store *Store) ConversationRemark(username string) (string, error) {
+	db, found, err := store.database("contact/contact.db")
 	if err != nil || !found {
 		return "", err
 	}
-	return conversationRemarkFromDB(path, username)
+	return conversationRemarkFromDB(db, username)
 }
 
-func conversationMetadataFromDB(path, username string) (ConversationMetadata, error) {
-	db, err := openSQLite(path)
-	if err != nil {
-		return ConversationMetadata{}, err
-	}
-	defer func() { _ = db.Close() }()
+func conversationMetadataFromDB(db *sql.DB, username string) (ConversationMetadata, error) {
 	var nickname, remark, alias sql.NullString
-	err = db.QueryRow(
+	err := db.QueryRow(
 		"SELECT nick_name, remark, alias FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
 		strings.TrimSpace(username),
 	).Scan(&nickname, &remark, &alias)
@@ -329,111 +339,91 @@ func conversationMetadataFromDB(path, username string) (ConversationMetadata, er
 	}, nil
 }
 
-func ConversationMetadataFor(dbDir string, keys map[string]string, cacheDir, username string) (ConversationMetadata, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return ConversationMetadata{}, err
-	}
-	path, found, err := cache.get("contact/contact.db")
+func (store *Store) ConversationMetadataFor(username string) (ConversationMetadata, error) {
+	db, found, err := store.database("contact/contact.db")
 	if err != nil || !found {
 		return ConversationMetadata{}, err
 	}
-	return conversationMetadataFromDB(path, username)
+	return conversationMetadataFromDB(db, username)
 }
 
-func RoomMessagePositionsFor(dbDir string, keys map[string]string, cacheDir, roomID string) (RoomMessagePositions, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return nil, err
-	}
-	shards, err := findMessageShards(cache, roomID)
+func (store *Store) RoomMessagePositionsFor(roomID string) (RoomMessagePositions, error) {
+	shards, err := findMessageShards(store, roomID)
 	if err != nil {
 		return nil, err
 	}
 	positions := make(RoomMessagePositions)
 	for _, shard := range shards {
-		position, _, err := maxMessagePosition(shard.path, shard.table)
+		position, _, err := maxMessagePosition(shard.db, shard.table)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		positions[shard.relativePath] = position
 	}
 	return positions, nil
 }
 
-func HasOutgoingText(dbDir string, keys map[string]string, cacheDir, roomID string, positions RoomMessagePositions, text string) (bool, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return false, err
-	}
-	shards, err := findMessageShards(cache, roomID)
+func (store *Store) HasOutgoingText(roomID string, positions RoomMessagePositions, text string) (bool, error) {
+	group := strings.HasSuffix(roomID, "@chatroom")
+	return store.hasOutgoingMessage(roomID, positions,
+		func(localType int64, content []byte, contentType int64) bool {
+			return baseType(localType) == 1 && stripGroupPrefix(decompressMessage(content, contentType), group) == text
+		})
+}
+
+func (store *Store) HasOutgoingImage(roomID string, positions RoomMessagePositions) (bool, error) {
+	return store.hasOutgoingMessage(roomID, positions,
+		func(localType int64, _ []byte, _ int64) bool { return baseType(localType) == 3 })
+}
+
+func (store *Store) HasOutgoingFile(roomID string, positions RoomMessagePositions, filename string) (bool, error) {
+	filename = strings.TrimSpace(filename)
+	return store.hasOutgoingMessage(roomID, positions,
+		func(localType int64, content []byte, contentType int64) bool {
+			if baseType(localType) != 49 {
+				return false
+			}
+			metadata, ok := parseFileMessage(decompressMessage(content, contentType))
+			return ok && metadata.Filename == filename
+		})
+}
+
+func (store *Store) hasOutgoingMessage(
+	roomID string,
+	positions RoomMessagePositions,
+	match func(localType int64, content []byte, contentType int64) bool,
+) (bool, error) {
+	shards, err := findMessageShards(store, roomID)
 	if err != nil {
 		return false, err
 	}
 	for _, shard := range shards {
 		position := positions[shard.relativePath]
-		db, err := openSQLite(shard.path)
-		if err != nil {
-			return false, err
-		}
-		query := fmt.Sprintf(`SELECT local_type, message_content, WCDB_CT_message_content
-            FROM [%s]
+		db := shard.db
+		query := fmt.Sprintf(`SELECT local_type, message_content, WCDB_CT_message_content FROM [%s]
             WHERE ((create_time > ?) OR (create_time = ? AND local_id > ?))
               AND status = 2 AND origin_source = 1
-            ORDER BY create_time DESC, local_id DESC LIMIT 100`, shard.table)
+            ORDER BY create_time ASC, local_id ASC`, shard.table)
 		rows, err := db.Query(query, position.CreateTime, position.CreateTime, position.LocalID)
 		if err != nil {
-			_ = db.Close()
-			return false, err
+			continue
 		}
 		for rows.Next() {
 			var localType int64
-			var contentType sql.NullInt64
 			var content []byte
-			if err := rows.Scan(&localType, &content, &contentType); err != nil {
+			var contentType sql.NullInt64
+			if rows.Scan(&localType, &content, &contentType) != nil {
 				continue
 			}
-			decoded := decompressMessage(content, contentType.Int64)
-			if baseType(localType) == 1 && stripGroupPrefix(decoded, strings.HasSuffix(roomID, "@chatroom")) == text {
+			if match(localType, content, contentType.Int64) {
 				_ = rows.Close()
-				_ = db.Close()
 				return true, nil
 			}
 		}
+		rowsErr := rows.Err()
 		_ = rows.Close()
-		_ = db.Close()
-	}
-	return false, nil
-}
-
-func HasOutgoingImage(dbDir string, keys map[string]string, cacheDir, roomID string, positions RoomMessagePositions) (bool, error) {
-	cache, err := newDBCache(dbDir, cacheDir, keys)
-	if err != nil {
-		return false, err
-	}
-	shards, err := findMessageShards(cache, roomID)
-	if err != nil {
-		return false, err
-	}
-	for _, shard := range shards {
-		position := positions[shard.relativePath]
-		db, err := openSQLite(shard.path)
-		if err != nil {
-			return false, err
-		}
-		query := fmt.Sprintf(`SELECT 1 FROM [%s]
-            WHERE ((create_time > ?) OR (create_time = ? AND local_id > ?))
-              AND (local_type & 4294967295) = 3
-              AND status = 2 AND origin_source = 1
-            LIMIT 1`, shard.table)
-		var found int
-		err = db.QueryRow(query, position.CreateTime, position.CreateTime, position.LocalID).Scan(&found)
-		_ = db.Close()
-		if err == nil {
-			return true, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return false, err
+		if rowsErr != nil {
+			continue
 		}
 	}
 	return false, nil
@@ -620,109 +610,43 @@ func collectDBSalts(dbDir string) map[string]string {
 	return result
 }
 
-func newDBCache(dbDir, cacheDir string, keys map[string]string) (*dbCache, error) {
-	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
-		return nil, err
+func (store *Store) database(relative string) (*sql.DB, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if db := store.dbs[relative]; db != nil {
+		return db, true, nil
 	}
-	cache := &dbCache{
-		dbDir: dbDir, cacheDir: cacheDir, mtimeFile: filepath.Join(cacheDir, "_mtimes.json"),
-		keys: keys, entries: make(map[string]cacheEntry),
-	}
-	cache.load()
-	return cache, nil
-}
-
-func (cache *dbCache) load() {
-	data, err := os.ReadFile(cache.mtimeFile)
-	if err != nil {
-		return
-	}
-	var stored map[string]mtimeEntry
-	if json.Unmarshal(data, &stored) != nil {
-		return
-	}
-	for relative, entry := range stored {
-		if _, err := os.Stat(entry.Path); err == nil && fileMtime(cache.dbPath(relative)) == entry.DBMtime {
-			cache.entries[relative] = cacheEntry{dbMtime: entry.DBMtime, walMtime: entry.WALMtime, decryptedPath: entry.Path}
-		}
-	}
-}
-
-func (cache *dbCache) save() {
-	stored := make(map[string]mtimeEntry, len(cache.entries))
-	for relative, entry := range cache.entries {
-		stored[relative] = mtimeEntry{DBMtime: entry.dbMtime, WALMtime: entry.walMtime, Path: entry.decryptedPath}
-	}
-	data, err := json.MarshalIndent(stored, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := cache.mtimeFile + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, cache.mtimeFile)
-	}
-}
-
-func (cache *dbCache) dbPath(relative string) string {
-	return filepath.Join(cache.dbDir, filepath.FromSlash(relative))
-}
-
-func (cache *dbCache) get(relative string) (string, bool, error) {
-	keyHex, exists := cache.keys[relative]
+	keyHex, exists := store.keys[relative]
 	if !exists {
-		return "", false, nil
+		return nil, false, nil
 	}
-	dbPath := cache.dbPath(relative)
+	dbPath := filepath.Join(store.dbDir, filepath.FromSlash(relative))
 	if _, err := os.Stat(dbPath); err != nil {
-		return "", false, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	key, err := hex.DecodeString(keyHex)
 	if err != nil || len(key) != 32 {
-		return "", false, fmt.Errorf("密钥格式错误: %s", relative)
+		return nil, false, fmt.Errorf("密钥格式错误: %s", relative)
 	}
-	walPath := dbPath + "-wal"
-	dbMtime, walMtime := fileMtime(dbPath), fileMtime(walPath)
-	if entry, found := cache.entries[relative]; found && entry.dbMtime == dbMtime {
-		if _, err := os.Stat(entry.decryptedPath); err == nil {
-			if entry.walMtime != walMtime && walMtime != 0 {
-				if err := applyWAL(walPath, entry.decryptedPath, key); err != nil {
-					return "", false, err
-				}
-			}
-			entry.walMtime = walMtime
-			cache.entries[relative] = entry
-			cache.save()
-			return entry.decryptedPath, true, nil
-		}
+	db, err := openSQLCipher(dbPath, hex.EncodeToString(key))
+	if err != nil {
+		return nil, false, fmt.Errorf("open encrypted WeChat database %s: %w", relative, err)
 	}
-	hash := md5.Sum([]byte(relative))
-	outPath := filepath.Join(cache.cacheDir, fmt.Sprintf("%x.db", hash))
-	if err := fullDecrypt(dbPath, outPath, key); err != nil {
-		return "", false, err
-	}
-	if walMtime != 0 {
-		if err := applyWAL(walPath, outPath, key); err != nil {
-			return "", false, err
-		}
-	}
-	cache.entries[relative] = cacheEntry{dbMtime: dbMtime, walMtime: walMtime, decryptedPath: outPath}
-	cache.save()
-	return outPath, true, nil
+	store.dbs[relative] = db
+	return db, true, nil
 }
 
-func loadSessionState(cache *dbCache) (map[string]int64, error) {
-	path, found, err := cache.get("session/session.db")
+func loadSessionState(store *Store) (map[string]int64, error) {
+	db, found, err := store.database("session/session.db")
 	if err != nil {
 		return nil, err
 	}
 	if !found {
-		return nil, errors.New("无法解密 session.db")
+		return nil, errors.New("无法打开 session.db")
 	}
-	db, err := openSQLite(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = db.Close() }()
 	rows, err := db.Query("SELECT username, last_timestamp FROM SessionTable WHERE last_timestamp > 0")
 	if err != nil {
 		return nil, err
@@ -765,12 +689,12 @@ func ValidateMessageDBKeys(dbDir string, keys map[string]string) error {
 	return fmt.Errorf("missing WeChat message database key: %s", strings.Join(missing, ", "))
 }
 
-func messageDBKeys(cache *dbCache) ([]string, error) {
-	if err := ValidateMessageDBKeys(cache.dbDir, cache.keys); err != nil {
+func messageDBKeys(store *Store) ([]string, error) {
+	if err := ValidateMessageDBKeys(store.dbDir, store.keys); err != nil {
 		return nil, err
 	}
 	var keys []string
-	for key := range cache.keys {
+	for key := range store.keys {
 		if strings.HasPrefix(key, "message/") && isMessageShard(filepath.Base(key)) {
 			keys = append(keys, key)
 		}
@@ -779,51 +703,44 @@ func messageDBKeys(cache *dbCache) ([]string, error) {
 	return keys, nil
 }
 
-func findMessageShards(cache *dbCache, username string) ([]messageShard, error) {
+func findMessageShards(store *Store, username string) ([]messageShard, error) {
 	table := fmt.Sprintf("Msg_%x", md5.Sum([]byte(username)))
 	var shards []messageShard
-	keys, err := messageDBKeys(cache)
+	keys, err := messageDBKeys(store)
 	if err != nil {
 		return nil, err
 	}
 	for _, relative := range keys {
-		path, found, err := cache.get(relative)
+		db, found, err := store.database(relative)
 		if err != nil {
 			return nil, err
 		}
 		if !found {
 			continue
 		}
-		db, err := openSQLite(path)
-		if err != nil {
-			return nil, err
-		}
 		var exists int
 		err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
-			_ = db.Close()
 			continue
 		}
 		if err != nil {
-			_ = db.Close()
 			return nil, err
 		}
 		var maxTimestamp sql.NullInt64
 		err = db.QueryRow(fmt.Sprintf("SELECT MAX(create_time) FROM [%s]", table)).Scan(&maxTimestamp)
-		_ = db.Close()
 		if err != nil {
-			return nil, err
+			continue
 		}
 		if maxTimestamp.Valid {
-			shards = append(shards, messageShard{relativePath: relative, path: path, table: table, maxTimestamp: maxTimestamp.Int64})
+			shards = append(shards, messageShard{relativePath: relative, db: db, table: table, maxTimestamp: maxTimestamp.Int64})
 		}
 	}
 	sort.Slice(shards, func(i, j int) bool { return shards[i].maxTimestamp > shards[j].maxTimestamp })
 	return shards, nil
 }
 
-func queryNewMessages(cache *dbCache, state MessagePositions, startedAt int64, limit int) (PollData, error) {
-	sessions, err := loadSessionState(cache)
+func queryNewMessages(store *Store, state MessagePositions, startedAt int64, limit int) (PollData, error) {
+	sessions, err := loadSessionState(store)
 	if err != nil {
 		return PollData{}, err
 	}
@@ -846,7 +763,7 @@ func queryNewMessages(cache *dbCache, state MessagePositions, startedAt int64, l
 	perTableLimit := clamp(limit*4, 100, 2000)
 	var events []messageEvent
 	for _, username := range changed {
-		shards, err := findMessageShards(cache, username)
+		shards, err := findMessageShards(store, username)
 		if err != nil {
 			return PollData{}, err
 		}
@@ -857,7 +774,7 @@ func queryNewMessages(cache *dbCache, state MessagePositions, startedAt int64, l
 			}
 			rows, err := queryNewTable(shard, username, strings.HasSuffix(username, "@chatroom"), position, perTableLimit)
 			if err != nil {
-				return PollData{}, fmt.Errorf("query message table %s: %w", shard.table, err)
+				continue
 			}
 			events = append(events, rows...)
 		}
@@ -894,16 +811,13 @@ func queryNewMessages(cache *dbCache, state MessagePositions, startedAt int64, l
 }
 
 func queryNewTable(shard messageShard, username string, group bool, position MessagePosition, limit int) ([]messageEvent, error) {
-	db, err := openSQLite(shard.path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = db.Close() }()
+	db := shard.db
 	idToUsername := loadIDToUsername(db)
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
 			message_content, WCDB_CT_message_content
 		 FROM [%s]
-		 WHERE create_time > ? OR (create_time = ? AND local_id > ?)
+		 WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
+		   AND server_id > 0
 		 ORDER BY create_time ASC, local_id ASC LIMIT ?`, shard.table)
 	rows, err := db.Query(query, position.CreateTime, position.CreateTime, position.LocalID, limit)
 	if err != nil {
@@ -920,6 +834,12 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 		}
 		decoded := decompressMessage(content, contentType.Int64)
 		messageType, text := normalizedMessage(localType, decoded, group)
+		messageBody := map[string]any{"content": text}
+		if messageType == "file" {
+			if metadata, ok := parseFileMessage(decoded); ok {
+				messageBody["filename"] = metadata.Filename
+			}
+		}
 		event := messageEvent{
 			room: username, shard: shard.relativePath,
 			position: MessagePosition{CreateTime: timestamp, LocalID: localID},
@@ -927,7 +847,7 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 				"msgid": strconv.FormatInt(serverID, 10), "local_id": localID,
 				"from":   senderUsername(realSenderID, decoded, group, username, idToUsername),
 				"tolist": []any{}, "roomid": username, "msgtime": saturatingMilliseconds(timestamp),
-				"msgtype": messageType, messageType: map[string]any{"content": text},
+				"msgtype": messageType, messageType: messageBody,
 			},
 		}
 		events = append(events, event)
@@ -952,14 +872,9 @@ func loadIDToUsername(db *sql.DB) map[int64]string {
 	return result
 }
 
-func maxMessagePosition(path, table string) (MessagePosition, bool, error) {
-	db, err := openSQLite(path)
-	if err != nil {
-		return MessagePosition{}, false, err
-	}
-	defer func() { _ = db.Close() }()
+func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error) {
 	var position MessagePosition
-	err = db.QueryRow(fmt.Sprintf(
+	err := db.QueryRow(fmt.Sprintf(
 		"SELECT create_time, local_id FROM [%s] ORDER BY create_time DESC, local_id DESC LIMIT 1", table,
 	)).Scan(&position.CreateTime, &position.LocalID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -975,6 +890,11 @@ func normalizedMessage(localType int64, content string, group bool) (string, str
 	}
 	if base == 49 && strings.Contains(content, "<refermsg>") {
 		return "text", quotedMessageText(stripGroupPrefix(content, group))
+	}
+	if base == 49 {
+		if metadata, ok := parseFileMessage(content); ok {
+			return "file", "[文件] " + metadata.Filename
+		}
 	}
 	labels := map[int64]struct{ kind, text string }{
 		3: {"image", "[图片]"}, 34: {"voice", "[语音]"}, 42: {"card", "[名片]"},
@@ -1088,122 +1008,6 @@ func senderUsername(realSenderID int64, content string, group bool, chatUsername
 	return chatUsername
 }
 
-func fullDecrypt(dbPath, outPath string, key []byte) error {
-	input, err := os.Open(dbPath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = input.Close() }()
-	info, err := input.Stat()
-	if err != nil {
-		return err
-	}
-	if info.Size() == 0 {
-		return fmt.Errorf("数据库文件为空: %s", dbPath)
-	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
-		return err
-	}
-	output, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = output.Close() }()
-	pages := (info.Size() + pageSize - 1) / pageSize
-	buffer := make([]byte, pageSize)
-	for page := int64(1); page <= pages; page++ {
-		clear(buffer)
-		remaining := info.Size() - (page-1)*pageSize
-		expected := int64(pageSize)
-		if remaining < expected {
-			expected = remaining
-		}
-		if _, err := io.ReadFull(input, buffer[:expected]); err != nil {
-			return err
-		}
-		decrypted, err := decryptPage(key, buffer, uint32(page))
-		if err != nil {
-			return err
-		}
-		if _, err := output.Write(decrypted); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func applyWAL(walPath, outPath string, key []byte) error {
-	data, err := os.ReadFile(walPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil || len(data) <= walHeaderSize {
-		return err
-	}
-	salt1 := uint32FromBigEndian(data[16:20])
-	salt2 := uint32FromBigEndian(data[20:24])
-	frameSize := walFrameHeader + pageSize
-	output, err := os.OpenFile(outPath, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = output.Close() }()
-	for position := walHeaderSize; position+frameSize <= len(data); position += frameSize {
-		header := data[position : position+walFrameHeader]
-		pageNumber := uint32FromBigEndian(header[:4])
-		if pageNumber == 0 || pageNumber > 1_000_000 ||
-			uint32FromBigEndian(header[8:12]) != salt1 || uint32FromBigEndian(header[12:16]) != salt2 {
-			continue
-		}
-		page := data[position+walFrameHeader : position+frameSize]
-		decrypted, err := decryptPage(key, page, pageNumber)
-		if err != nil {
-			return err
-		}
-		if _, err := output.WriteAt(decrypted, int64(pageNumber-1)*pageSize); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func decryptPage(key, page []byte, pageNumber uint32) ([]byte, error) {
-	if len(page) < pageSize {
-		return nil, fmt.Errorf("页面数据不足 %d 字节", pageSize)
-	}
-	ivOffset := pageSize - reserveSize
-	iv := page[ivOffset : ivOffset+aes.BlockSize]
-	result := make([]byte, pageSize)
-	if pageNumber == 1 {
-		decrypted, err := decryptCBC(key, iv, page[saltSize:pageSize-reserveSize])
-		if err != nil {
-			return nil, err
-		}
-		copy(result, sqliteHeader)
-		copy(result[16:], decrypted)
-		return result, nil
-	}
-	decrypted, err := decryptCBC(key, iv, page[:pageSize-reserveSize])
-	if err != nil {
-		return nil, err
-	}
-	copy(result, decrypted)
-	return result, nil
-}
-
-func decryptCBC(key, iv, data []byte) ([]byte, error) {
-	if len(data) == 0 || len(data)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("密文长度不是 AES 块大小的倍数: %d", len(data))
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	result := append([]byte(nil), data...)
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(result, result)
-	return result, nil
-}
-
 var (
 	zstdOnce    sync.Once
 	zstdDecoder *zstd.Decoder
@@ -1221,14 +1025,22 @@ func decompressMessage(data []byte, contentType int64) string {
 	return string(bytes.ToValidUTF8(data, []byte("�")))
 }
 
-func openSQLite(path string) (*sql.DB, error) {
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_query_only=1"}).String()
+func openSQLCipher(path, key string) (*sql.DB, error) {
+	query := url.Values{
+		"mode":                     {"ro"},
+		"_busy_timeout":            {"5000"},
+		"_query_only":              {"1"},
+		"_pragma_cipher_page_size": {strconv.Itoa(pageSize)},
+		"_pragma_key":              {fmt.Sprintf("x'%s'", key)},
+	}
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if err := db.Ping(); err != nil {
+	var schemaObjects int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&schemaObjects); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -1247,14 +1059,6 @@ func latestDBMtime(root string) time.Time {
 		return nil
 	})
 	return latest
-}
-
-func fileMtime(path string) int64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return info.ModTime().UnixNano()
 }
 
 func recipientDisplayName(username, nickname, remark, alias string) string {
@@ -1341,10 +1145,6 @@ func saturatingMilliseconds(seconds int64) int64 {
 		return math.MinInt64
 	}
 	return seconds * 1000
-}
-
-func uint32FromBigEndian(value []byte) uint32 {
-	return uint32(value[0])<<24 | uint32(value[1])<<16 | uint32(value[2])<<8 | uint32(value[3])
 }
 
 func isHexBytes(value []byte) bool {

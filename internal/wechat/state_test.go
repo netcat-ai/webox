@@ -160,7 +160,7 @@ func TestKeyFileRejectsLegacyFields(t *testing.T) {
 func TestMissingKeyMaterialInvalidatesReadyState(t *testing.T) {
 	state := New(t.TempDir(), "test-token", true)
 	state.initialized.Store(true)
-	if _, err := state.readyMaterial(); err == nil {
+	if _, _, err := state.readyDatabase(); err == nil {
 		t.Fatal("missing key material accepted")
 	}
 	if state.IsInitialized() {

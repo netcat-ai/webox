@@ -3,7 +3,12 @@ package wechatdb
 import "testing"
 
 func TestResolveRecipientDoesNotSpecialCaseFileHelper(t *testing.T) {
-	recipient, err := ResolveRecipient(t.TempDir(), nil, t.TempDir(), "filehelper", "wxid-self")
+	store, err := Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	recipient, err := store.ResolveRecipient("filehelper", "wxid-self")
 	if err != nil {
 		t.Fatal(err)
 	}

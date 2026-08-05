@@ -47,14 +47,16 @@ token、provider account ID 和游标签名密钥分别持久化。`/healthz` �
 ```text
 POST getupdates(get_updates_buf)
   -> verify signed cursor
-  -> decrypt and poll new WeChat DB rows
+  -> query encrypted WeChat DB and WAL through SQLCipher
   -> map rows to iLink msgs
   -> decode V2 image .dat files into /webox/state/media/inbox
+  -> copy available WeChat files into /webox/state/media/inbox
   -> issue signed context_token per target
   -> return msgs and next signed cursor
 ```
 
 首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `msgid` 去重。
+数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
 
 主要字段映射：
 
@@ -67,39 +69,39 @@ POST getupdates(get_updates_buf)
 | `msgtime` | `create_time_ms`、`update_time_ms` |
 | `text.content` | `text`、`item_list[].text_item.text` |
 | V2 图片 `.dat` | `shared_path`、`item_list[].image_item.shared_path` |
+| 文件 | `filename`、`shared_path`、`item_list[].file_item` |
 
 Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返回 `conversation_name`（昵称优先）和
 `conversation_remark`（唯一备注）。消费者使用 `session_id` 作为稳定身份，名称字段只用于展示。
 
-群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。图片消息只解码 Linux 微信 V2 `.dat`，原子写入
-共享目录的 `inbox/` 并返回相对 `shared_path`；其他非文本消息仍转换为可读占位文本。
+群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
+从微信本地目录复制到共享目录。两者都返回 `inbox/` 相对 `shared_path`，尚未下载的文件返回 `available=false`。
 
 ## 发消息
 
 ```text
-POST sendmessage(msg.context_token, msg.client_id, text/image item)
+POST sendmessage(msg.context_token, msg.client_id, text/image/file item)
   -> authenticate bot token
   -> verify and decode context_token
   -> check client_id idempotency
   -> resolve recipient and unique remark
-  -> resolve image shared_path only under /webox/state/media/outbox
+  -> resolve media shared_path under /webox/state/media/inbox or outbox
   -> activate WeChat, paste clipboard contents and send
-  -> verify the text or image in the same local DB conversation
+  -> verify the text, image, or file in the same local DB conversation
   -> cache receipt and return ret=0
 ```
 
 服务只信任签名 `context_token` 中的目标，不信任调用方可修改的 `to_user_id`。同一 `client_id` 和相同内容重试直接返回第一次结果；同一 ID 携带不同内容会被拒绝。缓存有 1024 条上限，进程重启后清空。
 
-整个发送路径由互斥锁串行化。文本和图片都通过剪贴板粘贴，不使用附件按钮、文件选择器或坐标点击。HTTP 成功
-表示 UI 发送及数据库回读都已完成，不是“已进入队列”。图片 API 只传 `outbox/` 下的相对路径，不上传文件、
-不生成下载 URL。
+整个发送路径由互斥锁串行化。文本、图片和文件都通过剪贴板粘贴，不使用附件按钮、文件选择器或坐标点击。HTTP 成功
+表示 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 
 ## 辅助接口
 
 - `getconfig` 签发绑定用户的 `typing_ticket`。
 - `sendtyping` 校验 ticket 后返回 HTTP 501，因为 Linux 微信 UI 没有可靠输入状态动作。
 - `notifystart`、`notifystop` 校验身份并返回 `ret=0`。
-- 语音、文件和视频出站 item 返回 HTTP 501，不伪造成功。
+- 语音和视频出站 item 返回 HTTP 501，不伪造成功。
 
 ## 可靠性边界
 
@@ -115,7 +117,7 @@ POST sendmessage(msg.context_token, msg.client_id, text/image item)
 - 不实现企业微信 AI Bot、XML/Webhook 或通用消息中台协议。
 - 不维护独立用户、会话或消息事实库。
 - 不从 WeChat 网络流量解析登录或聊天消息。
-- 当前不支持二进制媒体传输、文件上传或真实输入状态。
+- 当前不支持 HTTP 二进制媒体上传或真实输入状态。
 
 ## Go 模块
 
@@ -125,6 +127,6 @@ internal/config   persistent iLink identity and environment configuration
 internal/ilink    iLink routes, authentication, mapping and idempotency
 internal/qrsource locate login QR from Xvfb framebuffer
 internal/wechat   initialization, signed cursor and DB coordination
-internal/wechatdb decrypt and poll WeChat local DB
+internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher
 internal/sender   serialized xdotool/xclip text sender and DB verification
 ```

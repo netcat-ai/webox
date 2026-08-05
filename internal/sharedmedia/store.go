@@ -1,6 +1,7 @@
 package sharedmedia
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -41,9 +42,29 @@ func (store *Store) WriteInbox(roomID, messageID string, data []byte, contentTyp
 	if len(data) == 0 || extension == "" {
 		return "", errors.New("incoming image is empty or has an unsupported format")
 	}
+	return store.writeInbox(roomID, messageIDHash(messageID)+extension, bytes.NewReader(data))
+}
+
+func (store *Store) CopyInboxFile(roomID, messageID, filename, sourcePath string) (string, error) {
+	filename = safeFilename(filename)
+	if filename == "" {
+		return "", errors.New("incoming file has an invalid filename")
+	}
+	source, err := os.Open(strings.TrimSpace(sourcePath))
+	if err != nil {
+		return "", fmt.Errorf("open incoming file: %w", err)
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("incoming file is not a regular file")
+	}
+	return store.writeInbox(roomID, filepath.Join(messageIDHash(messageID), filename), source)
+}
+
+func (store *Store) writeInbox(roomID, name string, source io.Reader) (string, error) {
 	roomHash := sha256.Sum256([]byte(strings.TrimSpace(roomID)))
-	messageHash := sha256.Sum256([]byte(strings.TrimSpace(messageID)))
-	relative := filepath.Join("inbox", hex.EncodeToString(roomHash[:8]), hex.EncodeToString(messageHash[:16])+extension)
+	relative := filepath.Join("inbox", hex.EncodeToString(roomHash[:8]), name)
 	destination := filepath.Join(store.root, relative)
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return "", fmt.Errorf("create incoming media directory: %w", err)
@@ -54,7 +75,7 @@ func (store *Store) WriteInbox(roomID, messageID string, data []byte, contentTyp
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
-	if _, err := temporary.Write(data); err != nil {
+	if _, err := io.Copy(temporary, source); err != nil {
 		_ = temporary.Close()
 		return "", fmt.Errorf("write incoming media file: %w", err)
 	}
@@ -71,37 +92,15 @@ func (store *Store) WriteInbox(roomID, messageID string, data []byte, contentTyp
 	return filepath.ToSlash(relative), nil
 }
 
-func (store *Store) ResolveOutbox(sharedPath string) (string, string, error) {
-	sharedPath = strings.TrimSpace(sharedPath)
-	if sharedPath == "" || filepath.IsAbs(sharedPath) {
-		return "", "", errors.New("image shared_path must be relative")
-	}
-	clean := filepath.Clean(filepath.FromSlash(sharedPath))
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", "", errors.New("image shared_path escapes the shared media directory")
-	}
-	parts := strings.Split(filepath.ToSlash(clean), "/")
-	if len(parts) < 2 || parts[0] != "outbox" {
-		return "", "", errors.New("image shared_path must be under outbox/")
-	}
-	root, err := filepath.EvalSymlinks(store.root)
+func messageIDHash(messageID string) string {
+	hash := sha256.Sum256([]byte(strings.TrimSpace(messageID)))
+	return hex.EncodeToString(hash[:16])
+}
+
+func (store *Store) ResolveOutboxImage(sharedPath string) (string, string, error) {
+	resolved, err := store.resolve(sharedPath, false)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve shared media root: %w", err)
-	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(store.root, clean))
-	if err != nil {
-		return "", "", fmt.Errorf("resolve shared image: %w", err)
-	}
-	relative, err := filepath.Rel(root, resolved)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", "", errors.New("image shared_path escapes the shared media directory")
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect shared image: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", "", errors.New("shared image is not a regular file")
+		return "", "", err
 	}
 	file, err := os.Open(resolved)
 	if err != nil {
@@ -118,6 +117,61 @@ func (store *Store) ResolveOutbox(sharedPath string) (string, string, error) {
 		return "", "", errors.New("shared file is not a supported image")
 	}
 	return resolved, contentType, nil
+}
+
+func (store *Store) ResolveFile(sharedPath string) (string, string, error) {
+	resolved, err := store.resolve(sharedPath, true)
+	if err != nil {
+		return "", "", err
+	}
+	filename := safeFilename(filepath.Base(resolved))
+	if filename == "" {
+		return "", "", errors.New("shared file has an invalid filename")
+	}
+	return resolved, filename, nil
+}
+
+func (store *Store) resolve(sharedPath string, allowInbox bool) (string, error) {
+	sharedPath = strings.TrimSpace(sharedPath)
+	if sharedPath == "" || filepath.IsAbs(sharedPath) {
+		return "", errors.New("shared_path must be relative")
+	}
+	clean := filepath.Clean(filepath.FromSlash(sharedPath))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("shared_path escapes the shared media directory")
+	}
+	parts := strings.Split(filepath.ToSlash(clean), "/")
+	if len(parts) < 2 || parts[0] != "outbox" && (!allowInbox || parts[0] != "inbox") {
+		return "", errors.New("shared_path must be under an allowed shared media directory")
+	}
+	root, err := filepath.EvalSymlinks(store.root)
+	if err != nil {
+		return "", fmt.Errorf("resolve shared media root: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(store.root, clean))
+	if err != nil {
+		return "", fmt.Errorf("resolve shared file: %w", err)
+	}
+	relative, err := filepath.Rel(root, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("shared_path escapes the shared media directory")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect shared file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("shared file is not a regular file")
+	}
+	return resolved, nil
+}
+
+func safeFilename(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsRune(value, 0) || filepath.Base(value) != value || value == "." || value == ".." {
+		return ""
+	}
+	return value
 }
 
 func contentTypeFor(data []byte) string {

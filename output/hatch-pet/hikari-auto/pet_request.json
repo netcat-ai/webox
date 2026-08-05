@@ -1,0 +1,14 @@
+{
+  "pet_id": "hikari-auto",
+  "display_name": "Hikari · Auto",
+  "description": "A fictional adult Japanese stage performer whose fully covered outfit changes automatically with Codex task state.",
+  "sprite_version_number": 2,
+  "chroma_key": {
+    "hex": "#00FF00"
+  },
+  "source_pets": [
+    "hikari-coat",
+    "hikari-stage",
+    "hikari-sport"
+  ]
+}
