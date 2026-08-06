@@ -40,7 +40,14 @@ get_qrcode_status
 
 二维码会话只确认当前进程实际签发的 ID，未知或超时 ID 返回 `expired`。微信已登录时，只有携带当前本地 token 的客户端能够恢复连接，避免匿名请求直接取得 token。
 
-token、provider account ID 和游标签名密钥分别持久化。`/healthz` 只返回 `ok` 和 `ready`，不暴露这些内部状态。
+token 和游标签名密钥分别持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
+`account_id` 直接取自 contact 自账号记录的 `username`，不假设它具有 `wxid_` 前缀。受 token 保护的
+`GET /ilink/bot/userinfo` 返回必需的 `account_id`、可见且可修改的 `wechat_id`，并在可用时附带
+`nickname` 和 `avatar_url`；这些字段来自同一条 contact 记录。`avatar_url` 优先使用 `big_head_url`，
+缺失时回退到 `small_head_url`；contact `alias` 为空时，`wechat_id` 回退为当前账号的 `username`。
+这里的 `username` 始终作为稳定 `account_id`；部分旧账号的 `username` 恰好与当前可见微信号相同，
+但两者语义不同。用户以后修改微信号时，新的可见值进入 `alias`，`account_id` 仍保持原 `username`。
+`/healthz` 仍只返回 `ok` 和 `ready`，不暴露这些身份或凭据。
 
 ## 收消息
 
@@ -65,16 +72,20 @@ POST getupdates(get_updates_buf)
 | `msgid` | `msgid`、`client_id`、数值 `message_id` |
 | `local_id` | `seq` |
 | `from` | `from_user_id`、`ilink_user_id` |
+| 当前登录账号 `account_id` | `to_user_id` |
 | `roomid` | `session_id`、签名 `context_token` 目标 |
 | `msgtime` | `create_time_ms`、`update_time_ms` |
 | `text.content` | `text`、`item_list[].text_item.text` |
+| 群消息 `source.atuserlist` | `mentioned_me` |
 | V2 图片 `.dat` | `shared_path`、`item_list[].image_item.shared_path` |
 | 文件 | `filename`、`shared_path`、`item_list[].file_item` |
 
 Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返回 `conversation_name`（昵称优先）和
 `conversation_remark`（唯一备注）。消费者使用 `session_id` 作为稳定身份，名称字段只用于展示。
 
-群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
+群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。Webox 解压并解析消息 `source` 中逗号分隔的
+`atuserlist`，仅当其中存在当前账号的完整 `account_id` 时返回 `mentioned_me=true`；不根据消息文本中的昵称
+推测 @，`notify@all` 等群体标记也不等价于明确 @ 当前账号。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
 从微信本地目录复制到共享目录。两者都返回 `inbox/` 相对 `shared_path`，尚未下载的文件返回 `available=false`。
 
 ## 发消息
@@ -124,7 +135,7 @@ POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...]
 
 ```text
 cmd/weagent       process lifecycle and HTTP server
-internal/config   persistent iLink identity and environment configuration
+internal/config   persistent iLink credentials and environment configuration
 internal/ilink    iLink routes, authentication, mapping and idempotency
 internal/qrsource locate login QR from Xvfb framebuffer
 internal/wechat   initialization, signed cursor and DB coordination

@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
@@ -85,6 +88,34 @@ func TestNormalizedMessageRecognizesFileAppMessage(t *testing.T) {
 	}
 }
 
+func TestQueryExtractsOrdinaryLinkMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	content := `<msg><appmsg><title><![CDATA[文章标题]]></title><des><![CDATA[文章摘要]]></des>` +
+		`<type>5</type><url><![CDATA[https://example.com/article?id=1&from=wechat]]></url></appmsg></msg>`
+	mustExec(t, db, `INSERT INTO [Msg_test] (
+		local_id, server_id, local_type, create_time, real_sender_id,
+		message_content, WCDB_CT_message_content, status, origin_source
+	) VALUES (1, 101, 49, 1000, 0, ?, 0, 3, 2)`, content)
+	defer func() { _ = db.Close() }()
+
+	events, err := queryNewTable(
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
+		"alice", false, MessagePosition{CreateTime: 999}, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"title": "文章标题", "description": "文章摘要",
+		"url": "https://example.com/article?id=1&from=wechat",
+	}
+	if len(events) != 1 || events[0].message["msgtype"] != "link" ||
+		!reflect.DeepEqual(events[0].message["link"], want) {
+		t.Fatalf("events=%#v want link=%#v", events, want)
+	}
+}
+
 func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
@@ -99,7 +130,8 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 	}
 	for _, row := range rows {
 		mustExec(t, db,
-			"INSERT INTO [Msg_test] VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			`INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id,
+			 message_content, WCDB_CT_message_content, status, origin_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.id, 100+row.id, 1, 1000, 0, row.text, 0, row.status, row.origin,
 		)
 	}
@@ -122,11 +154,39 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 	}
 }
 
+func TestQueryExtractsAtUserIDsFromCompressedMessageSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := encoder.EncodeAll([]byte(`<msgsource><atuserlist>wxid-self, wxid-other,wxid-self</atuserlist></msgsource>`), nil)
+	encoder.Close()
+	mustExec(t, db, `INSERT INTO [Msg_test] (
+		local_id, server_id, local_type, create_time, real_sender_id,
+		message_content, WCDB_CT_message_content, source, WCDB_CT_source, status, origin_source
+	) VALUES (1, 101, 1, 1000, 0, 'hello', 0, ?, 4, 3, 2)`, source)
+	defer func() { _ = db.Close() }()
+
+	events, err := queryNewTable(
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
+		"group@chatroom", true, MessagePosition{CreateTime: 999}, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"wxid-self", "wxid-other"}
+	if len(events) != 1 || !reflect.DeepEqual(events[0].message["at_user_ids"], want) {
+		t.Fatalf("events=%#v want at_user_ids=%v", events, want)
+	}
+}
+
 func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
-	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (1, 101, 1, 1000, 0, 'first', 0, 3, 2)")
-	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'second', 0, 3, 2)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1000, 0, 'first', 0, 3, 2)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 1000, 0, 'second', 0, 3, 2)")
 	defer func() { _ = db.Close() }()
 	events, err := queryNewTable(
 		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
@@ -143,8 +203,8 @@ func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
-	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (1, 0, 1, 1000, 0, 'pending', 0, 2, 1)")
-	mustExec(t, db, "INSERT INTO [Msg_test] VALUES (2, 102, 1, 1000, 0, 'ready', 0, 3, 2)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 0, 1, 1000, 0, 'pending', 0, 2, 1)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 1000, 0, 'ready', 0, 3, 2)")
 	defer func() { _ = db.Close() }()
 	events, err := queryNewTable(
 		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
@@ -271,7 +331,8 @@ func createMessageDB(t *testing.T, path string) *sql.DB {
 	mustExec(t, db, `CREATE TABLE [Msg_test] (
         local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
         create_time INTEGER, real_sender_id INTEGER, message_content BLOB,
-        WCDB_CT_message_content INTEGER, status INTEGER, origin_source INTEGER
+		WCDB_CT_message_content INTEGER, source BLOB, WCDB_CT_source INTEGER,
+		status INTEGER, origin_source INTEGER
     )`)
 	return db
 }

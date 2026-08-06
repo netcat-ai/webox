@@ -106,6 +106,13 @@ type ConversationMetadata struct {
 	Remark string
 }
 
+type AccountInfo struct {
+	AccountID string
+	WeChatID  string
+	Nickname  string
+	AvatarURL string
+}
+
 type keyEntry struct {
 	dbName string
 	key    string
@@ -350,6 +357,48 @@ func (store *Store) ConversationMetadataFor(username string) (ConversationMetada
 		return ConversationMetadata{}, err
 	}
 	return conversationMetadataFromDB(db, username)
+}
+
+func (store *Store) AccountInfoFor(username string) (AccountInfo, error) {
+	db, found, err := store.database("contact/contact.db")
+	if err != nil {
+		return AccountInfo{}, err
+	}
+	if !found {
+		return AccountInfo{}, errors.New("contact database not found")
+	}
+	return accountInfoFromDB(db, username)
+}
+
+func accountInfoFromDB(db *sql.DB, username string) (AccountInfo, error) {
+	username = strings.TrimSpace(username)
+	var accountID string
+	var alias, nickname, bigHeadURL, smallHeadURL sql.NullString
+	err := db.QueryRow(
+		`SELECT username, alias, nick_name, big_head_url, small_head_url
+		 FROM contact WHERE delete_flag=0 AND username=? LIMIT 1`,
+		username,
+	).Scan(&accountID, &alias, &nickname, &bigHeadURL, &smallHeadURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AccountInfo{}, nil
+	}
+	if err != nil {
+		return AccountInfo{}, err
+	}
+	wechatID := strings.TrimSpace(alias.String)
+	if wechatID == "" {
+		wechatID = strings.TrimSpace(accountID)
+	}
+	avatarURL := strings.TrimSpace(bigHeadURL.String)
+	if avatarURL == "" {
+		avatarURL = strings.TrimSpace(smallHeadURL.String)
+	}
+	return AccountInfo{
+		AccountID: strings.TrimSpace(accountID),
+		WeChatID:  wechatID,
+		Nickname:  strings.TrimSpace(nickname.String),
+		AvatarURL: avatarURL,
+	}, nil
 }
 
 func (store *Store) RoomMessagePositionsFor(roomID string) (RoomMessagePositions, error) {
@@ -800,7 +849,7 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	db := shard.db
 	idToUsername := loadIDToUsername(db)
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
-			message_content, WCDB_CT_message_content
+			message_content, WCDB_CT_message_content, source, WCDB_CT_source
 		 FROM [%s]
 		 WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
 		   AND server_id > 0
@@ -813,17 +862,31 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	var events []messageEvent
 	for rows.Next() {
 		var localID, serverID, localType, timestamp, realSenderID int64
-		var contentType sql.NullInt64
-		var content []byte
-		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType); err != nil {
+		var contentType, sourceType sql.NullInt64
+		var content, source []byte
+		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType, &source, &sourceType); err != nil {
 			continue
 		}
 		decoded := decompressMessage(content, contentType.Int64)
+		atUserIDs := messageAtUserIDs(decompressMessage(source, sourceType.Int64))
 		messageType, text := normalizedMessage(localType, decoded, group)
 		messageBody := map[string]any{"content": text}
 		if messageType == "file" {
 			if metadata, ok := parseFileMessage(decoded); ok {
 				messageBody["filename"] = metadata.Filename
+			}
+		} else if messageType == "link" {
+			if metadata, ok := parseLinkMessage(decoded); ok {
+				delete(messageBody, "content")
+				if metadata.Title != "" {
+					messageBody["title"] = metadata.Title
+				}
+				if metadata.Description != "" {
+					messageBody["description"] = metadata.Description
+				}
+				if metadata.URL != "" {
+					messageBody["url"] = metadata.URL
+				}
 			}
 		}
 		event := messageEvent{
@@ -833,12 +896,31 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 				"msgid": strconv.FormatInt(serverID, 10), "local_id": localID,
 				"from":   senderUsername(realSenderID, decoded, group, username, idToUsername),
 				"tolist": []any{}, "roomid": username, "msgtime": saturatingMilliseconds(timestamp),
-				"msgtype": messageType, messageType: messageBody,
+				"msgtype": messageType, messageType: messageBody, "at_user_ids": atUserIDs,
 			},
 		}
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func messageAtUserIDs(source string) []string {
+	var metadata struct {
+		AtUserList string `xml:"atuserlist"`
+	}
+	if xml.Unmarshal([]byte(strings.TrimSpace(source)), &metadata) != nil {
+		return nil
+	}
+	var result []string
+	seen := make(map[string]bool)
+	for value := range strings.SplitSeq(metadata.AtUserList, ",") {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			result = append(result, value)
+			seen[value] = true
+		}
+	}
+	return result
 }
 
 func loadIDToUsername(db *sql.DB) map[int64]string {
@@ -908,9 +990,33 @@ type quotedReference struct {
 
 type linkedMessage struct {
 	AppMessage struct {
-		Title string `xml:"title"`
-		URL   string `xml:"url"`
+		Title       string `xml:"title"`
+		Description string `xml:"des"`
+		URL         string `xml:"url"`
 	} `xml:"appmsg"`
+}
+
+type linkMessageMetadata struct {
+	Title       string
+	Description string
+	URL         string
+}
+
+func parseLinkMessage(content string) (linkMessageMetadata, bool) {
+	document := xmlMessageDocument(content)
+	if document == "" {
+		return linkMessageMetadata{}, false
+	}
+	var message linkedMessage
+	if err := xml.Unmarshal([]byte(document), &message); err != nil {
+		return linkMessageMetadata{}, false
+	}
+	metadata := linkMessageMetadata{
+		Title:       cleanXMLText(message.AppMessage.Title),
+		Description: cleanXMLText(message.AppMessage.Description),
+		URL:         cleanXMLText(message.AppMessage.URL),
+	}
+	return metadata, metadata.Title != "" || metadata.Description != "" || metadata.URL != ""
 }
 
 func quotedMessageText(document string) string {
@@ -964,15 +1070,15 @@ func quotedReferenceText(reference quotedReference) string {
 
 func quotedLinkText(content string) string {
 	result := "[引用消息][链接]"
-	var message linkedMessage
-	if err := xml.Unmarshal([]byte(strings.TrimSpace(content)), &message); err != nil {
+	metadata, ok := parseLinkMessage(content)
+	if !ok {
 		return result
 	}
-	if title := cleanXMLText(message.AppMessage.Title); title != "" {
-		result += " " + title
+	if metadata.Title != "" {
+		result += " " + metadata.Title
 	}
-	if link := strings.TrimSpace(message.AppMessage.URL); link != "" {
-		result += "\n" + link
+	if metadata.URL != "" {
+		result += "\n" + metadata.URL
 	}
 	return result
 }

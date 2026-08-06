@@ -34,6 +34,8 @@ const (
 
 type messageSource interface {
 	IsInitialized() bool
+	AccountID() (string, error)
+	UserInfo() (wechat.UserInfo, error)
 	RefreshLoginQRCode() (bool, error)
 	ValidatePollCursor(string) error
 	PollMessages(string, int) (wechat.PollResult, error)
@@ -50,14 +52,13 @@ type qrSource interface {
 }
 
 type Server struct {
-	apiToken          string
-	providerAccountID string
-	publicBaseURL     string
-	media             *sharedmedia.Store
-	messages          messageSource
-	sender            messageSender
-	qr                qrSource
-	logger            *slog.Logger
+	apiToken      string
+	publicBaseURL string
+	media         *sharedmedia.Store
+	messages      messageSource
+	sender        messageSender
+	qr            qrSource
+	logger        *slog.Logger
 
 	loginMu sync.Mutex
 	login   loginSession
@@ -107,9 +108,9 @@ type typingTicket struct {
 	UserID string `json:"ilink_user_id"`
 }
 
-func New(apiToken, providerAccountID, publicBaseURL string, media *sharedmedia.Store, messages messageSource, sender messageSender, qr qrSource, logger *slog.Logger) *Server {
+func New(apiToken, publicBaseURL string, media *sharedmedia.Store, messages messageSource, sender messageSender, qr qrSource, logger *slog.Logger) *Server {
 	return &Server{
-		apiToken: apiToken, providerAccountID: providerAccountID,
+		apiToken:      apiToken,
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
 		media:         media, messages: messages, sender: sender, qr: qr, logger: logger,
 		cache:       sendReceiptCache{entries: make(map[string]cachedSend)},
@@ -123,6 +124,7 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ilink/bot/get_bot_qrcode", server.getBotQrcode)
 	mux.HandleFunc("POST /ilink/bot/get_bot_qrcode", server.getBotQrcode)
 	mux.HandleFunc("GET /ilink/bot/get_qrcode_status", server.getQrcodeStatus)
+	mux.HandleFunc("GET /ilink/bot/userinfo", server.getUserInfo)
 	mux.HandleFunc("POST /ilink/bot/getupdates", server.getUpdates)
 	mux.HandleFunc("POST /ilink/bot/sendmessage", server.sendMessage)
 	mux.HandleFunc("POST /ilink/bot/getconfig", server.getConfig)
@@ -134,6 +136,41 @@ func (server *Server) Handler() http.Handler {
 
 func (server *Server) health(response http.ResponseWriter, _ *http.Request) {
 	writeJSON(response, http.StatusOK, map[string]any{"ok": true, "ready": server.messages.IsInitialized()})
+}
+
+func (server *Server) getUserInfo(response http.ResponseWriter, request *http.Request) {
+	if !server.authenticate(response, request) {
+		return
+	}
+	if !server.messages.IsInitialized() {
+		writeJSON(response, http.StatusOK, sessionUnavailable(""))
+		return
+	}
+	info, err := server.messages.UserInfo()
+	if err != nil {
+		server.logger.Warn("could not read current WeChat account", "error", err)
+		writeJSON(response, http.StatusOK, sessionUnavailable(""))
+		return
+	}
+	accountID := strings.TrimSpace(info.AccountID)
+	wechatID := strings.TrimSpace(info.WeChatID)
+	if accountID == "" || wechatID == "" {
+		server.logger.Warn("current WeChat account identity is incomplete")
+		writeJSON(response, http.StatusOK, sessionUnavailable(""))
+		return
+	}
+	result := map[string]any{
+		"ret":        0,
+		"account_id": accountID,
+		"wechat_id":  wechatID,
+	}
+	if nickname := strings.TrimSpace(info.Nickname); nickname != "" {
+		result["nickname"] = nickname
+	}
+	if avatarURL := strings.TrimSpace(info.AvatarURL); avatarURL != "" {
+		result["avatar_url"] = avatarURL
+	}
+	writeJSON(response, http.StatusOK, result)
 }
 
 func (server *Server) getBotQrcode(response http.ResponseWriter, request *http.Request) {
@@ -215,9 +252,14 @@ func (server *Server) getQrcodeStatus(response http.ResponseWriter, request *htt
 	server.loginMu.Unlock()
 	result := map[string]any{"status": status}
 	if status == "confirmed" {
+		accountID, err := server.messages.AccountID()
+		if err != nil {
+			writeError(response, http.StatusServiceUnavailable, "current WeChat account is unavailable")
+			return
+		}
 		result["bot_token"] = server.apiToken
-		result["ilink_bot_id"] = server.providerAccountID
-		result["ilink_user_id"] = server.providerAccountID
+		result["ilink_bot_id"] = accountID
+		result["ilink_user_id"] = accountID
 		result["baseurl"] = server.baseURL(request)
 	}
 	writeJSON(response, http.StatusOK, result)
@@ -280,7 +322,6 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		writeJSON(response, http.StatusOK, sessionUnavailable(body.Cursor))
 		return
 	}
-
 	cursor := body.Cursor
 	deadline := time.Now().Add(server.pollTimeout)
 	for {
@@ -290,11 +331,17 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 			writeJSON(response, http.StatusOK, sessionUnavailable(cursor))
 			return
 		}
+		accountID := strings.TrimSpace(result.AccountID)
+		if accountID == "" {
+			server.logger.Warn("WeChat message polling returned no account identity")
+			writeJSON(response, http.StatusOK, sessionUnavailable(cursor))
+			return
+		}
 		cursor = result.Cursor
 		if len(result.Messages) != 0 || !time.Now().Before(deadline) {
 			messages := make([]map[string]any, 0, len(result.Messages))
 			for _, message := range result.Messages {
-				view, err := server.standardMessage(message)
+				view, err := server.standardMessage(message, accountID)
 				if err != nil {
 					server.logger.Warn("could not materialize WeChat message", "error", err)
 					writeError(response, http.StatusInternalServerError, err.Error())
@@ -318,7 +365,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
-func (server *Server) standardMessage(message map[string]any) (map[string]any, error) {
+func (server *Server) standardMessage(message map[string]any, accountID string) (map[string]any, error) {
 	externalID := stringValue(message["msgid"])
 	createdAt := integerValue(message["msgtime"])
 	roomID := stringValue(message["roomid"])
@@ -374,7 +421,7 @@ func (server *Server) standardMessage(message map[string]any) (map[string]any, e
 	view := map[string]any{
 		"seq": integerOr(message["local_id"], messageID), "message_id": messageID,
 		"msgid": externalID, "client_id": externalID,
-		"from_user_id": senderID, "to_user_id": server.providerAccountID, "ilink_user_id": senderID,
+		"from_user_id": senderID, "to_user_id": accountID, "ilink_user_id": senderID,
 		"create_time_ms": createdAt, "update_time_ms": createdAt, "session_id": roomID,
 		"message_type": 1, "message_state": 2,
 		"context_token": server.contextToken(roomID), "text": text,
@@ -400,8 +447,19 @@ func (server *Server) standardMessage(message map[string]any) (map[string]any, e
 	}
 	if strings.HasSuffix(roomID, "@chatroom") {
 		view["group_id"] = roomID
+		view["mentioned_me"] = containsAccountID(message["at_user_ids"], accountID)
 	}
 	return view, nil
+}
+
+func containsAccountID(value any, accountID string) bool {
+	userIDs, _ := value.([]string)
+	for _, userID := range userIDs {
+		if userID == accountID {
+			return true
+		}
+	}
+	return false
 }
 
 func (server *Server) sendMessage(response http.ResponseWriter, request *http.Request) {

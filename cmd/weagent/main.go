@@ -68,7 +68,6 @@ func run(logger *slog.Logger) error {
 
 	protocol := ilink.New(
 		configuration.APIToken,
-		configuration.ProviderAccountID,
 		configuration.PublicBaseURL,
 		media,
 		wechatState,

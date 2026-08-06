@@ -58,8 +58,16 @@ type dbCursor struct {
 }
 
 type PollResult struct {
-	Cursor   string
-	Messages []map[string]any
+	AccountID string
+	Cursor    string
+	Messages  []map[string]any
+}
+
+type UserInfo struct {
+	AccountID string
+	WeChatID  string
+	Nickname  string
+	AvatarURL string
 }
 
 func filterMessagesByRemarkPrefix(
@@ -145,6 +153,47 @@ func (state *State) EnsureStateDir() error {
 
 func (state *State) IsInitialized() bool {
 	return state.initialized.Load()
+}
+
+func (state *State) AccountID() (string, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, wxid, err := state.readyDatabase()
+	if err != nil {
+		return "", err
+	}
+	info, err := state.currentAccountInfo(database, wxid)
+	return info.AccountID, err
+}
+
+func (state *State) UserInfo() (UserInfo, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, wxid, err := state.readyDatabase()
+	if err != nil {
+		return UserInfo{}, err
+	}
+	info, err := state.currentAccountInfo(database, wxid)
+	if err != nil {
+		return UserInfo{}, err
+	}
+	return UserInfo{
+		AccountID: info.AccountID,
+		WeChatID:  info.WeChatID,
+		Nickname:  info.Nickname,
+		AvatarURL: info.AvatarURL,
+	}, nil
+}
+
+func (state *State) currentAccountInfo(database *wechatdb.Store, username string) (wechatdb.AccountInfo, error) {
+	info, err := database.AccountInfoFor(username)
+	if err != nil {
+		return wechatdb.AccountInfo{}, state.dbError("read current WeChat account", err)
+	}
+	if strings.TrimSpace(info.AccountID) == "" || strings.TrimSpace(info.WeChatID) == "" {
+		return wechatdb.AccountInfo{}, errors.New("current WeChat account identity is unavailable")
+	}
+	return info, nil
 }
 
 func (state *State) ValidatePollCursor(rawCursor string) error {
@@ -263,7 +312,11 @@ func (state *State) DismissPostLoginOverlay() (bool, error) {
 func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
-	database, _, err := state.readyDatabase()
+	database, wxid, err := state.readyDatabase()
+	if err != nil {
+		return PollResult{}, err
+	}
+	account, err := state.currentAccountInfo(database, wxid)
 	if err != nil {
 		return PollResult{}, err
 	}
@@ -276,7 +329,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 			return PollResult{}, state.dbError("baseline WeChat messages", err)
 		}
 		encoded, err := state.encodeCursor(cursor)
-		return PollResult{Cursor: encoded, Messages: []map[string]any{}}, err
+		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []map[string]any{}}, err
 	}
 	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
 		return PollResult{}, fmt.Errorf("decode get_updates_buf: %w", err)
@@ -318,7 +371,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 	if err != nil {
 		return PollResult{}, err
 	}
-	return PollResult{Cursor: encoded, Messages: messages}, nil
+	return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: messages}, nil
 }
 
 func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, error) {

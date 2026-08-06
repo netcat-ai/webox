@@ -41,7 +41,7 @@ func TestLoadOrCreateIDIsStable(t *testing.T) {
 	}
 }
 
-func TestLoadCreatesStableILinkIdentity(t *testing.T) {
+func TestLoadCreatesStableILinkCredentials(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("WEBOX_WEAGENT_STATE_DIR", dir)
 	t.Setenv("WEBOX_PUBLIC_BASE_URL", " https://webox.example.test/base/ ")
@@ -56,9 +56,6 @@ func TestLoadCreatesStableILinkIdentity(t *testing.T) {
 	}
 	if first.APIToken == "" || first.APIToken != second.APIToken {
 		t.Fatalf("unstable API token: %q %q", first.APIToken, second.APIToken)
-	}
-	if !strings.HasPrefix(first.ProviderAccountID, "webox-") || first.ProviderAccountID != second.ProviderAccountID {
-		t.Fatalf("unstable provider account ID: %q %q", first.ProviderAccountID, second.ProviderAccountID)
 	}
 	if first.PublicBaseURL != "https://webox.example.test/base" {
 		t.Fatalf("public base URL=%q", first.PublicBaseURL)

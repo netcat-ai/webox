@@ -24,6 +24,10 @@ import (
 
 type fakeMessages struct {
 	initialized bool
+	accountID   string
+	userInfo    wechat.UserInfo
+	accountErr  error
+	userInfoErr error
 	validateErr error
 	pollResult  wechat.PollResult
 	pollErr     error
@@ -35,13 +39,23 @@ type fakeMessages struct {
 }
 
 func (source *fakeMessages) IsInitialized() bool { return source.initialized }
+func (source *fakeMessages) AccountID() (string, error) {
+	return source.accountID, source.accountErr
+}
+func (source *fakeMessages) UserInfo() (wechat.UserInfo, error) {
+	return source.userInfo, source.userInfoErr
+}
 func (source *fakeMessages) RefreshLoginQRCode() (bool, error) {
 	source.refreshes++
 	return true, nil
 }
 func (source *fakeMessages) ValidatePollCursor(string) error { return source.validateErr }
 func (source *fakeMessages) PollMessages(string, int) (wechat.PollResult, error) {
-	return source.pollResult, source.pollErr
+	result := source.pollResult
+	if result.AccountID == "" {
+		result.AccountID = source.accountID
+	}
+	return result, source.pollErr
 }
 func (source *fakeMessages) ReadImage(string, string) (*wechatdb.MediaFile, error) {
 	return source.media, source.mediaErr
@@ -125,7 +139,7 @@ func TestQRCodeLoginReturnsRealCodeAndConfirmsIssuedSession(t *testing.T) {
 	qr.code = nil
 	confirmed := perform(server, http.MethodGet, "/ilink/bot/get_qrcode_status?qrcode=xvfb-qr-current", nil, false)
 	body := responseJSON(t, confirmed)
-	if body["status"] != "confirmed" || body["bot_token"] != "api-token" || body["ilink_bot_id"] != "webox-account" || body["baseurl"] != "http://example.test" {
+	if body["status"] != "confirmed" || body["bot_token"] != "api-token" || body["ilink_bot_id"] != "wxid-self" || body["baseurl"] != "http://example.test" {
 		t.Fatalf("confirmed body=%#v", body)
 	}
 }
@@ -161,7 +175,8 @@ func TestExpiredQRCodeIsRefreshedBeforeReissue(t *testing.T) {
 func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{Cursor: "next-cursor", Messages: []map[string]any{{
+	messages.accountID = "wxid-stale"
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{{
 		"msgid": "message-1", "local_id": int64(7), "from": "wxid-alice", "roomid": "wxid-alice",
 		"msgtime": int64(1781703356000), "msgtype": "text", "text": map[string]any{"content": "hello"},
 		"conversation_name": "Alice", "conversation_remark": "webox.alice",
@@ -174,7 +189,7 @@ func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 	}
 	messagesView := body["msgs"].([]any)
 	message := messagesView[0].(map[string]any)
-	if message["from_user_id"] != "wxid-alice" || message["to_user_id"] != "webox-account" || message["text"] != "hello" {
+	if message["from_user_id"] != "wxid-alice" || message["to_user_id"] != "wxid-self" || message["text"] != "hello" {
 		t.Fatalf("message=%#v", message)
 	}
 	if message["conversation_name"] != "Alice" || message["conversation_remark"] != "webox.alice" {
@@ -183,6 +198,52 @@ func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 	var context contextToken
 	if err := signedpayload.Decode("api-token", message["context_token"].(string), &context); err != nil || context.Target != "wxid-alice" {
 		t.Fatalf("context=%#v err=%v", context, err)
+	}
+}
+
+func TestGetUpdatesIncludesOrdinaryLinkTitleDescriptionAndURL(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{{
+		"msgid": "101", "local_id": int64(7), "from": "wxid-alice", "roomid": "wxid-alice",
+		"msgtime": int64(1781703356000), "msgtype": "link", "link": map[string]any{
+			"title": "文章标题", "description": "文章摘要",
+			"url": "https://example.com/article?id=1&from=wechat",
+		},
+	}}}
+
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	message := body["msgs"].([]any)[0].(map[string]any)
+	want := "[链接] 文章标题\n文章摘要\nhttps://example.com/article?id=1&from=wechat"
+	if response.Code != http.StatusOK || message["wechat_msgtype"] != "link" || message["text"] != want {
+		t.Fatalf("status=%d message=%#v want text=%q", response.Code, message, want)
+	}
+}
+
+func TestGetUpdatesMarksOnlyExplicitGroupAccountMention(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{
+		{
+			"msgid": "message-1", "local_id": int64(7), "from": "wxid-alice", "roomid": "group@chatroom",
+			"msgtime": int64(1781703356000), "msgtype": "text", "text": map[string]any{"content": "@Self hello"},
+			"at_user_ids": []string{"wxid-self", "wxid-other"},
+		},
+		{
+			"msgid": "message-2", "local_id": int64(8), "from": "wxid-alice", "roomid": "group@chatroom",
+			"msgtime": int64(1781703357000), "msgtype": "text", "text": map[string]any{"content": "@all hello"},
+			"at_user_ids": []string{"notify@all"},
+		},
+	}}
+
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	views := body["msgs"].([]any)
+	first := views[0].(map[string]any)
+	second := views[1].(map[string]any)
+	if response.Code != http.StatusOK || first["mentioned_me"] != true || second["mentioned_me"] != false {
+		t.Fatalf("status=%d messages=%#v", response.Code, views)
 	}
 }
 
@@ -419,6 +480,36 @@ func TestBusinessRoutesRequireStandardILinkHeaders(t *testing.T) {
 	}
 }
 
+func TestGetUserInfoReturnsCurrentWeChatAccount(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.userInfo = wechat.UserInfo{AccountID: "wxid-self", WeChatID: "jlyfish", Nickname: "小鱼", AvatarURL: "https://example.test/avatar.png"}
+	response := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, true)
+	body := responseJSON(t, response)
+	if response.Code != http.StatusOK || body["ret"] != float64(0) || body["account_id"] != "wxid-self" || body["wechat_id"] != "jlyfish" || body["nickname"] != "小鱼" || body["avatar_url"] != "https://example.test/avatar.png" {
+		t.Fatalf("status=%d body=%#v", response.Code, body)
+	}
+}
+
+func TestGetUserInfoRequiresAuthenticationAndReadySession(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	unauthorized := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, false)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+	unavailable := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, true)
+	body := responseJSON(t, unavailable)
+	if unavailable.Code != http.StatusOK || body["ret"] != float64(-14) {
+		t.Fatalf("unavailable status=%d body=%#v", unavailable.Code, body)
+	}
+	messages.initialized = true
+	incomplete := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, true)
+	body = responseJSON(t, incomplete)
+	if incomplete.Code != http.StatusOK || body["ret"] != float64(-14) {
+		t.Fatalf("incomplete status=%d body=%#v", incomplete.Code, body)
+	}
+}
+
 func TestGetConfigIssuesBoundTypingTicket(t *testing.T) {
 	server, _, _, _ := testServer(t)
 	response := perform(server, http.MethodPost, "/ilink/bot/getconfig", map[string]any{"ilink_user_id": "wxid-a"}, true)
@@ -445,7 +536,7 @@ func TestLoginSessionDoesNotConfirmUnknownOrExpiredCode(t *testing.T) {
 
 func testServer(t *testing.T) (*Server, *fakeMessages, *fakeSender, *fakeQR) {
 	t.Helper()
-	messages := &fakeMessages{}
+	messages := &fakeMessages{accountID: "wxid-self"}
 	outbound := &fakeSender{}
 	qr := &fakeQR{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -453,7 +544,7 @@ func testServer(t *testing.T) (*Server, *fakeMessages, *fakeSender, *fakeQR) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := New("api-token", "webox-account", "", media, messages, outbound, qr, logger)
+	server := New("api-token", "", media, messages, outbound, qr, logger)
 	server.pollTimeout = time.Millisecond
 	server.pollInterval = time.Millisecond
 	server.qrTimeout = time.Millisecond
