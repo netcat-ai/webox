@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
 )
@@ -60,7 +61,7 @@ type dbCursor struct {
 type PollResult struct {
 	AccountID string
 	Cursor    string
-	Messages  []map[string]any
+	Messages  []ilinkprotocol.WeixinMessage
 }
 
 type UserInfo struct {
@@ -71,15 +72,14 @@ type UserInfo struct {
 }
 
 func filterMessagesByRemarkPrefix(
-	messages []map[string]any,
+	messages []ilinkprotocol.WeixinMessage,
 	lookup func(string) (string, error),
-) ([]map[string]any, error) {
-	filtered := make([]map[string]any, 0, len(messages))
+) ([]ilinkprotocol.WeixinMessage, error) {
+	filtered := make([]ilinkprotocol.WeixinMessage, 0, len(messages))
 	remarks := make(map[string]string)
 	for _, message := range messages {
-		roomID, ok := message["roomid"].(string)
-		roomID = strings.TrimSpace(roomID)
-		if !ok || roomID == "" {
+		roomID := strings.TrimSpace(message.SessionID)
+		if roomID == "" {
 			continue
 		}
 		remark, found := remarks[roomID]
@@ -98,36 +98,6 @@ func filterMessagesByRemarkPrefix(
 	return filtered, nil
 }
 
-func addConversationMetadata(
-	messages []map[string]any,
-	lookup func(string) (wechatdb.ConversationMetadata, error),
-) (map[string]wechatdb.ConversationMetadata, error) {
-	metadataByRoom := make(map[string]wechatdb.ConversationMetadata)
-	for _, message := range messages {
-		roomID, ok := message["roomid"].(string)
-		roomID = strings.TrimSpace(roomID)
-		if !ok || roomID == "" {
-			continue
-		}
-		metadata, found := metadataByRoom[roomID]
-		if !found {
-			var err error
-			metadata, err = lookup(roomID)
-			if err != nil {
-				return nil, err
-			}
-			metadataByRoom[roomID] = metadata
-		}
-		if metadata.Name != "" {
-			message["conversation_name"] = metadata.Name
-		}
-		if metadata.Remark != "" {
-			message["conversation_remark"] = metadata.Remark
-		}
-	}
-	return metadataByRoom, nil
-}
-
 func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
 	return &State{
 		stateDir:            stateDir,
@@ -138,9 +108,9 @@ func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
 }
 
 func (state *State) applyRemarkFilter(
-	messages []map[string]any,
+	messages []ilinkprotocol.WeixinMessage,
 	lookup func(string) (string, error),
-) ([]map[string]any, error) {
+) ([]ilinkprotocol.WeixinMessage, error) {
 	if !state.remarkFilterEnabled {
 		return messages, nil
 	}
@@ -329,7 +299,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 			return PollResult{}, state.dbError("baseline WeChat messages", err)
 		}
 		encoded, err := state.encodeCursor(cursor)
-		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []map[string]any{}}, err
+		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []ilinkprotocol.WeixinMessage{}}, err
 	}
 	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
 		return PollResult{}, fmt.Errorf("decode get_updates_buf: %w", err)
@@ -351,18 +321,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 		}
 		return left.room < right.room
 	})
-	metadataByRoom, err := addConversationMetadata(data.Messages, func(roomID string) (wechatdb.ConversationMetadata, error) {
-		return database.ConversationMetadataFor(roomID)
-	})
-	if err != nil {
-		if state.remarkFilterEnabled {
-			return PollResult{}, state.dbError("read WeChat conversation metadata", err)
-		}
-		metadataByRoom = map[string]wechatdb.ConversationMetadata{}
-	}
-	messages, err := state.applyRemarkFilter(data.Messages, func(roomID string) (string, error) {
-		return metadataByRoom[roomID].Remark, nil
-	})
+	messages, err := state.applyRemarkFilter(data.Messages, database.ConversationRemark)
 	if err != nil {
 		return PollResult{}, state.dbError("filter WeChat messages by conversation remark", err)
 	}
@@ -527,30 +486,12 @@ type orderKey struct {
 	room      string
 }
 
-func messageOrder(message map[string]any) orderKey {
+func messageOrder(message ilinkprotocol.WeixinMessage) orderKey {
 	return orderKey{
-		timestamp: integerField(message["msgtime"]),
-		localID:   integerField(message["local_id"]),
-		room:      stringField(message["roomid"]),
+		timestamp: message.CreateTimeMS,
+		localID:   message.Sequence,
+		room:      message.SessionID,
 	}
-}
-
-func integerField(value any) int64 {
-	switch value := value.(type) {
-	case int64:
-		return value
-	case int:
-		return int64(value)
-	case float64:
-		return int64(value)
-	default:
-		return 0
-	}
-}
-
-func stringField(value any) string {
-	valueString, _ := value.(string)
-	return valueString
 }
 
 func wechatMainWindowReady() (bool, bool) {

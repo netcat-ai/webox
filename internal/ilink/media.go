@@ -3,13 +3,9 @@ package ilink
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/netcat-ai/webox/internal/wechatdb"
 )
-
-const imageItemType = 2
-const fileItemType = 4
 
 var errInboundMediaNotReady = errors.New("inbound media is not ready")
 
@@ -47,24 +43,4 @@ func (server *Server) materializeInboundFile(roomID, messageID string) (*wechatd
 		return nil, "", fmt.Errorf("write WeChat file to shared directory: %w", err)
 	}
 	return file, sharedPath, nil
-}
-
-func outboundImagePath(item map[string]any) (string, error) {
-	return outboundMediaPath(item, "image_item")
-}
-
-func outboundFilePath(item map[string]any) (string, error) {
-	return outboundMediaPath(item, "file_item")
-}
-
-func outboundMediaPath(item map[string]any, key string) (string, error) {
-	body, ok := item[key].(map[string]any)
-	if !ok {
-		return "", fmt.Errorf("%s must be an object", key)
-	}
-	sharedPath := strings.TrimSpace(stringValue(body["shared_path"]))
-	if sharedPath == "" {
-		return "", fmt.Errorf("%s.shared_path is required", key)
-	}
-	return sharedPath, nil
 }

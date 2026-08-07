@@ -62,33 +62,41 @@ POST getupdates(get_updates_buf)
   -> return msgs and next signed cursor
 ```
 
-首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `msgid` 去重。
+首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `message_id` 去重。
 数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
 
 主要字段映射：
 
 | 微信字段 | iLink 字段 |
 | --- | --- |
-| `msgid` | `msgid`、`client_id`、数值 `message_id` |
+| `msgid` | `client_id`、数值 `message_id` |
 | `local_id` | `seq` |
 | `from` | `from_user_id`、`ilink_user_id` |
 | 当前登录账号 `account_id` | `to_user_id` |
 | `roomid` | `session_id`、签名 `context_token` 目标 |
 | `msgtime` | `create_time_ms`、`update_time_ms` |
-| `text.content` | `text`、`item_list[].text_item.text` |
+| `text.content` | `item_list[].text_item.text` |
+| 图片 `appmsg.refermsg` | `item_list[].ref_msg.message_item` |
 | 群消息 `source.atuserlist` | `mentioned_me` |
-| V2 图片 `.dat` | `shared_path`、`item_list[].image_item.shared_path` |
-| 文件 | `filename`、`shared_path`、`item_list[].file_item` |
+| V2 图片 `.dat` | `item_list[].image_item.shared_path` |
+| 文件 | `item_list[].file_item.file_name`、`item_list[].file_item.shared_path` |
 
-Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返回 `conversation_name`（昵称优先）和
-`conversation_remark`（唯一备注）。消费者使用 `session_id` 作为稳定身份，名称字段只用于展示。
+数据库消息先转换为公开 Go 包 `github.com/netcat-ai/webox/ilink` 中有类型的官方 iLink
+`WeixinMessage` / `MessageItem`，再由 `getupdates` 原样交付；其他 Go 消费者可直接复用同一协议类型。
+Webox 不再额外输出顶层 `text`、`msgid`、`wechat_msgtype`、`filename` 或会话名称/备注字段。
+当前协议扩展只有媒体对象中的 `shared_path`，以及待后续群聊 mention 重构的临时 `mentioned_me`。
 
 群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。Webox 解压并解析消息 `source` 中逗号分隔的
 `atuserlist`，仅当其中存在当前账号的完整 `account_id` 时返回 `mentioned_me=true`；不根据消息文本中的昵称
 推测 @，`notify@all` 等群体标记也不等价于明确 @ 当前账号。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
 从微信本地目录复制到共享目录。媒体可用时返回 `inbox/` 相对 `shared_path`，不可用时不返回该字段。
 
-图片按 `_h.dat`、`.dat`、`_t.dat` 的顺序尝试解码，任一成功即可。图片或文件尚未准备好时，
+引用图片在保留原有文本摘要的同时使用 iLink `ref_msg` 结构。Webox 从微信 `refermsg.svrid`
+定位被引用的图片，解码后将路径写入
+`ref_msg.message_item.image_item.shared_path`；图片尚未准备好时复用当前消息的一分钟媒体等待窗口。
+
+图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
+到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，
 `getupdates` 不返回当前批次，也不推进 cursor；单次 HTTP 长轮询到期可返回空消息和原 cursor，由消费者继续请求。
 从微信消息时间起等待满 1 分钟仍不可用时，Webox 记录 WARN、返回不带 `shared_path` 的原媒体消息并推进 cursor，避免永久队头阻塞。
 因此 `shared_path` 是媒体可用性的唯一表达：存在表示媒体已经原子写入共享目录，缺失表示等待超时；原媒体消息仍然存在。

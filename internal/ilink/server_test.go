@@ -11,9 +11,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
@@ -36,6 +38,32 @@ type fakeMessages struct {
 	mediaErr    error
 	file        *wechatdb.LocalFile
 	fileErr     error
+}
+
+func inboundMessage(id, room, senderID string, createdAt int64, item ilinkprotocol.MessageItem) ilinkprotocol.WeixinMessage {
+	messageID, _ := strconv.ParseInt(id, 10, 64)
+	item.MessageID = id
+	item.CreateTimeMS = createdAt
+	item.IsCompleted = true
+	return ilinkprotocol.WeixinMessage{
+		Sequence: 7, MessageID: messageID, ClientID: id,
+		FromUserID: senderID, SessionID: room,
+		CreateTimeMS: createdAt, UpdateTimeMS: createdAt,
+		MessageType: ilinkprotocol.MessageTypeUser, MessageState: ilinkprotocol.MessageStateFinish,
+		Items: []ilinkprotocol.MessageItem{item},
+	}
+}
+
+func textItem(text string) ilinkprotocol.MessageItem {
+	return ilinkprotocol.MessageItem{Type: ilinkprotocol.ItemTypeText, Text: &ilinkprotocol.TextItem{Text: text}}
+}
+
+func imageItem() ilinkprotocol.MessageItem {
+	return ilinkprotocol.MessageItem{Type: ilinkprotocol.ItemTypeImage, Image: &ilinkprotocol.ImageItem{}}
+}
+
+func fileItem(filename string) ilinkprotocol.MessageItem {
+	return ilinkprotocol.MessageItem{Type: ilinkprotocol.ItemTypeFile, File: &ilinkprotocol.FileItem{FileName: filename}}
 }
 
 func (source *fakeMessages) IsInitialized() bool { return source.initialized }
@@ -176,11 +204,9 @@ func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
 	messages.accountID = "wxid-stale"
-	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{{
-		"msgid": "message-1", "local_id": int64(7), "from": "wxid-alice", "roomid": "wxid-alice",
-		"msgtime": int64(1781703356000), "msgtype": "text", "text": map[string]any{"content": "hello"},
-		"conversation_name": "Alice", "conversation_remark": "webox.alice",
-	}}}
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("message-1", "wxid-alice", "wxid-alice", 1781703356000, textItem("hello")),
+	}}
 
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": "", "base_info": map[string]any{}}, true)
 	body := responseJSON(t, response)
@@ -189,11 +215,15 @@ func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 	}
 	messagesView := body["msgs"].([]any)
 	message := messagesView[0].(map[string]any)
-	if message["from_user_id"] != "wxid-alice" || message["to_user_id"] != "wxid-self" || message["text"] != "hello" {
+	item := message["item_list"].([]any)[0].(map[string]any)
+	text := item["text_item"].(map[string]any)["text"]
+	if message["from_user_id"] != "wxid-alice" || message["to_user_id"] != "wxid-self" || text != "hello" {
 		t.Fatalf("message=%#v", message)
 	}
-	if message["conversation_name"] != "Alice" || message["conversation_remark"] != "webox.alice" {
-		t.Fatalf("conversation metadata=%#v", message)
+	for _, key := range []string{"text", "msgid", "shared_path", "filename", "wechat_msgtype", "conversation_name", "conversation_remark"} {
+		if _, exists := message[key]; exists {
+			t.Fatalf("non-iLink field %q in message=%#v", key, message)
+		}
 	}
 	var context contextToken
 	if err := signedpayload.Decode("api-token", message["context_token"].(string), &context); err != nil || context.Target != "wxid-alice" {
@@ -204,45 +234,76 @@ func TestGetUpdatesMapsMessageAndIssuesReplyContext(t *testing.T) {
 func TestGetUpdatesIncludesOrdinaryLinkTitleDescriptionAndURL(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{{
-		"msgid": "101", "local_id": int64(7), "from": "wxid-alice", "roomid": "wxid-alice",
-		"msgtime": int64(1781703356000), "msgtype": "link", "link": map[string]any{
-			"title": "文章标题", "description": "文章摘要",
-			"url": "https://example.com/article?id=1&from=wechat",
-		},
-	}}}
+	want := "[链接] 文章标题\n文章摘要\nhttps://example.com/article?id=1&from=wechat"
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("101", "wxid-alice", "wxid-alice", 1781703356000, textItem(want)),
+	}}
 
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
 	message := body["msgs"].([]any)[0].(map[string]any)
-	want := "[链接] 文章标题\n文章摘要\nhttps://example.com/article?id=1&from=wechat"
-	if response.Code != http.StatusOK || message["wechat_msgtype"] != "link" || message["text"] != want {
+	item := message["item_list"].([]any)[0].(map[string]any)
+	if response.Code != http.StatusOK || item["text_item"].(map[string]any)["text"] != want {
 		t.Fatalf("status=%d message=%#v want text=%q", response.Code, message, want)
+	}
+}
+
+func TestGetUpdatesUsesILinkRefMessageForQuotedImage(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	mediaRoot := t.TempDir()
+	mediaStore, err := sharedmedia.New(mediaRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.media = mediaStore
+	messages.initialized = true
+	imageBytes := append([]byte{0xff, 0xd8, 0xff, 0xe0}, []byte("quoted-image")...)
+	messages.media = &wechatdb.MediaFile{Data: imageBytes, ContentType: "image/jpeg", Filename: "quoted.jpg"}
+	itemValue := textItem("虾虾 看看这个")
+	itemValue.Reference = &ilinkprotocol.RefMessage{MessageItem: &ilinkprotocol.MessageItem{
+		Type: ilinkprotocol.ItemTypeImage, MessageID: "3143822696652695030",
+		IsCompleted: true, Image: &ilinkprotocol.ImageItem{},
+	}}
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("quote-1", "wxid-alice", "wxid-alice", time.Now().UnixMilli(), itemValue),
+	}}
+
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	body := responseJSON(t, response)
+	message := body["msgs"].([]any)[0].(map[string]any)
+	item := message["item_list"].([]any)[0].(map[string]any)
+	refMsg := item["ref_msg"].(map[string]any)
+	reference := refMsg["message_item"].(map[string]any)
+	imageItem := reference["image_item"].(map[string]any)
+	sharedPath := imageItem["shared_path"].(string)
+	if response.Code != http.StatusOK || item["text_item"].(map[string]any)["text"] != "虾虾 看看这个" || item["type"] != float64(ilinkprotocol.ItemTypeText) {
+		t.Fatalf("status=%d message=%#v", response.Code, message)
+	}
+	if _, hasTitle := refMsg["title"]; hasTitle || reference["type"] != float64(ilinkprotocol.ItemTypeImage) || reference["msg_id"] != "3143822696652695030" {
+		t.Fatalf("ref_msg=%#v", refMsg)
+	}
+	written, err := os.ReadFile(filepath.Join(mediaRoot, filepath.FromSlash(sharedPath)))
+	if err != nil || !bytes.Equal(written, imageBytes) {
+		t.Fatalf("path=%q data=%x err=%v", sharedPath, written, err)
 	}
 }
 
 func TestGetUpdatesMarksOnlyExplicitGroupAccountMention(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []map[string]any{
-		{
-			"msgid": "message-1", "local_id": int64(7), "from": "wxid-alice", "roomid": "group@chatroom",
-			"msgtime": int64(1781703356000), "msgtype": "text", "text": map[string]any{"content": "@Self hello"},
-			"at_user_ids": []string{"wxid-self", "wxid-other"},
-		},
-		{
-			"msgid": "message-2", "local_id": int64(8), "from": "wxid-alice", "roomid": "group@chatroom",
-			"msgtime": int64(1781703357000), "msgtype": "text", "text": map[string]any{"content": "@all hello"},
-			"at_user_ids": []string{"notify@all"},
-		},
-	}}
+	firstMessage := inboundMessage("message-1", "group@chatroom", "wxid-alice", 1781703356000, textItem("@Self hello"))
+	firstMessage.MentionedUserIDs = []string{"wxid-self", "wxid-other"}
+	secondMessage := inboundMessage("message-2", "group@chatroom", "wxid-alice", 1781703357000, textItem("@all hello"))
+	secondMessage.MentionedUserIDs = []string{"notify@all"}
+	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []ilinkprotocol.WeixinMessage{firstMessage, secondMessage}}
 
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
 	views := body["msgs"].([]any)
 	first := views[0].(map[string]any)
 	second := views[1].(map[string]any)
-	if response.Code != http.StatusOK || first["mentioned_me"] != true || second["mentioned_me"] != false {
+	_, secondMentioned := second["mentioned_me"]
+	if response.Code != http.StatusOK || first["mentioned_me"] != true || secondMentioned {
 		t.Fatalf("status=%d messages=%#v", response.Code, views)
 	}
 }
@@ -289,10 +350,10 @@ func TestSendMessageBatchesTextImageAndFile(t *testing.T) {
 	body := map[string]any{"msg": map[string]any{
 		"client_id": "batch-1", "context_token": server.contextToken("group@chatroom"),
 		"item_list": []any{
-			map[string]any{"type": fileItemType, "file_item": map[string]any{"shared_path": "outbox/report.txt"}},
-			map[string]any{"type": textItemType, "text_item": map[string]any{"text": "文件已整理完成"}},
-			map[string]any{"type": imageItemType, "image_item": map[string]any{"shared_path": "outbox/chart.png"}},
-			map[string]any{"type": textItemType, "text_item": map[string]any{"text": "请查收"}},
+			map[string]any{"type": ilinkprotocol.ItemTypeFile, "file_item": map[string]any{"shared_path": "outbox/report.txt"}},
+			map[string]any{"type": ilinkprotocol.ItemTypeText, "text_item": map[string]any{"text": "文件已整理完成"}},
+			map[string]any{"type": ilinkprotocol.ItemTypeImage, "image_item": map[string]any{"shared_path": "outbox/chart.png"}},
+			map[string]any{"type": ilinkprotocol.ItemTypeText, "text_item": map[string]any{"text": "请查收"}},
 		},
 	}}
 
@@ -310,7 +371,7 @@ func TestSharedImageIsSentForEveryRequest(t *testing.T) {
 	messages.initialized = true
 	body := map[string]any{"msg": map[string]any{
 		"client_id": "image-request-1", "context_token": server.contextToken("group@chatroom"),
-		"item_list": []any{map[string]any{"type": imageItemType, "image_item": map[string]any{
+		"item_list": []any{map[string]any{"type": ilinkprotocol.ItemTypeImage, "image_item": map[string]any{
 			"shared_path": "outbox/reply.png",
 		}}},
 	}}
@@ -335,17 +396,16 @@ func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
 	messages.initialized = true
 	imageBytes := append([]byte{0xff, 0xd8, 0xff, 0xe0}, []byte("image-bytes")...)
 	messages.media = &wechatdb.MediaFile{Data: imageBytes, ContentType: "image/jpeg", Filename: "message.jpg"}
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
-		"msgid": "123", "local_id": int64(7), "from": "wxid-a", "roomid": "wxid-a",
-		"msgtime": int64(1781703356000), "msgtype": "image", "image": map[string]any{"content": "[图片]"},
-	}}}
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("123", "wxid-a", "wxid-a", 1781703356000, imageItem()),
+	}}
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
 	message := body["msgs"].([]any)[0].(map[string]any)
 	item := message["item_list"].([]any)[0].(map[string]any)
 	imageItem := item["image_item"].(map[string]any)
 	sharedPath := imageItem["shared_path"].(string)
-	if message["shared_path"] != sharedPath || imageItem["shared_path"] != sharedPath {
+	if _, topLevel := message["shared_path"]; topLevel || imageItem["shared_path"] != sharedPath {
 		t.Fatalf("message=%#v", message)
 	}
 	assertNoMediaAvailabilityFields(t, message, imageItem)
@@ -358,15 +418,10 @@ func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
 func TestIncomingMediaWaitsWithoutAdvancingCursor(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{
-		{
-			"msgid": "image-pending", "local_id": int64(11), "from": "wxid-a", "roomid": "wxid-a",
-			"msgtime": time.Now().UnixMilli(), "msgtype": "image", "image": map[string]any{"content": "[图片]"},
-		},
-		{
-			"msgid": "file-pending", "local_id": int64(12), "from": "wxid-a", "roomid": "wxid-a",
-			"msgtime": time.Now().UnixMilli(), "msgtype": "file", "file": map[string]any{"filename": "pending.zip"},
-		},
+	now := time.Now().UnixMilli()
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("image-pending", "wxid-a", "wxid-a", now, imageItem()),
+		inboundMessage("file-pending", "wxid-a", "wxid-a", now, fileItem("pending.zip")),
 	}}
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": "cursor-original"}, true)
 	body := responseJSON(t, response)
@@ -380,7 +435,7 @@ func TestSharedFileIsSentForEveryRequest(t *testing.T) {
 	messages.initialized = true
 	body := map[string]any{"msg": map[string]any{
 		"client_id": "file-request-1", "context_token": server.contextToken("group@chatroom"),
-		"item_list": []any{map[string]any{"type": fileItemType, "file_item": map[string]any{
+		"item_list": []any{map[string]any{"type": ilinkprotocol.ItemTypeFile, "file_item": map[string]any{
 			"shared_path": "outbox/report.pdf",
 		}}},
 	}}
@@ -409,19 +464,16 @@ func TestIncomingFileIsCopiedToSharedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages.file = &wechatdb.LocalFile{Path: source, Filename: "report.pdf"}
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
-		"msgid": "456", "local_id": int64(8), "from": "wxid-a", "roomid": "wxid-a",
-		"msgtime": int64(1781703356000), "msgtype": "file", "file": map[string]any{
-			"content": "[文件] report.pdf", "filename": "report.pdf",
-		},
-	}}}
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("456", "wxid-a", "wxid-a", 1781703356000, fileItem("report.pdf")),
+	}}
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
 	message := body["msgs"].([]any)[0].(map[string]any)
 	item := message["item_list"].([]any)[0].(map[string]any)
 	fileItem := item["file_item"].(map[string]any)
 	sharedPath := fileItem["shared_path"].(string)
-	if message["shared_path"] != sharedPath || fileItem["filename"] != "report.pdf" || fileItem["shared_path"] != sharedPath {
+	if _, topLevel := message["shared_path"]; topLevel || fileItem["file_name"] != "report.pdf" || fileItem["shared_path"] != sharedPath {
 		t.Fatalf("message=%#v", message)
 	}
 	assertNoMediaAvailabilityFields(t, message, fileItem)
@@ -435,15 +487,9 @@ func TestIncomingTimedOutMediaIsDeliveredWithoutSharedPathAndAdvancesCursor(t *t
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
 	timedOut := time.Now().Add(-inboundMediaWait).UnixMilli()
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{
-		{
-			"msgid": "image-timeout", "local_id": int64(9), "from": "wxid-a", "roomid": "wxid-a",
-			"msgtime": timedOut, "msgtype": "image", "image": map[string]any{"content": "[图片]"},
-		},
-		{
-			"msgid": "file-timeout", "local_id": int64(10), "from": "wxid-a", "roomid": "wxid-a",
-			"msgtime": timedOut, "msgtype": "file", "file": map[string]any{"filename": "pending.zip"},
-		},
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []ilinkprotocol.WeixinMessage{
+		inboundMessage("image-timeout", "wxid-a", "wxid-a", timedOut, imageItem()),
+		inboundMessage("file-timeout", "wxid-a", "wxid-a", timedOut, fileItem("pending.zip")),
 	}}
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
@@ -453,13 +499,13 @@ func TestIncomingTimedOutMediaIsDeliveredWithoutSharedPathAndAdvancesCursor(t *t
 	}
 	image := views[0].(map[string]any)
 	imageItem := image["item_list"].([]any)[0].(map[string]any)["image_item"].(map[string]any)
-	if image["shared_path"] != nil || imageItem["shared_path"] != nil {
+	if _, topLevel := image["shared_path"]; topLevel || imageItem["shared_path"] != nil {
 		t.Fatalf("image=%#v", image)
 	}
 	assertNoMediaAvailabilityFields(t, image, imageItem)
 	file := views[1].(map[string]any)
 	fileItem := file["item_list"].([]any)[0].(map[string]any)["file_item"].(map[string]any)
-	if file["filename"] != "pending.zip" || file["shared_path"] != nil || fileItem["shared_path"] != nil {
+	if fileItem["file_name"] != "pending.zip" || fileItem["shared_path"] != nil {
 		t.Fatalf("file=%#v", file)
 	}
 	assertNoMediaAvailabilityFields(t, file, fileItem)
@@ -480,7 +526,7 @@ func assertNoMediaAvailabilityFields(t *testing.T, message, item map[string]any)
 func TestSendMessageRejectsMissingContextLegacyTextAndUnsupportedMedia(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
-	textItem := []any{map[string]any{"type": textItemType, "text_item": map[string]any{"text": "hello"}}}
+	textItem := []any{map[string]any{"type": ilinkprotocol.ItemTypeText, "text_item": map[string]any{"text": "hello"}}}
 	missing := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{"item_list": textItem}}, true)
 	if missing.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", missing.Code)

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -25,7 +26,10 @@ var (
 	imageKeys    sync.Map
 )
 
-const v2ImageHeaderSize = 15
+const (
+	v2ImageHeaderSize  = 15
+	imageThumbnailWait = 3 * time.Second
+)
 
 type MediaFile struct {
 	Data        []byte
@@ -141,6 +145,10 @@ func resourceMD5(packed []byte) string {
 }
 
 func findImageDats(attachRoot, roomID, md5Value string) []string {
+	return findImageDatsAt(attachRoot, roomID, md5Value, time.Now())
+}
+
+func findImageDatsAt(attachRoot, roomID, md5Value string, now time.Time) []string {
 	chatDir := filepath.Join(attachRoot, fmt.Sprintf("%x", md5.Sum([]byte(roomID))))
 	entries, err := os.ReadDir(chatDir)
 	if err != nil {
@@ -155,6 +163,9 @@ func findImageDats(attachRoot, roomID, md5Value string) []string {
 		for _, suffix := range []string{"_h.dat", ".dat", "_t.dat"} {
 			path := filepath.Join(chatDir, month.Name(), "Img", md5Value+suffix)
 			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+				if suffix == "_t.dat" && now.Before(info.ModTime().Add(imageThumbnailWait)) {
+					continue
+				}
 				paths = append(paths, path)
 			}
 		}

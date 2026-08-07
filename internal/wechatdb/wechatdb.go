@@ -24,6 +24,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	_ "github.com/mutecomm/go-sqlcipher/v4"
+	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 )
 
 const (
@@ -92,18 +93,13 @@ func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 }
 
 type PollData struct {
-	Messages []map[string]any
+	Messages []ilinkprotocol.WeixinMessage
 	NewState MessagePositions
 }
 
 type Recipient struct {
 	Username   string
 	SearchTerm string
-}
-
-type ConversationMetadata struct {
-	Name   string
-	Remark string
 }
 
 type AccountInfo struct {
@@ -136,7 +132,7 @@ type messageEvent struct {
 	room     string
 	shard    string
 	position MessagePosition
-	message  map[string]any
+	message  *ilinkprotocol.WeixinMessage
 }
 
 func DetectStorage() string {
@@ -331,32 +327,6 @@ func (store *Store) ConversationRemark(username string) (string, error) {
 		return "", err
 	}
 	return conversationRemarkFromDB(db, username)
-}
-
-func conversationMetadataFromDB(db *sql.DB, username string) (ConversationMetadata, error) {
-	var nickname, remark, alias sql.NullString
-	err := db.QueryRow(
-		"SELECT nick_name, remark, alias FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
-		strings.TrimSpace(username),
-	).Scan(&nickname, &remark, &alias)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ConversationMetadata{}, nil
-	}
-	if err != nil {
-		return ConversationMetadata{}, err
-	}
-	return ConversationMetadata{
-		Name:   conversationDisplayName(nickname.String, remark.String, alias.String),
-		Remark: strings.TrimSpace(remark.String),
-	}, nil
-}
-
-func (store *Store) ConversationMetadataFor(username string) (ConversationMetadata, error) {
-	db, found, err := store.database("contact/contact.db")
-	if err != nil || !found {
-		return ConversationMetadata{}, err
-	}
-	return conversationMetadataFromDB(db, username)
 }
 
 func (store *Store) AccountInfoFor(username string) (AccountInfo, error) {
@@ -793,7 +763,7 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 	}
 	sort.Strings(changed)
 	if len(changed) == 0 {
-		return PollData{Messages: []map[string]any{}, NewState: state}, nil
+		return PollData{Messages: []ilinkprotocol.WeixinMessage{}, NewState: state}, nil
 	}
 	perTableLimit := clamp(limit*4, 100, 2000)
 	var events []messageEvent
@@ -829,14 +799,14 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 	if state == nil {
 		state = make(MessagePositions)
 	}
-	messages := make([]map[string]any, 0, limit)
+	messages := make([]ilinkprotocol.WeixinMessage, 0, limit)
 	for _, event := range events[:min(len(events), clamp(limit*10, 200, 5000))] {
 		if state[event.room] == nil {
 			state[event.room] = make(RoomMessagePositions)
 		}
 		state[event.room][event.shard] = event.position
 		if event.message != nil {
-			messages = append(messages, event.message)
+			messages = append(messages, *event.message)
 			if len(messages) >= limit {
 				break
 			}
@@ -869,34 +839,49 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 		}
 		decoded := decompressMessage(content, contentType.Int64)
 		atUserIDs := messageAtUserIDs(decompressMessage(source, sourceType.Int64))
-		messageType, text := normalizedMessage(localType, decoded, group)
-		messageBody := map[string]any{"content": text}
-		if messageType == "file" {
-			if metadata, ok := parseFileMessage(decoded); ok {
-				messageBody["filename"] = metadata.Filename
-			}
-		} else if messageType == "link" {
-			if metadata, ok := parseLinkMessage(decoded); ok {
-				delete(messageBody, "content")
-				if metadata.Title != "" {
-					messageBody["title"] = metadata.Title
-				}
-				if metadata.Description != "" {
-					messageBody["description"] = metadata.Description
-				}
-				if metadata.URL != "" {
-					messageBody["url"] = metadata.URL
-				}
-			}
+		normalized := normalizeMessage(localType, decoded, group)
+		messageID := strconv.FormatInt(serverID, 10)
+		createdAt := saturatingMilliseconds(timestamp)
+		item := ilinkprotocol.MessageItem{
+			Type:         ilinkprotocol.ItemTypeText,
+			CreateTimeMS: createdAt,
+			IsCompleted:  true,
+			MessageID:    messageID,
+			Text:         &ilinkprotocol.TextItem{Text: normalized.text},
+			Reference:    normalized.reference,
+		}
+		switch normalized.kind {
+		case "image":
+			item.Type = ilinkprotocol.ItemTypeImage
+			item.Text = nil
+			item.Image = &ilinkprotocol.ImageItem{}
+		case "voice":
+			item.Type = ilinkprotocol.ItemTypeVoice
+			item.Text = nil
+			item.Voice = &ilinkprotocol.VoiceItem{}
+		case "file":
+			item.Type = ilinkprotocol.ItemTypeFile
+			item.Text = nil
+			item.File = &ilinkprotocol.FileItem{FileName: normalized.filename}
+		case "video":
+			item.Type = ilinkprotocol.ItemTypeVideo
+			item.Text = nil
+			item.Video = &ilinkprotocol.VideoItem{}
+		}
+		groupID := ""
+		if group {
+			groupID = username
 		}
 		event := messageEvent{
 			room: username, shard: shard.relativePath,
 			position: MessagePosition{CreateTime: timestamp, LocalID: localID},
-			message: map[string]any{
-				"msgid": strconv.FormatInt(serverID, 10), "local_id": localID,
-				"from":   senderUsername(realSenderID, decoded, group, username, idToUsername),
-				"tolist": []any{}, "roomid": username, "msgtime": saturatingMilliseconds(timestamp),
-				"msgtype": messageType, messageType: messageBody, "at_user_ids": atUserIDs,
+			message: &ilinkprotocol.WeixinMessage{
+				Sequence: localID, MessageID: serverID, ClientID: messageID,
+				FromUserID:   senderUsername(realSenderID, decoded, group, username, idToUsername),
+				CreateTimeMS: createdAt, UpdateTimeMS: createdAt,
+				SessionID: username, GroupID: groupID,
+				MessageType: ilinkprotocol.MessageTypeUser, MessageState: ilinkprotocol.MessageStateFinish,
+				Items: []ilinkprotocol.MessageItem{item}, MentionedUserIDs: atUserIDs,
 			},
 		}
 		events = append(events, event)
@@ -951,17 +936,49 @@ func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error)
 	return position, err == nil, err
 }
 
+type normalizedContent struct {
+	kind      string
+	text      string
+	filename  string
+	reference *ilinkprotocol.RefMessage
+}
+
 func normalizedMessage(localType int64, content string, group bool) (string, string) {
+	message := normalizeMessage(localType, content, group)
+	return message.kind, message.text
+}
+
+func normalizeMessage(localType int64, content string, group bool) normalizedContent {
 	base := baseType(localType)
 	if base == 1 {
-		return "text", stripGroupPrefix(content, group)
+		return normalizedContent{kind: "text", text: stripGroupPrefix(content, group)}
 	}
 	if base == 49 && strings.Contains(content, "<refermsg>") {
-		return "text", quotedMessageText(stripGroupPrefix(content, group))
+		document := stripGroupPrefix(content, group)
+		message, ok := parseQuotedMessage(document)
+		if !ok {
+			return normalizedContent{kind: "text", text: quotedMessageText(document)}
+		}
+		reference := message.AppMessage.Reference
+		messageID := cleanXMLText(reference.ServerID)
+		if baseType(reference.Type) == 3 && messageID != "" {
+			return normalizedContent{
+				kind: "text", text: cleanXMLText(message.AppMessage.Title),
+				reference: &ilinkprotocol.RefMessage{MessageItem: &ilinkprotocol.MessageItem{
+					Type: ilinkprotocol.ItemTypeImage, MessageID: messageID,
+					IsCompleted: true, Image: &ilinkprotocol.ImageItem{},
+				}},
+			}
+		}
+		return normalizedContent{kind: "text", text: quotedMessageText(document)}
 	}
 	if base == 49 {
 		if metadata, ok := parseFileMessage(content); ok {
-			return "file", "[文件] " + metadata.Filename
+			return normalizedContent{kind: "file", text: "[文件] " + metadata.Filename, filename: metadata.Filename}
+		}
+		if metadata, ok := parseLinkMessage(content); ok {
+			parts := []string{metadata.Title, metadata.Description, metadata.URL}
+			return normalizedContent{kind: "link", text: compoundText("[链接]", parts...)}
 		}
 	}
 	labels := map[int64]struct{ kind, text string }{
@@ -971,9 +988,9 @@ func normalizedMessage(localType int64, content string, group bool) (string, str
 		10002: {"revoke", "[撤回了一条消息]"},
 	}
 	if value, found := labels[base]; found {
-		return value.kind, value.text
+		return normalizedContent{kind: value.kind, text: value.text}
 	}
-	return "unknown", stripGroupPrefix(content, group)
+	return normalizedContent{kind: "unknown", text: stripGroupPrefix(content, group)}
 }
 
 type quotedMessage struct {
@@ -984,8 +1001,9 @@ type quotedMessage struct {
 }
 
 type quotedReference struct {
-	Type    int64  `xml:"type"`
-	Content string `xml:"content"`
+	Type     int64  `xml:"type"`
+	ServerID string `xml:"svrid"`
+	Content  string `xml:"content"`
 }
 
 type linkedMessage struct {
@@ -1020,8 +1038,8 @@ func parseLinkMessage(content string) (linkMessageMetadata, bool) {
 }
 
 func quotedMessageText(document string) string {
-	var message quotedMessage
-	if err := xml.Unmarshal([]byte(document), &message); err != nil {
+	message, ok := parseQuotedMessage(document)
+	if !ok {
 		return cleanXMLText(extractXMLText(document, "title"))
 	}
 	current := cleanXMLText(message.AppMessage.Title)
@@ -1035,6 +1053,18 @@ func quotedMessageText(document string) string {
 	return current + "\n" + reference
 }
 
+func parseQuotedMessage(document string) (quotedMessage, bool) {
+	document = xmlMessageDocument(document)
+	if document == "" {
+		return quotedMessage{}, false
+	}
+	var message quotedMessage
+	if err := xml.Unmarshal([]byte(document), &message); err != nil {
+		return quotedMessage{}, false
+	}
+	return message, true
+}
+
 func quotedReferenceText(reference quotedReference) string {
 	switch baseType(reference.Type) {
 	case 1:
@@ -1044,8 +1074,6 @@ func quotedReferenceText(reference quotedReference) string {
 		}
 		return "[引用消息] " + content
 	case 3:
-		// TODO: Resolve the referenced image from refermsg metadata and expose it
-		// as an inbound attachment instead of flattening it to text.
 		return "[引用消息][图片]"
 	case 34:
 		return "[引用消息][语音]"
@@ -1068,6 +1096,22 @@ func quotedReferenceText(reference quotedReference) string {
 	default:
 		return ""
 	}
+}
+
+func compoundText(prefix string, values ...string) string {
+	parts := make([]string, 0, len(values))
+	seen := make(map[string]bool)
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			parts = append(parts, value)
+			seen[value] = true
+		}
+	}
+	if len(parts) == 0 {
+		return prefix
+	}
+	return prefix + " " + strings.Join(parts, "\n")
 }
 
 func quotedLinkText(content string) string {
@@ -1157,15 +1201,6 @@ func latestDBMtime(root string) time.Time {
 
 func recipientDisplayName(username, nickname, remark, alias string) string {
 	for _, value := range []string{remark, nickname, alias, username} {
-		if value = strings.TrimSpace(value); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func conversationDisplayName(nickname, remark, alias string) string {
-	for _, value := range []string{nickname, remark, alias} {
 		if value = strings.TrimSpace(value); value != "" {
 			return value
 		}

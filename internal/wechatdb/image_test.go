@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFindImageDatsPrefersHighQualityThenStandardThenThumbnail(t *testing.T) {
@@ -27,20 +28,55 @@ func TestFindImageDatsPrefersHighQualityThenStandardThenThumbnail(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if got := findImageDats(attachRoot, roomID, imageMD5); len(got) != 3 || got[0] != paths["high"] || got[1] != paths["standard"] || got[2] != paths["thumbnail"] {
+	now := time.Now().Add(imageThumbnailWait)
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, now); len(got) != 3 || got[0] != paths["high"] || got[1] != paths["standard"] || got[2] != paths["thumbnail"] {
 		t.Fatalf("all variants selected %#v, want high then standard then thumbnail", got)
 	}
 	if err := os.Remove(paths["high"]); err != nil {
 		t.Fatal(err)
 	}
-	if got := findImageDats(attachRoot, roomID, imageMD5); len(got) != 2 || got[0] != paths["standard"] || got[1] != paths["thumbnail"] {
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, now); len(got) != 2 || got[0] != paths["standard"] || got[1] != paths["thumbnail"] {
 		t.Fatalf("fallback variants selected %#v, want standard then thumbnail", got)
 	}
 	if err := os.Remove(paths["standard"]); err != nil {
 		t.Fatal(err)
 	}
-	if got := findImageDats(attachRoot, roomID, imageMD5); len(got) != 1 || got[0] != paths["thumbnail"] {
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, now); len(got) != 1 || got[0] != paths["thumbnail"] {
 		t.Fatalf("thumbnail fallback selected %#v, want %q", got, paths["thumbnail"])
+	}
+}
+
+func TestFindImageDatsDefersThumbnailForThreeSeconds(t *testing.T) {
+	attachRoot := t.TempDir()
+	roomID := "room@chatroom"
+	imageMD5 := "0123456789abcdef0123456789abcdef"
+	imageDir := filepath.Join(attachRoot, fmt.Sprintf("%x", md5.Sum([]byte(roomID))), "2026-08", "Img")
+	if err := os.MkdirAll(imageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	thumbnail := filepath.Join(imageDir, imageMD5+"_t.dat")
+	if err := os.WriteFile(thumbnail, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writtenAt := time.Unix(1786106120, 0)
+	if err := os.Chtimes(thumbnail, writtenAt, writtenAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, writtenAt.Add(imageThumbnailWait-time.Nanosecond)); len(got) != 0 {
+		t.Fatalf("fresh thumbnail selected before wait elapsed: %#v", got)
+	}
+	standard := filepath.Join(imageDir, imageMD5+".dat")
+	if err := os.WriteFile(standard, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, writtenAt.Add(time.Second)); len(got) != 1 || got[0] != standard {
+		t.Fatalf("standard image did not bypass thumbnail wait: %#v", got)
+	}
+	if err := os.Remove(standard); err != nil {
+		t.Fatal(err)
+	}
+	if got := findImageDatsAt(attachRoot, roomID, imageMD5, writtenAt.Add(imageThumbnailWait)); len(got) != 1 || got[0] != thumbnail {
+		t.Fatalf("thumbnail selected at deadline %#v, want %q", got, thumbnail)
 	}
 }
 

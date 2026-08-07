@@ -79,6 +79,22 @@ func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing
 	}
 }
 
+func TestNormalizedMessageUsesILinkReferenceForQuotedImage(t *testing.T) {
+	content := `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
+		`<type>3</type><svrid>3143822696652695030</svrid><fromusr>group@chatroom</fromusr>` +
+		`<chatusr>wxid_sender</chatusr><displayname>小鱼</displayname><createtime>1781703356</createtime>` +
+		`<content><![CDATA[<msg><img aeskey="secret" /></msg>]]></content></refermsg></appmsg></msg>`
+
+	message := normalizeMessage(49, content, false)
+	if message.kind != "text" || message.text != "虾虾 看看这个" || message.reference == nil || message.reference.Title != "" {
+		t.Fatalf("message=%#v", message)
+	}
+	reference := message.reference.MessageItem
+	if reference == nil || reference.Type != 2 || reference.MessageID != "3143822696652695030" || reference.Image == nil {
+		t.Fatalf("reference=%#v", reference)
+	}
+}
+
 func TestNormalizedMessageRecognizesFileAppMessage(t *testing.T) {
 	content := "wxid_sender:\n" + `<msg><appmsg><title>report.pdf</title><type>6</type>` +
 		`<appattach><totallen>42</totallen></appattach></appmsg></msg>`
@@ -106,13 +122,10 @@ func TestQueryExtractsOrdinaryLinkMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]any{
-		"title": "文章标题", "description": "文章摘要",
-		"url": "https://example.com/article?id=1&from=wechat",
-	}
-	if len(events) != 1 || events[0].message["msgtype"] != "link" ||
-		!reflect.DeepEqual(events[0].message["link"], want) {
-		t.Fatalf("events=%#v want link=%#v", events, want)
+	want := "[链接] 文章标题\n文章摘要\nhttps://example.com/article?id=1&from=wechat"
+	if len(events) != 1 || len(events[0].message.Items) != 1 || events[0].message.Items[0].Text == nil ||
+		events[0].message.Items[0].Text.Text != want {
+		t.Fatalf("events=%#v want text=%q", events, want)
 	}
 }
 
@@ -147,7 +160,7 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 		t.Fatalf("events=%d want %d: %#v", len(events), len(rows), events)
 	}
 	for index, event := range events {
-		text := event.message["text"].(map[string]any)["content"]
+		text := event.message.Items[0].Text.Text
 		if text != rows[index].text || event.position.LocalID != int64(rows[index].id) {
 			t.Fatalf("event[%d]=%#v want text=%q", index, event, rows[index].text)
 		}
@@ -177,7 +190,7 @@ func TestQueryExtractsAtUserIDsFromCompressedMessageSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"wxid-self", "wxid-other"}
-	if len(events) != 1 || !reflect.DeepEqual(events[0].message["at_user_ids"], want) {
+	if len(events) != 1 || !reflect.DeepEqual(events[0].message.MentionedUserIDs, want) {
 		t.Fatalf("events=%#v want at_user_ids=%v", events, want)
 	}
 }

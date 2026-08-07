@@ -7,15 +7,16 @@ import (
 	"reflect"
 	"testing"
 
+	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
 )
 
 func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
-	messages := []map[string]any{
-		{"roomid": "wxid-direct"},
-		{"roomid": "family@chatroom"},
-		{"roomid": "noise@chatroom"},
+	messages := []ilinkprotocol.WeixinMessage{
+		{SessionID: "wxid-direct"},
+		{SessionID: "family@chatroom"},
+		{SessionID: "noise@chatroom"},
 	}
 	remarks := map[string]string{
 		"wxid-direct":     "webox.alice",
@@ -32,17 +33,17 @@ func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 	if len(filtered) != 2 {
 		t.Fatalf("filtered=%#v", filtered)
 	}
-	got := []string{filtered[0]["roomid"].(string), filtered[1]["roomid"].(string)}
+	got := []string{filtered[0].SessionID, filtered[1].SessionID}
 	if want := []string{"wxid-direct", "family@chatroom"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rooms=%v want=%v", got, want)
 	}
 }
 
 func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
-	messages := []map[string]any{
-		{"roomid": "wxid-direct"},
-		{"roomid": "wxid-direct"},
-		{"text": map[string]any{"content": "missing room"}},
+	messages := []ilinkprotocol.WeixinMessage{
+		{SessionID: "wxid-direct"},
+		{SessionID: "wxid-direct"},
+		{},
 	}
 	lookupCalls := 0
 
@@ -60,7 +61,7 @@ func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
 
 func TestDisabledRemarkFilterDoesNotReadRemarksOrDropMessages(t *testing.T) {
 	state := New(t.TempDir(), "test-token", false)
-	messages := []map[string]any{{"roomid": "unmarked"}}
+	messages := []ilinkprotocol.WeixinMessage{{SessionID: "unmarked"}}
 	lookupCalled := false
 
 	filtered, err := state.applyRemarkFilter(messages, func(string) (string, error) {
@@ -72,28 +73,6 @@ func TestDisabledRemarkFilterDoesNotReadRemarksOrDropMessages(t *testing.T) {
 	}
 	if lookupCalled || len(filtered) != 1 {
 		t.Fatalf("lookupCalled=%v filtered=%#v", lookupCalled, filtered)
-	}
-}
-
-func TestConversationMetadataIsAddedOncePerRoom(t *testing.T) {
-	messages := []map[string]any{
-		{"roomid": "family@chatroom"},
-		{"roomid": "family@chatroom"},
-		{"roomid": "wxid-direct"},
-	}
-	lookupCalls := 0
-	metadata, err := addConversationMetadata(messages, func(roomID string) (wechatdb.ConversationMetadata, error) {
-		lookupCalls++
-		return wechatdb.ConversationMetadata{Name: "name:" + roomID, Remark: "webox." + roomID}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lookupCalls != 2 || len(metadata) != 2 {
-		t.Fatalf("lookupCalls=%d metadata=%#v", lookupCalls, metadata)
-	}
-	if messages[0]["conversation_name"] != "name:family@chatroom" || messages[0]["conversation_remark"] != "webox.family@chatroom" {
-		t.Fatalf("message=%#v", messages[0])
 	}
 }
 

@@ -30,30 +30,6 @@ func TestConversationRemarkReadsTheExplicitContactRemark(t *testing.T) {
 	}
 }
 
-func TestConversationMetadataPrefersNicknameAndIncludesRemark(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contact.db")
-	db, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mustExec(t, db, `CREATE TABLE contact (
-		username TEXT, nick_name TEXT, remark TEXT, alias TEXT, delete_flag INTEGER
-	)`)
-	mustExec(t, db,
-		"INSERT INTO contact(username, nick_name, remark, alias, delete_flag) VALUES (?, ?, ?, ?, ?)",
-		"family@chatroom", "Family Chat", "webox.family", "family", 0,
-	)
-	defer func() { _ = db.Close() }()
-
-	metadata, err := conversationMetadataFromDB(db, "family@chatroom")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if metadata.Name != "Family Chat" || metadata.Remark != "webox.family" {
-		t.Fatalf("metadata=%#v", metadata)
-	}
-}
-
 func TestAccountInfoReadsVisibleWeChatIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "contact.db")
 	db, err := sql.Open("sqlite3", path)
