@@ -1044,6 +1044,8 @@ func quotedReferenceText(reference quotedReference) string {
 		}
 		return "[引用消息] " + content
 	case 3:
+		// TODO: Resolve the referenced image from refermsg metadata and expose it
+		// as an inbound attachment instead of flattening it to text.
 		return "[引用消息][图片]"
 	case 34:
 		return "[引用消息][语音]"

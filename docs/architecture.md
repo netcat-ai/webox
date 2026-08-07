@@ -86,7 +86,17 @@ Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返�
 群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。Webox 解压并解析消息 `source` 中逗号分隔的
 `atuserlist`，仅当其中存在当前账号的完整 `account_id` 时返回 `mentioned_me=true`；不根据消息文本中的昵称
 推测 @，`notify@all` 等群体标记也不等价于明确 @ 当前账号。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
-从微信本地目录复制到共享目录。两者都返回 `inbox/` 相对 `shared_path`，尚未下载的文件返回 `available=false`。
+从微信本地目录复制到共享目录。媒体可用时返回 `inbox/` 相对 `shared_path`，不可用时不返回该字段。
+
+图片按 `_h.dat`、`.dat`、`_t.dat` 的顺序尝试解码，任一成功即可。图片或文件尚未准备好时，
+`getupdates` 不返回当前批次，也不推进 cursor；单次 HTTP 长轮询到期可返回空消息和原 cursor，由消费者继续请求。
+从微信消息时间起等待满 1 分钟仍不可用时，Webox 记录 WARN、返回不带 `shared_path` 的原媒体消息并推进 cursor，避免永久队头阻塞。
+因此 `shared_path` 是媒体可用性的唯一表达：存在表示媒体已经原子写入共享目录，缺失表示等待超时；原媒体消息仍然存在。
+
+V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
+`libvoipCodec.so`，调用 `wxam_dec_wxam2pic_5` 输出 JPEG；加载 codec 前以 `RTLD_GLOBAL` 预载
+`libz.so.1`，满足其未自行声明的 zlib 符号依赖。该接收链路不调用 FFmpeg；非 Linux 或关闭 CGO 的构建
+会返回明确的不支持错误。
 
 ## 发消息
 
@@ -94,15 +104,14 @@ Webox 还会根据 `roomid` 从联系人数据库读取会话元数据，并返�
 POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...])
   -> authenticate bot token
   -> verify and decode context_token
-  -> check client_id idempotency
   -> resolve recipient and unique remark
   -> resolve media shared_path under /webox/state/media/inbox or outbox
   -> activate WeChat once, paste every item into the same composer, press Enter once
   -> verify every expected text, image, and file in the same local DB conversation
-  -> cache receipt and return ret=0
+  -> return client_id as client_msg_id with ret=0
 ```
 
-服务只信任签名 `context_token` 中的目标，不信任调用方可修改的 `to_user_id`。同一 `client_id` 和相同内容重试直接返回第一次结果；同一 ID 携带不同内容会被拒绝。缓存有 1024 条上限，进程重启后清空。
+服务只信任签名 `context_token` 中的目标，不信任调用方可修改的 `to_user_id`。`client_id` 是调用方提供的消息标识，Webox 原样返回，不赋予其请求幂等语义。
 
 整个发送路径由互斥锁串行化。一个 `item_list` 是一次 UI 发送：文本、图片和文件都通过剪贴板依次粘贴，最后只按一次 Enter，
 不使用附件按钮、文件选择器或坐标点击，也不维护逐 item 发送进度。HTTP 成功
@@ -121,7 +130,7 @@ POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...]
 - 游标带 HMAC 签名，调用方只能原样回传。
 - 进程重启后，空游标从当前数据库末尾建立新基线。
 - UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
-- `client_id` 处理请求重试；`msgid` 处理入站重复。
+- `client_id` 由调用方标识出站消息；`msgid` 处理入站重复。
 - 微信会话退出后，业务接口返回 iLink `ret=-14`，由客户端重新登录。
 
 ## 非目标
@@ -136,7 +145,7 @@ POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...]
 ```text
 cmd/weagent       process lifecycle and HTTP server
 internal/config   persistent iLink credentials and environment configuration
-internal/ilink    iLink routes, authentication, mapping and idempotency
+internal/ilink    iLink routes, authentication and mapping
 internal/qrsource locate login QR from Xvfb framebuffer
 internal/wechat   initialization, signed cursor and DB coordination
 internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher

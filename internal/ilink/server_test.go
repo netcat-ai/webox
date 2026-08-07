@@ -263,7 +263,7 @@ func TestGetUpdatesRejectsInvalidCursorAndReportsExpiredSession(t *testing.T) {
 	}
 }
 
-func TestSendMessageUsesContextAndClientIDIdempotency(t *testing.T) {
+func TestSendMessageUsesContextAndReturnsClientID(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
 	token := server.contextToken("group@chatroom")
@@ -276,15 +276,10 @@ func TestSendMessageUsesContextAndClientIDIdempotency(t *testing.T) {
 	if result := responseJSON(t, first); first.Code != http.StatusOK || result["client_msg_id"] != "request-1" {
 		t.Fatalf("status=%d result=%#v", first.Code, result)
 	}
-	second := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
-	if second.Code != http.StatusOK || outbound.calls != 1 || outbound.target != "group@chatroom" || outbound.text != "reply" {
-		t.Fatalf("status=%d sender=%#v", second.Code, outbound)
-	}
-
 	body["msg"].(map[string]any)["item_list"] = []any{map[string]any{"type": 1, "text_item": map[string]any{"text": "changed"}}}
-	conflict := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
-	if conflict.Code != http.StatusBadRequest || outbound.calls != 1 {
-		t.Fatalf("status=%d calls=%d", conflict.Code, outbound.calls)
+	second := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
+	if result := responseJSON(t, second); second.Code != http.StatusOK || result["client_msg_id"] != "request-1" || outbound.calls != 2 || outbound.target != "group@chatroom" || outbound.text != "changed" {
+		t.Fatalf("status=%d result=%#v sender=%#v", second.Code, result, outbound)
 	}
 }
 
@@ -310,7 +305,7 @@ func TestSendMessageBatchesTextImageAndFile(t *testing.T) {
 	}
 }
 
-func TestSharedImageIsSentIdempotently(t *testing.T) {
+func TestSharedImageIsSentForEveryRequest(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msg": map[string]any{
@@ -321,7 +316,7 @@ func TestSharedImageIsSentIdempotently(t *testing.T) {
 	}}
 	first := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
 	second := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
-	if first.Code != http.StatusOK || second.Code != http.StatusOK || outbound.imageCalls != 1 {
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || outbound.imageCalls != 2 {
 		t.Fatalf("first=%d second=%d imageCalls=%d", first.Code, second.Code, outbound.imageCalls)
 	}
 	if outbound.target != "group@chatroom" || outbound.imagePath != "outbox/reply.png" {
@@ -350,32 +345,37 @@ func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
 	item := message["item_list"].([]any)[0].(map[string]any)
 	imageItem := item["image_item"].(map[string]any)
 	sharedPath := imageItem["shared_path"].(string)
-	if message["shared_path"] != sharedPath || imageItem["available"] != true {
+	if message["shared_path"] != sharedPath || imageItem["shared_path"] != sharedPath {
 		t.Fatalf("message=%#v", message)
 	}
+	assertNoMediaAvailabilityFields(t, message, imageItem)
 	written, err := os.ReadFile(filepath.Join(mediaRoot, filepath.FromSlash(sharedPath)))
 	if err != nil || !bytes.Equal(written, imageBytes) {
 		t.Fatalf("path=%q data=%x err=%v", sharedPath, written, err)
 	}
 }
 
-func TestIncomingUnavailableImageDoesNotBlockPolling(t *testing.T) {
+func TestIncomingMediaWaitsWithoutAdvancingCursor(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
-		"msgid": "321", "local_id": int64(10), "from": "wxid-a", "roomid": "wxid-a",
-		"msgtime": int64(1781703356000), "msgtype": "image", "image": map[string]any{"content": "[图片]"},
-	}}}
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{
+		{
+			"msgid": "image-pending", "local_id": int64(11), "from": "wxid-a", "roomid": "wxid-a",
+			"msgtime": time.Now().UnixMilli(), "msgtype": "image", "image": map[string]any{"content": "[图片]"},
+		},
+		{
+			"msgid": "file-pending", "local_id": int64(12), "from": "wxid-a", "roomid": "wxid-a",
+			"msgtime": time.Now().UnixMilli(), "msgtype": "file", "file": map[string]any{"filename": "pending.zip"},
+		},
+	}}
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": "cursor-original"}, true)
 	body := responseJSON(t, response)
-	message := body["msgs"].([]any)[0].(map[string]any)
-	imageItem := message["item_list"].([]any)[0].(map[string]any)["image_item"].(map[string]any)
-	if response.Code != http.StatusOK || message["shared_path"] != nil || imageItem["available"] != false {
-		t.Fatalf("status=%d message=%#v", response.Code, message)
+	if response.Code != http.StatusOK || body["get_updates_buf"] != "cursor-original" || len(body["msgs"].([]any)) != 0 {
+		t.Fatalf("pending status=%d body=%#v", response.Code, body)
 	}
 }
 
-func TestSharedFileIsSentIdempotently(t *testing.T) {
+func TestSharedFileIsSentForEveryRequest(t *testing.T) {
 	server, messages, outbound, _ := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msg": map[string]any{
@@ -386,7 +386,7 @@ func TestSharedFileIsSentIdempotently(t *testing.T) {
 	}}
 	first := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
 	second := perform(server, http.MethodPost, "/ilink/bot/sendmessage", body, true)
-	if first.Code != http.StatusOK || second.Code != http.StatusOK || outbound.fileCalls != 1 {
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || outbound.fileCalls != 2 {
 		t.Fatalf("first=%d second=%d fileCalls=%d", first.Code, second.Code, outbound.fileCalls)
 	}
 	if outbound.target != "group@chatroom" || outbound.filePath != "outbox/report.pdf" {
@@ -421,30 +421,59 @@ func TestIncomingFileIsCopiedToSharedDirectory(t *testing.T) {
 	item := message["item_list"].([]any)[0].(map[string]any)
 	fileItem := item["file_item"].(map[string]any)
 	sharedPath := fileItem["shared_path"].(string)
-	if message["shared_path"] != sharedPath || fileItem["filename"] != "report.pdf" || fileItem["available"] != true {
+	if message["shared_path"] != sharedPath || fileItem["filename"] != "report.pdf" || fileItem["shared_path"] != sharedPath {
 		t.Fatalf("message=%#v", message)
 	}
+	assertNoMediaAvailabilityFields(t, message, fileItem)
 	written, err := os.ReadFile(filepath.Join(mediaRoot, filepath.FromSlash(sharedPath)))
 	if err != nil || !bytes.Equal(written, fileBytes) {
 		t.Fatalf("path=%q data=%q err=%v", sharedPath, written, err)
 	}
 }
 
-func TestIncomingUnavailableFileDoesNotBlockPolling(t *testing.T) {
+func TestIncomingTimedOutMediaIsDeliveredWithoutSharedPathAndAdvancesCursor(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
-	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{{
-		"msgid": "789", "local_id": int64(9), "from": "wxid-a", "roomid": "wxid-a",
-		"msgtime": int64(1781703356000), "msgtype": "file", "file": map[string]any{
-			"content": "[文件] pending.zip", "filename": "pending.zip",
+	timedOut := time.Now().Add(-inboundMediaWait).UnixMilli()
+	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []map[string]any{
+		{
+			"msgid": "image-timeout", "local_id": int64(9), "from": "wxid-a", "roomid": "wxid-a",
+			"msgtime": timedOut, "msgtype": "image", "image": map[string]any{"content": "[图片]"},
 		},
-	}}}
+		{
+			"msgid": "file-timeout", "local_id": int64(10), "from": "wxid-a", "roomid": "wxid-a",
+			"msgtime": timedOut, "msgtype": "file", "file": map[string]any{"filename": "pending.zip"},
+		},
+	}}
 	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": ""}, true)
 	body := responseJSON(t, response)
-	message := body["msgs"].([]any)[0].(map[string]any)
-	fileItem := message["item_list"].([]any)[0].(map[string]any)["file_item"].(map[string]any)
-	if response.Code != http.StatusOK || message["shared_path"] != nil || fileItem["available"] != false || fileItem["filename"] != "pending.zip" {
-		t.Fatalf("status=%d message=%#v", response.Code, message)
+	views := body["msgs"].([]any)
+	if response.Code != http.StatusOK || body["get_updates_buf"] != "next" || len(views) != 2 {
+		t.Fatalf("status=%d body=%#v", response.Code, body)
+	}
+	image := views[0].(map[string]any)
+	imageItem := image["item_list"].([]any)[0].(map[string]any)["image_item"].(map[string]any)
+	if image["shared_path"] != nil || imageItem["shared_path"] != nil {
+		t.Fatalf("image=%#v", image)
+	}
+	assertNoMediaAvailabilityFields(t, image, imageItem)
+	file := views[1].(map[string]any)
+	fileItem := file["item_list"].([]any)[0].(map[string]any)["file_item"].(map[string]any)
+	if file["filename"] != "pending.zip" || file["shared_path"] != nil || fileItem["shared_path"] != nil {
+		t.Fatalf("file=%#v", file)
+	}
+	assertNoMediaAvailabilityFields(t, file, fileItem)
+}
+
+func assertNoMediaAvailabilityFields(t *testing.T, message, item map[string]any) {
+	t.Helper()
+	for _, key := range []string{"image_available", "file_available"} {
+		if _, exists := message[key]; exists {
+			t.Fatalf("message still exposes %s: %#v", key, message)
+		}
+	}
+	if _, exists := item["available"]; exists {
+		t.Fatalf("media item still exposes available: %#v", item)
 	}
 }
 

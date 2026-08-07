@@ -29,7 +29,7 @@ const (
 	getUpdatesInterval = time.Second
 	qrAcquireTimeout   = 20 * time.Second
 	qrSessionTTL       = 5 * time.Minute
-	maxSendReceipts    = 1024
+	inboundMediaWait   = time.Minute
 )
 
 type messageSource interface {
@@ -63,7 +63,6 @@ type Server struct {
 	loginMu sync.Mutex
 	login   loginSession
 	sendMu  sync.Mutex
-	cache   sendReceiptCache
 
 	pollTimeout  time.Duration
 	pollInterval time.Duration
@@ -74,16 +73,6 @@ type loginSession struct {
 	activeQrcode    string
 	activeIssuedAt  time.Time
 	confirmedQrcode string
-}
-
-type cachedSend struct {
-	fingerprint     string
-	clientMessageID string
-}
-
-type sendReceiptCache struct {
-	entries map[string]cachedSend
-	order   []string
 }
 
 type getUpdatesRequest struct {
@@ -113,7 +102,6 @@ func New(apiToken, publicBaseURL string, media *sharedmedia.Store, messages mess
 		apiToken:      apiToken,
 		publicBaseURL: strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
 		media:         media, messages: messages, sender: sender, qr: qr, logger: logger,
-		cache:       sendReceiptCache{entries: make(map[string]cachedSend)},
 		pollTimeout: getUpdatesTimeout, pollInterval: getUpdatesInterval, qrTimeout: qrAcquireTimeout,
 	}
 }
@@ -337,20 +325,47 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 			writeJSON(response, http.StatusOK, sessionUnavailable(cursor))
 			return
 		}
-		cursor = result.Cursor
-		if len(result.Messages) != 0 || !time.Now().Before(deadline) {
+		if len(result.Messages) == 0 {
+			cursor = result.Cursor
+		} else {
 			messages := make([]map[string]any, 0, len(result.Messages))
+			blocked := false
 			for _, message := range result.Messages {
-				view, err := server.standardMessage(message, accountID)
-				if err != nil {
-					server.logger.Warn("could not materialize WeChat message", "error", err)
-					writeError(response, http.StatusInternalServerError, err.Error())
+				mediaWaitExpired := inboundMediaWaitExpired(message, time.Now())
+				view, materializeErr := server.standardMessage(message, accountID, mediaWaitExpired)
+				if errors.Is(materializeErr, errInboundMediaNotReady) {
+					server.logger.Debug("waiting for WeChat media",
+						"msgid", stringValue(message["msgid"]), "type", messageType(message), "error", materializeErr,
+					)
+					blocked = true
+					break
+				}
+				if materializeErr != nil {
+					server.logger.Warn("could not materialize WeChat message", "error", materializeErr)
+					writeError(response, http.StatusInternalServerError, materializeErr.Error())
 					return
+				}
+				if mediaWaitExpired && (messageType(message) == "image" || messageType(message) == "file") {
+					if _, available := view["shared_path"]; !available {
+						server.logger.Warn("delivering WeChat media without shared_path after waiting one minute",
+							"msgid", stringValue(message["msgid"]), "type", messageType(message),
+						)
+					}
 				}
 				messages = append(messages, view)
 			}
+			if !blocked {
+				cursor = result.Cursor
+				writeJSON(response, http.StatusOK, map[string]any{
+					"ret": 0, "msgs": messages, "get_updates_buf": cursor,
+					"longpolling_timeout_ms": server.pollTimeout.Milliseconds(),
+				})
+				return
+			}
+		}
+		if !time.Now().Before(deadline) {
 			writeJSON(response, http.StatusOK, map[string]any{
-				"ret": 0, "msgs": messages, "get_updates_buf": cursor,
+				"ret": 0, "msgs": []map[string]any{}, "get_updates_buf": cursor,
 				"longpolling_timeout_ms": server.pollTimeout.Milliseconds(),
 			})
 			return
@@ -365,7 +380,12 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
-func (server *Server) standardMessage(message map[string]any, accountID string) (map[string]any, error) {
+func inboundMediaWaitExpired(message map[string]any, now time.Time) bool {
+	createdAt := integerValue(message["msgtime"])
+	return createdAt <= 0 || !now.Before(time.UnixMilli(createdAt).Add(inboundMediaWait))
+}
+
+func (server *Server) standardMessage(message map[string]any, accountID string, allowMissingMedia bool) (map[string]any, error) {
 	externalID := stringValue(message["msgid"])
 	createdAt := integerValue(message["msgtime"])
 	roomID := stringValue(message["roomid"])
@@ -385,12 +405,12 @@ func (server *Server) standardMessage(message map[string]any, accountID string) 
 	sharedPath := ""
 	kind := messageType(message)
 	if kind == "image" {
-		imageSharedPath, imageErr := server.materializeInboundImage(roomID, externalID)
-		if imageErr != nil {
-			server.logger.Warn("WeChat image is unavailable", "msgid", externalID, "error", imageErr)
+		var imageErr error
+		sharedPath, imageErr = server.materializeInboundImage(roomID, externalID)
+		if imageErr != nil && !(allowMissingMedia && errors.Is(imageErr, errInboundMediaNotReady)) {
+			return nil, imageErr
 		}
-		sharedPath = imageSharedPath
-		imageItem := map[string]any{"available": sharedPath != ""}
+		imageItem := map[string]any{}
 		if sharedPath != "" {
 			imageItem["shared_path"] = sharedPath
 		}
@@ -402,14 +422,14 @@ func (server *Server) standardMessage(message map[string]any, accountID string) 
 		body, _ := message["file"].(map[string]any)
 		filename := strings.TrimSpace(stringValue(body["filename"]))
 		file, fileSharedPath, fileErr := server.materializeInboundFile(roomID, externalID)
-		if fileErr != nil {
+		if fileErr != nil && !(allowMissingMedia && errors.Is(fileErr, errInboundMediaNotReady)) {
 			return nil, fileErr
 		}
-		if file != nil {
+		if fileErr == nil {
 			filename = file.Filename
 			sharedPath = fileSharedPath
 		}
-		fileItem := map[string]any{"filename": filename, "available": sharedPath != ""}
+		fileItem := map[string]any{"filename": filename}
 		if sharedPath != "" {
 			fileItem["shared_path"] = sharedPath
 		}
@@ -434,10 +454,6 @@ func (server *Server) standardMessage(message map[string]any, accountID string) 
 	if kind == "file" {
 		body, _ := items[0]["file_item"].(map[string]any)
 		view["filename"] = stringValue(body["filename"])
-		view["file_available"] = body["available"]
-	} else if kind == "image" {
-		body, _ := items[0]["image_item"].(map[string]any)
-		view["image_available"] = body["available"]
 	}
 	if name := strings.TrimSpace(stringValue(message["conversation_name"])); name != "" {
 		view["conversation_name"] = name
@@ -484,30 +500,13 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
 	}
-	clientID := strings.TrimSpace(body.Message.ClientID)
-	if len(clientID) > 128 {
-		writeError(response, http.StatusBadRequest, "msg.client_id is too long")
-		return
-	}
 	target, err := server.outboundTarget(body.Message.ContextToken)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
 	}
-	fingerprint := messageFingerprint(body.Message)
-
 	server.sendMu.Lock()
 	defer server.sendMu.Unlock()
-	if clientID != "" {
-		if cached, found := server.cache.entries[clientID]; found {
-			if cached.fingerprint != fingerprint {
-				writeError(response, http.StatusBadRequest, "msg.client_id was already used for different content")
-				return
-			}
-			writeJSON(response, http.StatusOK, sendSuccess(cached.clientMessageID))
-			return
-		}
-	}
 	receipt, sendErr := server.sender.Send(request.Context(), target, items)
 	if sendErr != nil {
 		server.logger.Error("could not send WeChat message", "target", target, "error", sendErr)
@@ -515,24 +514,11 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		return
 	}
 	resultID := receipt.ClientMessageID
-	if clientID != "" {
-		resultID = clientID
-		server.rememberSend(clientID, fingerprint, resultID)
+	if body.Message.ClientID != "" {
+		resultID = body.Message.ClientID
 	}
 	server.logger.Info("WeChat message sent", "target", target, "client_msg_id", resultID)
 	writeJSON(response, http.StatusOK, sendSuccess(resultID))
-}
-
-func (server *Server) rememberSend(clientID, fingerprint, messageID string) {
-	if _, exists := server.cache.entries[clientID]; !exists {
-		for len(server.cache.entries) >= maxSendReceipts {
-			oldest := server.cache.order[0]
-			server.cache.order = server.cache.order[1:]
-			delete(server.cache.entries, oldest)
-		}
-		server.cache.order = append(server.cache.order, clientID)
-	}
-	server.cache.entries[clientID] = cachedSend{fingerprint: fingerprint, clientMessageID: messageID}
 }
 
 func (server *Server) getConfig(response http.ResponseWriter, request *http.Request) {
@@ -718,12 +704,6 @@ func outboundItems(message outboundMessage) ([]sender.Item, error) {
 		return nil, errors.New("msg.item_list is required")
 	}
 	return items, nil
-}
-
-func messageFingerprint(message outboundMessage) string {
-	data, _ := json.Marshal(message)
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:])
 }
 
 func messageType(message map[string]any) string {

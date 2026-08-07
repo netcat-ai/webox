@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -73,11 +72,17 @@ func (store *Store) ReadImage(roomID, messageID string) (*MediaFile, error) {
 		if !isHexValue(md5Value, 32) {
 			continue
 		}
-		path := findImageDat(attachRoot, roomID, strings.ToLower(md5Value))
-		if path == "" {
-			continue
+		var decodeErr error
+		for _, path := range findImageDats(attachRoot, roomID, strings.ToLower(md5Value)) {
+			media, err := decodeImageDat(accountDir, attachRoot, path, strings.ToLower(md5Value))
+			if err == nil {
+				return media, nil
+			}
+			decodeErr = errors.Join(decodeErr, fmt.Errorf("decode %s: %w", filepath.Base(path), err))
 		}
-		return decodeImageDat(accountDir, attachRoot, path, strings.ToLower(md5Value))
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
 	}
 	return nil, nil
 }
@@ -135,25 +140,29 @@ func resourceMD5(packed []byte) string {
 	return ""
 }
 
-func findImageDat(attachRoot, roomID, md5Value string) string {
+func findImageDats(attachRoot, roomID, md5Value string) []string {
 	chatDir := filepath.Join(attachRoot, fmt.Sprintf("%x", md5.Sum([]byte(roomID))))
 	entries, err := os.ReadDir(chatDir)
 	if err != nil {
-		return ""
+		return nil
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
 	for _, month := range entries {
 		if !month.IsDir() {
 			continue
 		}
-		for _, suffix := range []string{".dat", "_h.dat", "_t.dat"} {
+		var paths []string
+		for _, suffix := range []string{"_h.dat", ".dat", "_t.dat"} {
 			path := filepath.Join(chatDir, month.Name(), "Img", md5Value+suffix)
 			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
-				return path
+				paths = append(paths, path)
 			}
 		}
+		if len(paths) != 0 {
+			return paths
+		}
 	}
-	return ""
+	return nil
 }
 
 func decodeImageDat(accountDir, attachRoot, path, md5Value string) (*MediaFile, error) {
@@ -193,35 +202,17 @@ func decodeImageDat(accountDir, attachRoot, path, md5Value string) (*MediaFile, 
 }
 
 func convertWXGFToJPEG(data []byte) ([]byte, error) {
-	payload := wxgfHEVCPayload(data)
-	if payload == nil {
-		return nil, errors.New("wxgf image has no HEVC payload")
+	if !bytes.HasPrefix(data, []byte("wxgf")) {
+		return nil, errors.New("invalid wxgf image")
 	}
-	command := exec.Command(
-		"ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "hevc", "-i", "pipe:0",
-		"-frames:v", "1", "-q:v", "2", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
-	)
-	command.Stdin = bytes.NewReader(payload)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	jpeg, err := command.Output()
+	jpeg, err := decodeWXGF(data)
 	if err != nil {
-		return nil, fmt.Errorf("convert wxgf with ffmpeg: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, err
 	}
 	if imageContentType(jpeg) != "image/jpeg" {
-		return nil, errors.New("ffmpeg did not produce a JPEG image from wxgf")
+		return nil, errors.New("WeChat WXGF decoder did not produce a JPEG image")
 	}
 	return jpeg, nil
-}
-
-func wxgfHEVCPayload(data []byte) []byte {
-	if !bytes.HasPrefix(data, []byte("wxgf")) {
-		return nil
-	}
-	if offset := bytes.Index(data, []byte{0, 0, 0, 1}); offset >= 0 {
-		return data[offset:]
-	}
-	return nil
 }
 
 func imageKey(accountDir, attachRoot string) (imageKeyMaterial, error) {

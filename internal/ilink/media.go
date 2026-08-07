@@ -11,16 +11,18 @@ import (
 const imageItemType = 2
 const fileItemType = 4
 
+var errInboundMediaNotReady = errors.New("inbound media is not ready")
+
 func (server *Server) materializeInboundImage(roomID, messageID string) (string, error) {
 	if server.media == nil {
 		return "", errors.New("shared media store is unavailable")
 	}
 	media, err := server.messages.ReadImage(roomID, messageID)
 	if err != nil {
-		return "", fmt.Errorf("read WeChat image: %w", err)
+		return "", fmt.Errorf("%w: read WeChat image: %v", errInboundMediaNotReady, err)
 	}
 	if media == nil {
-		return "", errors.New("WeChat image is not available yet")
+		return "", errInboundMediaNotReady
 	}
 	sharedPath, err := server.media.WriteInbox(roomID, messageID, media.Data, media.ContentType)
 	if err != nil {
@@ -35,10 +37,10 @@ func (server *Server) materializeInboundFile(roomID, messageID string) (*wechatd
 	}
 	file, err := server.messages.ReadFile(roomID, messageID)
 	if err != nil {
-		return nil, "", fmt.Errorf("read WeChat file: %w", err)
+		return nil, "", fmt.Errorf("%w: read WeChat file: %v", errInboundMediaNotReady, err)
 	}
 	if file == nil {
-		return nil, "", nil
+		return nil, "", errInboundMediaNotReady
 	}
 	sharedPath, err := server.media.CopyInboxFile(roomID, messageID, file.Filename, file.Path)
 	if err != nil {
