@@ -14,7 +14,6 @@ import (
 
 	"github.com/netcat-ai/webox/internal/config"
 	"github.com/netcat-ai/webox/internal/ilink"
-	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
@@ -58,21 +57,18 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	qr := qrsource.New(configuration.QRScreenshotPath)
 	var workers sync.WaitGroup
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		runInitializer(ctx, wechatState, qr, logger)
+		runInitializer(ctx, wechatState, logger)
 	}()
 
 	protocol := ilink.New(
 		configuration.APIToken,
-		configuration.PublicBaseURL,
 		media,
 		wechatState,
 		sender.New(wechatState, media),
-		qr,
 		logger,
 	)
 	server := &http.Server{Handler: requestLogger(protocol.Handler(), logger), ReadHeaderTimeout: 5 * time.Second}
@@ -105,11 +101,11 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
-func runInitializer(ctx context.Context, state *wechat.State, source qrsource.Source, logger *slog.Logger) {
+func runInitializer(ctx context.Context, state *wechat.State, logger *slog.Logger) {
 	if !wait(ctx, 3*time.Second) {
 		return
 	}
-	readyLogged, noQRChecks := false, 0
+	readyLogged, loginRequiredLogged := false, false
 	var postLogin postLoginUIState
 	for {
 		initialization, err := state.InitializeIfReady()
@@ -136,27 +132,13 @@ func runInitializer(ctx context.Context, state *wechat.State, source qrsource.So
 				logger.Info("wechat automatic initialization is ready")
 				readyLogged = true
 			}
-			noQRChecks = 0
+			loginRequiredLogged = false
 		} else {
 			readyLogged = false
 			postLogin.shouldDismiss(wechat.WaitingForLogin)
-			code, err := source.Latest()
-			if err != nil {
-				logger.Warn("could not inspect WeChat login QR code", "error", err)
-			}
-			if code != nil {
-				noQRChecks = 0
-			} else {
-				noQRChecks++
-				if noQRChecks >= 3 {
-					clicked, err := state.ClickSavedAccountLogin()
-					if err != nil {
-						logger.Warn("could not activate saved-account login", "error", err)
-					} else if clicked {
-						logger.Info("activated saved-account WeChat login")
-					}
-					noQRChecks = 0
-				}
+			if !loginRequiredLogged {
+				logger.Info("wechat login is required; complete it through noVNC")
+				loginRequiredLogged = true
 			}
 		}
 		if !wait(ctx, time.Second) {

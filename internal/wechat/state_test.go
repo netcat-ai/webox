@@ -113,11 +113,8 @@ func TestCursorRoundTripAndRejectLegacyFields(t *testing.T) {
 	}
 }
 
-func TestGeometrySeparatesLoginAndMainWindows(t *testing.T) {
+func TestGeometryFindsMainWindow(t *testing.T) {
 	geometry := "WINDOW=1\nWIDTH=280\nHEIGHT=380\nWINDOW=2\nWIDTH=980\nHEIGHT=710\n"
-	if got := loginWindowFromGeometry(geometry); got != "1" {
-		t.Fatalf("login window: %q", got)
-	}
 	if got := mainWindowFromGeometry(geometry); got != "2" {
 		t.Fatalf("main window: %q", got)
 	}

@@ -44,7 +44,6 @@ func TestLoadOrCreateIDIsStable(t *testing.T) {
 func TestLoadCreatesStableILinkCredentials(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("WEBOX_WEAGENT_STATE_DIR", dir)
-	t.Setenv("WEBOX_PUBLIC_BASE_URL", " https://webox.example.test/base/ ")
 
 	first, err := Load()
 	if err != nil {
@@ -56,9 +55,6 @@ func TestLoadCreatesStableILinkCredentials(t *testing.T) {
 	}
 	if first.APIToken == "" || first.APIToken != second.APIToken {
 		t.Fatalf("unstable API token: %q %q", first.APIToken, second.APIToken)
-	}
-	if first.PublicBaseURL != "https://webox.example.test/base" {
-		t.Fatalf("public base URL=%q", first.PublicBaseURL)
 	}
 	if first.MediaDir != filepath.Join(filepath.Dir(dir), "media") {
 		t.Fatalf("media directory=%q", first.MediaDir)

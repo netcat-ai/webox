@@ -124,17 +124,6 @@ func (state *State) IsInitialized() bool {
 	return state.initialized.Load()
 }
 
-func (state *State) AccountID() (string, error) {
-	state.dbMu.Lock()
-	defer state.dbMu.Unlock()
-	database, wxid, err := state.readyDatabase()
-	if err != nil {
-		return "", err
-	}
-	info, err := state.currentAccountInfo(database, wxid)
-	return info.AccountID, err
-}
-
 func (state *State) UserInfo() (UserInfo, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
@@ -241,28 +230,6 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 
 func (state *State) MarkUninitialized() {
 	state.initialized.Store(false)
-}
-
-func (state *State) ClickSavedAccountLogin() (bool, error) {
-	window := wechatLoginWindow()
-	if window == "" {
-		return false, nil
-	}
-	if output, err := exec.Command("xdotool", "mousemove", "--window", window, "140", "290", "click", "1").CombinedOutput(); err != nil {
-		return false, fmt.Errorf("click saved-account login button: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return true, nil
-}
-
-func (state *State) RefreshLoginQRCode() (bool, error) {
-	window := wechatLoginWindow()
-	if window == "" {
-		return false, nil
-	}
-	if output, err := exec.Command("xdotool", "mousemove", "--window", window, "140", "130", "click", "1").CombinedOutput(); err != nil {
-		return false, fmt.Errorf("click expired QR refresh area: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return true, nil
 }
 
 func (state *State) DismissPostLoginOverlay() (bool, error) {
@@ -495,11 +462,6 @@ func wechatMainWindow() string {
 	return mainWindowFromGeometry(geometry)
 }
 
-func wechatLoginWindow() string {
-	geometry, _ := visibleWechatWindowGeometry()
-	return loginWindowFromGeometry(geometry)
-}
-
 func visibleWechatWindowGeometry() (string, bool) {
 	if strings.TrimSpace(os.Getenv("DISPLAY")) == "" {
 		return "", false
@@ -512,10 +474,6 @@ func visibleWechatWindowGeometry() (string, bool) {
 		return "", true
 	}
 	return string(output), true
-}
-
-func loginWindowFromGeometry(output string) string {
-	return windowFromGeometry(output, func(width, height int) bool { return width <= 400 && height <= 500 })
 }
 
 func mainWindowFromGeometry(output string) string {

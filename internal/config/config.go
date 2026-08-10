@@ -13,9 +13,7 @@ import (
 type Config struct {
 	ListenAddr          string
 	APIToken            string
-	PublicBaseURL       string
 	CursorKey           string
-	QRScreenshotPath    string
 	StateDir            string
 	MediaDir            string
 	RemarkFilterEnabled bool
@@ -38,9 +36,7 @@ func Load() (Config, error) {
 	return Config{
 		ListenAddr:          normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
 		APIToken:            apiToken,
-		PublicBaseURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("WEBOX_PUBLIC_BASE_URL")), "/"),
 		CursorKey:           cursorKey,
-		QRScreenshotPath:    strings.TrimSpace(envOr("WEBOX_QR_SCREENSHOT_PATH", "/webox/runtime/xvfb/Xvfb_screen0")),
 		StateDir:            stateDir,
 		MediaDir:            envOr("WEBOX_MEDIA_DIR", filepath.Join(filepath.Dir(stateDir), "media")),
 		RemarkFilterEnabled: remarkFilterEnabled,
