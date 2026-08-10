@@ -2,12 +2,12 @@
 
 `webox` 只解决一个问题：
 
-> 在单个容器里运行 Linux WeChat，并把真实客户端投影成 iLink HTTP 接口。
+> 在单个容器里运行 Linux WeChat，并把真实客户端投影成供 aicat 使用的 HTTP 接口。
 
 ## 设计原则
 
-1. 对外消息契约只有 iLink；不再提供企业微信 AI Bot WebSocket。
-2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 iLink 字段。
+1. 对外只保留 aicat 实际使用的 HTTP 接口，不维持通用 iLink 兼容面。
+2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
 3. WeChat Linux 客户端是真实终端：收消息读本地 DB，发消息驱动客户端 UI。
 4. WeChat DB 是消息事实源，不复制一套业务消息库。
 5. 对发送结果采用同步、可验证语义，不在 UI 操作完成前返回成功。
@@ -16,7 +16,7 @@
 
 ```mermaid
 flowchart LR
-  OpenClaw["OpenClaw Weixin Plugin"] -->|"iLink HTTP"| Adapter["Go iLink adapter"]
+  Aicat["aicat Claw"] -->|"Webox HTTP"| Adapter["Go HTTP adapter"]
   Adapter --> DBScanner["wechatdb scanner"]
   DBScanner --> WXDB["WeChat local DB"]
   Adapter --> UISender["sender"]
@@ -27,20 +27,19 @@ flowchart LR
 
 ## 登录与身份
 
-OpenClaw 通过标准二维码路由发起登录：
+微信登录完全通过 noVNC 桌面手动完成：
 
 ```text
-get_bot_qrcode
-  -> decode QR from Xvfb framebuffer
-  -> OpenClaw displays the real WeChat login URL
-get_qrcode_status
-  -> wait / scaned / confirmed
-  -> return persistent bot_token and baseurl
+noVNC desktop
+  -> scan the WeChat QR code or confirm the saved account
+  -> initializer observes the main window
+  -> extract and persist WeChat DB keys
+  -> expose ready=true from /healthz
 ```
 
-二维码会话只确认当前进程实际签发的 ID，未知或超时 ID 返回 `expired`。微信已登录时，只有携带当前本地 token 的客户端能够恢复连接，避免匿名请求直接取得 token。
+初始化循环不会解析 Xvfb framebuffer，也不会通过固定坐标点击登录按钮。未登录时它只记录一次提示并等待；首次登录、登录失效和已保存账号确认都由使用者在 noVNC 中处理。登录状态和提取出的数据库密钥持久化在 `/webox/state`。
 
-token 和游标签名密钥分别持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
+HTTP token 和游标签名密钥分别持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
 `account_id` 直接取自 contact 自账号记录的 `username`，不假设它具有 `wxid_` 前缀。受 token 保护的
 `GET /ilink/bot/userinfo` 返回必需的 `account_id`、可见且可修改的 `wechat_id`，并在可用时附带
 `nickname` 和 `avatar_url`；这些字段来自同一条 contact 记录。`avatar_url` 优先使用 `big_head_url`，
@@ -55,7 +54,7 @@ token 和游标签名密钥分别持久化。Webox 不再生成额外的 provide
 POST getupdates(get_updates_buf)
   -> verify signed cursor
   -> query encrypted WeChat DB and WAL through SQLCipher
-  -> map rows to iLink msgs
+  -> map rows to Webox msgs
   -> decode V2 image .dat files into /webox/state/media/inbox
   -> copy available WeChat files into /webox/state/media/inbox
   -> return msgs and next signed cursor
@@ -121,12 +120,16 @@ POST sendmessage(msgs[text/image/file...])
 不使用附件按钮、文件选择器或坐标点击。该批次不是原子操作，中途失败时前面的消息可能已经发出，调用方不能自动重试整个批次。
 HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 
-## 辅助接口
+## HTTP 接口
 
-- `getconfig` 签发绑定用户的 `typing_ticket`。
-- `sendtyping` 校验 ticket 后返回 HTTP 501，因为 Linux 微信 UI 没有可靠输入状态动作。
-- `notifystart`、`notifystop` 校验身份并返回 `ret=0`。
-- 语音和视频出站 item 返回 HTTP 501，不伪造成功。
+Webox 只暴露以下接口：
+
+- `GET /healthz`：返回进程存活与微信初始化状态。
+- `GET /ilink/bot/userinfo`：返回当前微信账号身份。
+- `POST /ilink/bot/getupdates`：长轮询接收消息。
+- `POST /ilink/bot/sendmessage`：发送文本、图片和文件。
+
+后三个接口要求 Webox token。语音和视频出站 item 返回 HTTP 501，不伪造成功。
 
 ## 可靠性边界
 
@@ -135,22 +138,23 @@ HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不�
 - 进程重启后，空游标从当前数据库末尾建立新基线。
 - UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
 - `client_id` 由调用方标识出站消息；`msgid` 处理入站重复。
-- 微信会话退出后，业务接口返回 iLink `ret=-14`，由客户端重新登录。
+- 微信会话退出后，业务接口返回 `ret=-14`；使用者通过 noVNC 重新登录。
 
 ## 非目标
 
 - 不实现企业微信 AI Bot、XML/Webhook 或通用消息中台协议。
 - 不维护独立用户、会话或消息事实库。
 - 不从 WeChat 网络流量解析登录或聊天消息。
+- 不通过 HTTP 分发登录二维码或管理登录会话。
+- 不自动识别、刷新或点击微信登录界面。
 - 当前不支持 HTTP 二进制媒体上传或真实输入状态。
 
 ## Go 模块
 
 ```text
 cmd/weagent       process lifecycle and HTTP server
-internal/config   persistent iLink credentials and environment configuration
-internal/ilink    iLink routes, authentication and mapping
-internal/qrsource locate login QR from Xvfb framebuffer
+internal/config   persistent HTTP credentials and environment configuration
+internal/ilink    HTTP routes, authentication and message mapping
 internal/wechat   initialization, signed cursor and DB coordination
 internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher
 internal/sender   serialized xdotool/xclip text sender and DB verification

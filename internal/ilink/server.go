@@ -2,8 +2,6 @@ package ilink
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,10 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
-	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechat"
 	"github.com/netcat-ai/webox/internal/wechatdb"
 	"github.com/netcat-ai/webox/wecom"
@@ -25,16 +21,12 @@ import (
 const (
 	getUpdatesTimeout  = 35 * time.Second
 	getUpdatesInterval = time.Second
-	qrAcquireTimeout   = 20 * time.Second
-	qrSessionTTL       = 5 * time.Minute
 	inboundMediaWait   = time.Minute
 )
 
 type messageSource interface {
 	IsInitialized() bool
-	AccountID() (string, error)
 	UserInfo() (wechat.UserInfo, error)
-	RefreshLoginQRCode() (bool, error)
 	ValidatePollCursor(string) error
 	PollMessages(string, int) (wechat.PollResult, error)
 	ReadImage(string, string) (*wechatdb.MediaFile, error)
@@ -45,32 +37,17 @@ type messageSender interface {
 	Send(context.Context, string, []sender.Item) (sender.Receipt, error)
 }
 
-type qrSource interface {
-	Latest() (*qrsource.LoginCode, error)
-}
-
 type Server struct {
-	apiToken      string
-	publicBaseURL string
-	media         *sharedmedia.Store
-	messages      messageSource
-	sender        messageSender
-	qr            qrSource
-	logger        *slog.Logger
+	apiToken string
+	media    *sharedmedia.Store
+	messages messageSource
+	sender   messageSender
+	logger   *slog.Logger
 
-	loginMu sync.Mutex
-	login   loginSession
-	sendMu  sync.Mutex
+	sendMu sync.Mutex
 
 	pollTimeout  time.Duration
 	pollInterval time.Duration
-	qrTimeout    time.Duration
-}
-
-type loginSession struct {
-	activeQrcode    string
-	activeIssuedAt  time.Time
-	confirmedQrcode string
 }
 
 type getUpdatesRequest struct {
@@ -81,36 +58,23 @@ type sendMessageRequest struct {
 	Messages []wecom.Message `json:"msgs"`
 }
 
-type contextToken struct {
-	Target string `json:"target"`
-}
-
-type typingTicket struct {
-	UserID string `json:"ilink_user_id"`
-}
-
-func New(apiToken, publicBaseURL string, media *sharedmedia.Store, messages messageSource, sender messageSender, qr qrSource, logger *slog.Logger) *Server {
+func New(apiToken string, media *sharedmedia.Store, messages messageSource, sender messageSender, logger *slog.Logger) *Server {
 	return &Server{
-		apiToken:      apiToken,
-		publicBaseURL: strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
-		media:         media, messages: messages, sender: sender, qr: qr, logger: logger,
-		pollTimeout: getUpdatesTimeout, pollInterval: getUpdatesInterval, qrTimeout: qrAcquireTimeout,
+		apiToken:    apiToken,
+		media:       media,
+		messages:    messages,
+		sender:      sender,
+		logger:      logger,
+		pollTimeout: getUpdatesTimeout, pollInterval: getUpdatesInterval,
 	}
 }
 
 func (server *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
-	mux.HandleFunc("GET /ilink/bot/get_bot_qrcode", server.getBotQrcode)
-	mux.HandleFunc("POST /ilink/bot/get_bot_qrcode", server.getBotQrcode)
-	mux.HandleFunc("GET /ilink/bot/get_qrcode_status", server.getQrcodeStatus)
 	mux.HandleFunc("GET /ilink/bot/userinfo", server.getUserInfo)
 	mux.HandleFunc("POST /ilink/bot/getupdates", server.getUpdates)
 	mux.HandleFunc("POST /ilink/bot/sendmessage", server.sendMessage)
-	mux.HandleFunc("POST /ilink/bot/getconfig", server.getConfig)
-	mux.HandleFunc("POST /ilink/bot/sendtyping", server.sendTyping)
-	mux.HandleFunc("POST /ilink/bot/msg/notifystart", server.notifyConnection)
-	mux.HandleFunc("POST /ilink/bot/msg/notifystop", server.notifyConnection)
 	return mux
 }
 
@@ -151,138 +115,6 @@ func (server *Server) getUserInfo(response http.ResponseWriter, request *http.Re
 		result["avatar_url"] = avatarURL
 	}
 	writeJSON(response, http.StatusOK, result)
-}
-
-func (server *Server) getBotQrcode(response http.ResponseWriter, request *http.Request) {
-	if value := strings.TrimSpace(request.URL.Query().Get("bot_type")); value != "" && value != "3" {
-		writeError(response, http.StatusBadRequest, "unsupported bot_type")
-		return
-	}
-	var body struct {
-		LocalTokens []string `json:"local_token_list"`
-	}
-	if request.Method == http.MethodPost && request.Body != nil {
-		if err := decodeJSON(request, &body); err != nil {
-			writeError(response, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	if server.messages.IsInitialized() {
-		if !containsToken(body.LocalTokens, server.apiToken) {
-			writeError(response, http.StatusUnauthorized, "WeChat is already logged in; a matching local token is required")
-			return
-		}
-		server.loginMu.Lock()
-		qrcode := server.login.registerResume()
-		server.loginMu.Unlock()
-		writeJSON(response, http.StatusOK, map[string]any{"qrcode": qrcode, "qrcode_img_content": ""})
-		return
-	}
-	server.loginMu.Lock()
-	expired := server.login.expired(time.Now())
-	server.loginMu.Unlock()
-	if expired {
-		refreshed, err := server.messages.RefreshLoginQRCode()
-		if err != nil {
-			server.logger.Warn("could not refresh expired WeChat QR code", "error", err)
-		} else if refreshed && !waitRequest(request.Context(), 750*time.Millisecond) {
-			return
-		}
-	}
-
-	deadline := time.Now().Add(server.qrTimeout)
-	for {
-		code, err := server.qr.Latest()
-		if err != nil {
-			server.logger.Warn("could not inspect WeChat login QR code", "error", err)
-		}
-		if code != nil {
-			server.loginMu.Lock()
-			qrcode := server.login.register(code.ID)
-			server.loginMu.Unlock()
-			writeJSON(response, http.StatusOK, map[string]any{"qrcode": qrcode, "qrcode_img_content": code.LoginURL})
-			return
-		}
-		if time.Now().After(deadline) {
-			writeError(response, http.StatusServiceUnavailable, "WeChat login QR code is not ready")
-			return
-		}
-		if !waitRequest(request.Context(), 500*time.Millisecond) {
-			return
-		}
-	}
-}
-
-func (server *Server) getQrcodeStatus(response http.ResponseWriter, request *http.Request) {
-	qrcode := strings.TrimSpace(request.URL.Query().Get("qrcode"))
-	if qrcode == "" {
-		writeError(response, http.StatusBadRequest, "qrcode is required")
-		return
-	}
-	current, err := server.qr.Latest()
-	if err != nil {
-		server.logger.Warn("could not inspect WeChat login QR code", "error", err)
-	}
-	currentID := ""
-	if current != nil {
-		currentID = current.ID
-	}
-	server.loginMu.Lock()
-	status := server.login.status(qrcode, currentID, server.messages.IsInitialized(), time.Now())
-	server.loginMu.Unlock()
-	result := map[string]any{"status": status}
-	if status == "confirmed" {
-		accountID, err := server.messages.AccountID()
-		if err != nil {
-			writeError(response, http.StatusServiceUnavailable, "current WeChat account is unavailable")
-			return
-		}
-		result["bot_token"] = server.apiToken
-		result["ilink_bot_id"] = accountID
-		result["ilink_user_id"] = accountID
-		result["baseurl"] = server.baseURL(request)
-	}
-	writeJSON(response, http.StatusOK, result)
-}
-
-func (session *loginSession) register(qrcode string) string {
-	if session.activeQrcode != qrcode {
-		session.activeQrcode = qrcode
-		session.activeIssuedAt = time.Now()
-		session.confirmedQrcode = ""
-	}
-	return qrcode
-}
-
-func (session *loginSession) registerResume() string {
-	return session.register("resume-" + randomID())
-}
-
-func (session *loginSession) expired(now time.Time) bool {
-	return session.activeQrcode != "" && !session.activeIssuedAt.IsZero() && now.Sub(session.activeIssuedAt) >= qrSessionTTL
-}
-
-func (session *loginSession) status(requested, current string, initialized bool, now time.Time) string {
-	known := requested == session.activeQrcode || requested == session.confirmedQrcode
-	if !known {
-		return "expired"
-	}
-	if initialized {
-		session.confirmedQrcode = requested
-		session.activeQrcode = ""
-		session.activeIssuedAt = time.Time{}
-		return "confirmed"
-	}
-	if requested == session.confirmedQrcode || session.activeIssuedAt.IsZero() || session.expired(now) {
-		return "expired"
-	}
-	if current != "" {
-		if current == requested {
-			return "wait"
-		}
-		return "expired"
-	}
-	return "scaned"
 }
 
 func (server *Server) getUpdates(response http.ResponseWriter, request *http.Request) {
@@ -531,71 +363,6 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 	writeJSON(response, http.StatusOK, sendSuccess(resultID))
 }
 
-func (server *Server) getConfig(response http.ResponseWriter, request *http.Request) {
-	if !server.authenticate(response, request) {
-		return
-	}
-	var body struct {
-		UserID       string `json:"ilink_user_id"`
-		ContextToken string `json:"context_token"`
-	}
-	if err := decodeJSON(request, &body); err != nil {
-		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	userID := strings.TrimSpace(body.UserID)
-	if userID == "" && strings.TrimSpace(body.ContextToken) != "" {
-		var context contextToken
-		if err := signedpayload.Decode(server.apiToken, body.ContextToken, &context); err != nil {
-			writeError(response, http.StatusBadRequest, "invalid context_token: "+err.Error())
-			return
-		}
-		userID = strings.TrimSpace(context.Target)
-	}
-	if userID == "" {
-		writeError(response, http.StatusBadRequest, "ilink_user_id or context_token is required")
-		return
-	}
-	ticket, _ := signedpayload.Encode(server.apiToken, typingTicket{UserID: userID})
-	writeJSON(response, http.StatusOK, map[string]any{"ret": 0, "typing_ticket": ticket})
-}
-
-func (server *Server) sendTyping(response http.ResponseWriter, request *http.Request) {
-	if !server.authenticate(response, request) {
-		return
-	}
-	var body struct {
-		UserID string `json:"ilink_user_id"`
-		Ticket string `json:"typing_ticket"`
-		Status *int   `json:"status"`
-	}
-	if err := decodeJSON(request, &body); err != nil {
-		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	if body.Status == nil || (*body.Status != 1 && *body.Status != 2) {
-		writeError(response, http.StatusBadRequest, "status must be 1 or 2")
-		return
-	}
-	var ticket typingTicket
-	if err := signedpayload.Decode(server.apiToken, body.Ticket, &ticket); err != nil {
-		writeError(response, http.StatusBadRequest, "invalid typing_ticket: "+err.Error())
-		return
-	}
-	if strings.TrimSpace(body.UserID) != "" && body.UserID != ticket.UserID {
-		writeError(response, http.StatusBadRequest, "typing_ticket user mismatch")
-		return
-	}
-	writeError(response, http.StatusNotImplemented, "WeChat Linux UI does not expose a reliable typing indicator action")
-}
-
-func (server *Server) notifyConnection(response http.ResponseWriter, request *http.Request) {
-	if !server.authenticate(response, request) {
-		return
-	}
-	writeJSON(response, http.StatusOK, map[string]any{"ret": 0})
-}
-
 func (server *Server) authenticate(response http.ResponseWriter, request *http.Request) bool {
 	if !strings.EqualFold(strings.TrimSpace(request.Header.Get("AuthorizationType")), "ilink_bot_token") {
 		writeError(response, http.StatusUnauthorized, "missing or invalid AuthorizationType")
@@ -610,13 +377,6 @@ func (server *Server) authenticate(response http.ResponseWriter, request *http.R
 		return false
 	}
 	return true
-}
-
-func (server *Server) baseURL(request *http.Request) string {
-	if server.publicBaseURL != "" {
-		return server.publicBaseURL
-	}
-	return "http://" + request.Host
 }
 
 func decodeJSON(request *http.Request, target any) error {
@@ -648,15 +408,6 @@ func sessionUnavailable(cursor string) map[string]any {
 
 func sendSuccess(clientMessageID string) map[string]any {
 	return map[string]any{"ret": 0, "client_msg_id": clientMessageID}
-}
-
-func containsToken(tokens []string, expected string) bool {
-	for _, token := range tokens {
-		if strings.TrimSpace(token) == expected {
-			return true
-		}
-	}
-	return false
 }
 
 var errUnsupportedOutboundItem = errors.New("only text, image, and file sending are supported")
@@ -709,14 +460,6 @@ func outboundMessageTarget(message wecom.Message) (string, error) {
 		return "", errors.New("roomid is required")
 	}
 	return target, nil
-}
-
-func randomID() string {
-	value := make([]byte, 16)
-	if _, err := rand.Read(value); err == nil {
-		return hex.EncodeToString(value)
-	}
-	return fmt.Sprintf("%032x", time.Now().UnixNano())
 }
 
 func waitRequest(ctx context.Context, duration time.Duration) bool {

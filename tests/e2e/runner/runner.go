@@ -37,8 +37,6 @@ type Result struct {
 	ReplyText      string
 	IncomingID     string
 	ReplyMessageID string
-	GroupID        string
-	ReplyFrom      string
 }
 
 type Runner struct {
@@ -103,71 +101,6 @@ func (runner *Runner) RunDirect(ctx context.Context) (Result, error) {
 	return Result{
 		RequestText: requestText, ReplyText: replyText,
 		IncomingID: incoming.MessageID, ReplyMessageID: reply.MessageID,
-	}, nil
-}
-
-func (runner *Runner) RunOpenClawDirect(ctx context.Context) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, runner.config.Timeout)
-	defer cancel()
-	if err := runner.checkReadiness(ctx); err != nil {
-		return Result{}, err
-	}
-	runner.progress("establishing peer message baseline; this can take up to 35 seconds")
-	updates, err := runner.peer.getUpdates(ctx, "")
-	if err != nil {
-		return Result{}, fmt.Errorf("establish peer baseline: %w", err)
-	}
-	if strings.TrimSpace(updates.Cursor) == "" {
-		return Result{}, errors.New("establish peer baseline: response has no cursor")
-	}
-	replyText := uniqueTextWithPrefix("WEBOX_OPENCLAW_E2E_")
-	requestText := "Reply with exactly this token and nothing else: " + replyText
-	runner.progress("sending OpenClaw prompt for " + replyText)
-	if err := runner.driver.Send(ctx, runner.config.PeerTarget, requestText); err != nil {
-		return Result{}, fmt.Errorf("send peer OpenClaw prompt: %w", err)
-	}
-	runner.progress("waiting for peer to receive the OpenClaw agent reply")
-	reply, _, err := runner.peer.waitForText(ctx, updates.Cursor, replyText)
-	if err != nil {
-		return Result{}, fmt.Errorf("wait for OpenClaw agent reply: %w", err)
-	}
-	if strings.HasSuffix(reply.RoomID, "@chatroom") {
-		return Result{}, fmt.Errorf("matching reply is not a direct message: roomid=%q", reply.RoomID)
-	}
-	return Result{RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID}, nil
-}
-
-func (runner *Runner) RunOpenClawGroup(ctx context.Context) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, runner.config.Timeout)
-	defer cancel()
-	if err := runner.checkReadiness(ctx); err != nil {
-		return Result{}, err
-	}
-	runner.progress("establishing peer message baseline; this can take up to 35 seconds")
-	updates, err := runner.peer.getUpdates(ctx, "")
-	if err != nil {
-		return Result{}, fmt.Errorf("establish peer baseline: %w", err)
-	}
-	if strings.TrimSpace(updates.Cursor) == "" {
-		return Result{}, errors.New("establish peer baseline: response has no cursor")
-	}
-	replyText := uniqueTextWithPrefix("WEBOX_OPENCLAW_GROUP_E2E_")
-	requestText := "虾虾，reply with exactly this token and nothing else: " + replyText
-	runner.progress("sending OpenClaw group prompt for " + replyText)
-	if err := runner.driver.Send(ctx, runner.config.PeerTarget, requestText); err != nil {
-		return Result{}, fmt.Errorf("send peer OpenClaw group prompt: %w", err)
-	}
-	runner.progress("waiting for peer to receive the OpenClaw group reply")
-	reply, _, err := runner.peer.waitForText(ctx, updates.Cursor, replyText)
-	if err != nil {
-		return Result{}, fmt.Errorf("wait for OpenClaw group reply: %w", err)
-	}
-	if !strings.HasSuffix(reply.RoomID, "@chatroom") {
-		return Result{}, fmt.Errorf("matching reply is not a group message: roomid=%q", reply.RoomID)
-	}
-	return Result{
-		RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID,
-		GroupID: reply.RoomID, ReplyFrom: reply.From,
 	}, nil
 }
 

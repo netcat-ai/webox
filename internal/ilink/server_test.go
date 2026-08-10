@@ -15,10 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
-	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechat"
 	"github.com/netcat-ai/webox/internal/wechatdb"
 	"github.com/netcat-ai/webox/wecom"
@@ -28,12 +26,10 @@ type fakeMessages struct {
 	initialized bool
 	accountID   string
 	userInfo    wechat.UserInfo
-	accountErr  error
 	userInfoErr error
 	validateErr error
 	pollResult  wechat.PollResult
 	pollErr     error
-	refreshes   int
 	media       *wechatdb.MediaFile
 	mediaErr    error
 	file        *wechatdb.LocalFile
@@ -64,15 +60,8 @@ func fileItem(filename string) wecom.Message {
 }
 
 func (source *fakeMessages) IsInitialized() bool { return source.initialized }
-func (source *fakeMessages) AccountID() (string, error) {
-	return source.accountID, source.accountErr
-}
 func (source *fakeMessages) UserInfo() (wechat.UserInfo, error) {
 	return source.userInfo, source.userInfoErr
-}
-func (source *fakeMessages) RefreshLoginQRCode() (bool, error) {
-	source.refreshes++
-	return true, nil
 }
 func (source *fakeMessages) ValidatePollCursor(string) error { return source.validateErr }
 func (source *fakeMessages) PollMessages(string, int) (wechat.PollResult, error) {
@@ -120,15 +109,8 @@ func (service *fakeSender) Send(_ context.Context, target string, items []sender
 	return sender.Receipt{ClientMessageID: "ui-message"}, service.err
 }
 
-type fakeQR struct {
-	code *qrsource.LoginCode
-	err  error
-}
-
-func (source *fakeQR) Latest() (*qrsource.LoginCode, error) { return source.code, source.err }
-
 func TestWeComRouteIsRemoved(t *testing.T) {
-	server, _, _, _ := testServer(t)
+	server, _, _ := testServer(t)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/wecom", nil))
 	if response.Code != http.StatusNotFound {
@@ -137,7 +119,7 @@ func TestWeComRouteIsRemoved(t *testing.T) {
 }
 
 func TestHealthOnlyExposesReadiness(t *testing.T) {
-	server, _, _, _ := testServer(t)
+	server, _, _ := testServer(t)
 	response := perform(server, http.MethodGet, "/healthz", nil, false)
 	body := responseJSON(t, response)
 	if response.Code != http.StatusOK || body["ok"] != true || body["ready"] != false || len(body) != 2 {
@@ -145,60 +127,30 @@ func TestHealthOnlyExposesReadiness(t *testing.T) {
 	}
 }
 
-func TestQRCodeLoginReturnsRealCodeAndConfirmsIssuedSession(t *testing.T) {
-	server, messages, _, qr := testServer(t)
-	qr.code = &qrsource.LoginCode{ID: "xvfb-qr-current", LoginURL: "https://weixin.qq.com/x/test"}
-
-	issued := perform(server, http.MethodPost, "/ilink/bot/get_bot_qrcode?bot_type=3", map[string]any{"local_token_list": []string{}}, false)
-	issuedBody := responseJSON(t, issued)
-	if issued.Code != http.StatusOK || issuedBody["qrcode"] != "xvfb-qr-current" || issuedBody["qrcode_img_content"] != qr.code.LoginURL {
-		t.Fatalf("status=%d body=%#v", issued.Code, issuedBody)
+func TestCompatibilityRoutesAreRemoved(t *testing.T) {
+	server, _, _ := testServer(t)
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/ilink/bot/get_bot_qrcode"},
+		{http.MethodPost, "/ilink/bot/get_bot_qrcode"},
+		{http.MethodGet, "/ilink/bot/get_qrcode_status"},
+		{http.MethodPost, "/ilink/bot/getconfig"},
+		{http.MethodPost, "/ilink/bot/sendtyping"},
+		{http.MethodPost, "/ilink/bot/msg/notifystart"},
+		{http.MethodPost, "/ilink/bot/msg/notifystop"},
 	}
-
-	waiting := perform(server, http.MethodGet, "/ilink/bot/get_qrcode_status?qrcode=xvfb-qr-current", nil, false)
-	if body := responseJSON(t, waiting); body["status"] != "wait" {
-		t.Fatalf("waiting body=%#v", body)
-	}
-
-	messages.initialized = true
-	qr.code = nil
-	confirmed := perform(server, http.MethodGet, "/ilink/bot/get_qrcode_status?qrcode=xvfb-qr-current", nil, false)
-	body := responseJSON(t, confirmed)
-	if body["status"] != "confirmed" || body["bot_token"] != "api-token" || body["ilink_bot_id"] != "wxid-self" || body["baseurl"] != "http://example.test" {
-		t.Fatalf("confirmed body=%#v", body)
-	}
-}
-
-func TestLoggedInResumeRequiresMatchingLocalToken(t *testing.T) {
-	server, messages, _, _ := testServer(t)
-	messages.initialized = true
-
-	denied := perform(server, http.MethodPost, "/ilink/bot/get_bot_qrcode?bot_type=3", map[string]any{"local_token_list": []string{"wrong"}}, false)
-	if denied.Code != http.StatusUnauthorized {
-		t.Fatalf("status=%d body=%s", denied.Code, denied.Body.String())
-	}
-	accepted := perform(server, http.MethodPost, "/ilink/bot/get_bot_qrcode?bot_type=3", map[string]any{"local_token_list": []string{"api-token"}}, false)
-	body := responseJSON(t, accepted)
-	if accepted.Code != http.StatusOK || body["qrcode_img_content"] != "" {
-		t.Fatalf("status=%d body=%#v", accepted.Code, body)
-	}
-}
-
-func TestExpiredQRCodeIsRefreshedBeforeReissue(t *testing.T) {
-	server, messages, _, qr := testServer(t)
-	server.login.register("expired-code")
-	server.login.activeIssuedAt = time.Now().Add(-qrSessionTTL)
-	qr.code = &qrsource.LoginCode{ID: "fresh-code", LoginURL: "https://weixin.qq.com/x/fresh"}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/get_bot_qrcode?bot_type=3", map[string]any{"local_token_list": []string{}}, false)
-	body := responseJSON(t, response)
-	if response.Code != http.StatusOK || body["qrcode"] != "fresh-code" || messages.refreshes != 1 {
-		t.Fatalf("status=%d body=%#v refreshes=%d", response.Code, body, messages.refreshes)
+	for _, test := range tests {
+		response := perform(server, test.method, test.path, nil, false)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status=%d", test.method, test.path, response.Code)
+		}
 	}
 }
 
 func TestGetUpdatesUsesUnifiedRoomTextMessageFormat(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	messages.accountID = "wxid-stale"
 	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []wecom.Message{
@@ -230,7 +182,7 @@ func TestGetUpdatesUsesUnifiedRoomTextMessageFormat(t *testing.T) {
 }
 
 func TestGetUpdatesUsesRoomIDForOutgoingPrivateMessage(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	message := inboundMessage("outgoing-1", "wxid-alice", "wxid-alice", 1781703356000, textItem("sent"))
 	message.Outgoing = true
@@ -246,7 +198,7 @@ func TestGetUpdatesUsesRoomIDForOutgoingPrivateMessage(t *testing.T) {
 }
 
 func TestGetUpdatesIncludesOrdinaryLinkTitleDescriptionAndURL(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []wecom.Message{
 		inboundMessage("101", "wxid-alice", "wxid-alice", 1781703356000, wecom.Message{
@@ -273,7 +225,7 @@ func TestGetUpdatesIncludesOrdinaryLinkTitleDescriptionAndURL(t *testing.T) {
 }
 
 func TestGetUpdatesPreservesSphFeedMessage(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	messages.accountID = "wxid-self"
 	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []wecom.Message{{
@@ -301,7 +253,7 @@ func TestGetUpdatesPreservesSphFeedMessage(t *testing.T) {
 }
 
 func TestGetUpdatesUsesWeComMixedForQuotedImage(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	mediaRoot := t.TempDir()
 	mediaStore, err := sharedmedia.New(mediaRoot)
 	if err != nil {
@@ -336,7 +288,7 @@ func TestGetUpdatesUsesWeComMixedForQuotedImage(t *testing.T) {
 }
 
 func TestGetUpdatesDoesNotAddMentionExtension(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	firstMessage := inboundMessage("message-1", "group@chatroom", "wxid-alice", 1781703356000, textItem("@Self hello"))
 	secondMessage := inboundMessage("message-2", "group@chatroom", "wxid-alice", 1781703357000, textItem("@all hello"))
@@ -355,7 +307,7 @@ func TestGetUpdatesDoesNotAddMentionExtension(t *testing.T) {
 }
 
 func TestGetUpdatesLogsMessagesSkippedForUnresolvedSenders(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	messages.pollResult = wechat.PollResult{
 		AccountID: "wxid-self",
@@ -390,7 +342,7 @@ func TestGetUpdatesLogsMessagesSkippedForUnresolvedSenders(t *testing.T) {
 }
 
 func TestGetUpdatesRejectsInvalidCursorAndReportsExpiredSession(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.validateErr = errors.New("signature mismatch")
 	invalid := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"get_updates_buf": "tampered"}, true)
 	if invalid.Code != http.StatusBadRequest {
@@ -406,7 +358,7 @@ func TestGetUpdatesRejectsInvalidCursorAndReportsExpiredSession(t *testing.T) {
 }
 
 func TestSendMessageUsesWeComRoutingAndReturnsMessageID(t *testing.T) {
-	server, messages, outbound, _ := testServer(t)
+	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msgs": []any{map[string]any{
 		"msgid": "request-1", "action": "send", "from": "wxid-self", "tolist": []string{},
@@ -426,7 +378,7 @@ func TestSendMessageUsesWeComRoutingAndReturnsMessageID(t *testing.T) {
 }
 
 func TestSendMessageBatchesTextImageAndFile(t *testing.T) {
-	server, messages, outbound, _ := testServer(t)
+	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msgs": []any{
 		map[string]any{"msgid": "1", "roomid": "group@chatroom", "msgtype": "file", "file": map[string]any{"sdkfileid": "outbox/report.txt"}},
@@ -445,7 +397,7 @@ func TestSendMessageBatchesTextImageAndFile(t *testing.T) {
 }
 
 func TestSharedImageIsSentForEveryRequest(t *testing.T) {
-	server, messages, outbound, _ := testServer(t)
+	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msgs": []any{map[string]any{
 		"msgid": "image-request-1", "roomid": "group@chatroom", "msgtype": "image",
@@ -462,7 +414,7 @@ func TestSharedImageIsSentForEveryRequest(t *testing.T) {
 }
 
 func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	mediaRoot := t.TempDir()
 	mediaStore, err := sharedmedia.New(mediaRoot)
 	if err != nil {
@@ -491,7 +443,7 @@ func TestIncomingImageIsWrittenToSharedDirectory(t *testing.T) {
 }
 
 func TestIncomingMediaWaitsWithoutAdvancingCursor(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	now := time.Now().UnixMilli()
 	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []wecom.Message{
@@ -506,7 +458,7 @@ func TestIncomingMediaWaitsWithoutAdvancingCursor(t *testing.T) {
 }
 
 func TestSharedFileIsSentForEveryRequest(t *testing.T) {
-	server, messages, outbound, _ := testServer(t)
+	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msgs": []any{map[string]any{
 		"msgid": "file-request-1", "roomid": "group@chatroom", "msgtype": "file",
@@ -523,7 +475,7 @@ func TestSharedFileIsSentForEveryRequest(t *testing.T) {
 }
 
 func TestIncomingFileIsCopiedToSharedDirectory(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	mediaRoot := t.TempDir()
 	mediaStore, err := sharedmedia.New(mediaRoot)
 	if err != nil {
@@ -556,7 +508,7 @@ func TestIncomingFileIsCopiedToSharedDirectory(t *testing.T) {
 }
 
 func TestIncomingTimedOutMediaIsDeliveredWithoutSharedPathAndAdvancesCursor(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	timedOut := time.Now().Add(-inboundMediaWait).UnixMilli()
 	messages.pollResult = wechat.PollResult{Cursor: "next", Messages: []wecom.Message{
@@ -596,7 +548,7 @@ func assertNoMediaAvailabilityFields(t *testing.T, message, item map[string]any)
 }
 
 func TestSendMessageRejectsMissingTargetLegacyEnvelopeAndUnsupportedMedia(t *testing.T) {
-	server, messages, outbound, _ := testServer(t)
+	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	missing := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msgs": []any{map[string]any{
 		"msgtype": "text", "text": map[string]any{"content": "hello"},
@@ -624,15 +576,15 @@ func TestSendMessageRejectsMissingTargetLegacyEnvelopeAndUnsupportedMedia(t *tes
 }
 
 func TestBusinessRoutesRequireStandardILinkHeaders(t *testing.T) {
-	server, _, _, _ := testServer(t)
-	response := perform(server, http.MethodPost, "/ilink/bot/msg/notifystart", map[string]any{}, false)
+	server, _, _ := testServer(t)
+	response := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, false)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d", response.Code)
 	}
 }
 
 func TestGetUserInfoReturnsCurrentWeChatAccount(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	messages.initialized = true
 	messages.userInfo = wechat.UserInfo{AccountID: "wxid-self", WeChatID: "jlyfish", Nickname: "小鱼", AvatarURL: "https://example.test/avatar.png"}
 	response := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, true)
@@ -643,7 +595,7 @@ func TestGetUserInfoReturnsCurrentWeChatAccount(t *testing.T) {
 }
 
 func TestGetUserInfoRequiresAuthenticationAndReadySession(t *testing.T) {
-	server, messages, _, _ := testServer(t)
+	server, messages, _ := testServer(t)
 	unauthorized := perform(server, http.MethodGet, "/ilink/bot/userinfo", nil, false)
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized status=%d", unauthorized.Code)
@@ -661,45 +613,19 @@ func TestGetUserInfoRequiresAuthenticationAndReadySession(t *testing.T) {
 	}
 }
 
-func TestGetConfigIssuesBoundTypingTicket(t *testing.T) {
-	server, _, _, _ := testServer(t)
-	response := perform(server, http.MethodPost, "/ilink/bot/getconfig", map[string]any{"ilink_user_id": "wxid-a"}, true)
-	body := responseJSON(t, response)
-	var ticket typingTicket
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%#v", response.Code, body)
-	}
-	if err := signedpayload.Decode("api-token", body["typing_ticket"].(string), &ticket); err != nil || ticket.UserID != "wxid-a" {
-		t.Fatalf("ticket=%#v err=%v", ticket, err)
-	}
-}
-
-func TestLoginSessionDoesNotConfirmUnknownOrExpiredCode(t *testing.T) {
-	var session loginSession
-	session.register("known")
-	if got := session.status("unknown", "", true, time.Now()); got != "expired" {
-		t.Fatalf("unknown=%q", got)
-	}
-	if got := session.status("known", "known", false, time.Now().Add(qrSessionTTL)); got != "expired" {
-		t.Fatalf("expired=%q", got)
-	}
-}
-
-func testServer(t *testing.T) (*Server, *fakeMessages, *fakeSender, *fakeQR) {
+func testServer(t *testing.T) (*Server, *fakeMessages, *fakeSender) {
 	t.Helper()
 	messages := &fakeMessages{accountID: "wxid-self"}
 	outbound := &fakeSender{}
-	qr := &fakeQR{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	media, err := sharedmedia.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := New("api-token", "", media, messages, outbound, qr, logger)
+	server := New("api-token", media, messages, outbound, logger)
 	server.pollTimeout = time.Millisecond
 	server.pollInterval = time.Millisecond
-	server.qrTimeout = time.Millisecond
-	return server, messages, outbound, qr
+	return server, messages, outbound
 }
 
 func perform(server *Server, method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
