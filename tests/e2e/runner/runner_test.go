@@ -102,8 +102,8 @@ func TestDirectRoundTripCrossesBothILinkEndpoints(t *testing.T) {
 	if driver.target != "Webox私聊测试" || driver.text != result.RequestText {
 		t.Fatalf("peer send target=%q text=%q", driver.target, driver.text)
 	}
-	if state.replyText != result.ReplyText || state.replyContext != "sut-context" {
-		t.Fatalf("sut reply text=%q context=%q", state.replyText, state.replyContext)
+	if state.replyText != result.ReplyText || state.replyContext != "" {
+		t.Fatalf("sut reply text=%q roomid=%q", state.replyText, state.replyContext)
 	}
 }
 
@@ -283,28 +283,28 @@ func (state *roundTripState) handleSUT(response http.ResponseWriter, request *ht
 		writeJSON(response, map[string]any{
 			"ret": 0, "get_updates_buf": "sut-next",
 			"msgs": []any{map[string]any{
-				"msgid": "incoming-1", "text": requestText, "context_token": "sut-context",
+				"msgid": "incoming-1", "action": "send", "from": "wxid-peer", "tolist": []string{"wxid-self"},
+				"roomid": "", "msgtime": 1781703356000, "msgtype": "text",
+				"text": map[string]any{"content": requestText},
 			}},
 		})
 	case "/ilink/bot/sendmessage":
 		var body struct {
-			Message struct {
-				Context string `json:"context_token"`
-				Items   []struct {
-					TextItem struct {
-						Text string `json:"text"`
-					} `json:"text_item"`
-				} `json:"item_list"`
-			} `json:"msg"`
+			Messages []struct {
+				RoomID string `json:"roomid"`
+				Text   struct {
+					Content string `json:"content"`
+				} `json:"text"`
+			} `json:"msgs"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			http.Error(response, err.Error(), http.StatusBadRequest)
 			return
 		}
-		state.replyText = body.Message.Items[0].TextItem.Text
-		state.replyContext = body.Message.Context
+		state.replyText = body.Messages[0].Text.Content
+		state.replyContext = body.Messages[0].RoomID
 		close(state.sutReplied)
-		writeJSON(response, map[string]any{"ret": 0, "client_message_id": "outgoing-1"})
+		writeJSON(response, map[string]any{"ret": 0, "client_msg_id": "outgoing-1"})
 	default:
 		http.NotFound(response, request)
 	}
@@ -330,7 +330,10 @@ func (state *roundTripState) handlePeer(response http.ResponseWriter, request *h
 	<-state.sutReplied
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
-		"msgs": []any{map[string]any{"msgid": "reply-1", "text": state.replyText, "context_token": "peer-context"}},
+		"msgs": []any{map[string]any{
+			"msgid": "reply-1", "action": "send", "from": "wxid-self", "tolist": []string{"wxid-peer"},
+			"roomid": "", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": state.replyText},
+		}},
 	})
 }
 
@@ -359,7 +362,10 @@ func (state *roundTripState) handleOpenClawPeer(response http.ResponseWriter, re
 	replyText := parts[len(parts)-1]
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
-		"msgs": []any{map[string]any{"msgid": "agent-reply-1", "text": replyText, "context_token": "peer-context"}},
+		"msgs": []any{map[string]any{
+			"msgid": "agent-reply-1", "action": "send", "from": "wxid-self", "tolist": []string{"wxid-peer"},
+			"roomid": "", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": replyText},
+		}},
 	})
 }
 
@@ -389,8 +395,9 @@ func (state *roundTripState) handleOpenClawGroupPeer(response http.ResponseWrite
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
 		"msgs": []any{map[string]any{
-			"msgid": "agent-group-reply-1", "text": replyText, "context_token": "peer-context",
-			"group_id": "e2e-room@chatroom", "session_id": "e2e-room@chatroom",
+			"msgid": "agent-group-reply-1", "action": "send", "from": "wxid-self", "tolist": []string{},
+			"roomid": "e2e-room@chatroom", "msgtime": 1781703356000, "msgtype": "text",
+			"text": map[string]any{"content": replyText},
 		}},
 	})
 }

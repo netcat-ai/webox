@@ -8,11 +8,11 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/netcat-ai/webox/wecom"
 )
 
 func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
@@ -40,6 +40,16 @@ func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
 				`<url>https://example.com/article?id=1&amp;from=wechat</url></appmsg></msg>]]></content>` +
 				`</refermsg></appmsg></msg>`,
 			want: "虾虾 总结一下\n[引用消息][链接] 文章标题\nhttps://example.com/article?id=1&from=wechat",
+		},
+		{
+			name: "finder feed",
+			content: `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
+				`<type>49</type><content><![CDATA[<msg><appmsg><type>51</type><finderFeed>` +
+				`<nickname>黄同学的移动小屋</nickname><desc>自驾游装备收纳清单</desc>` +
+				`<mediaList><media><url>https://example.com/video?id=1&amp;from=finder</url></media></mediaList>` +
+				`</finderFeed></appmsg></msg>]]></content></refermsg></appmsg></msg>`,
+			want: "虾虾 看看这个\n[引用消息][视频号] 黄同学的移动小屋\n自驾游装备收纳清单\n" +
+				"https://example.com/video?id=1&from=finder",
 		},
 		{
 			name: "malformed reference",
@@ -79,19 +89,15 @@ func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing
 	}
 }
 
-func TestNormalizedMessageUsesILinkReferenceForQuotedImage(t *testing.T) {
+func TestNormalizedMessageUsesWeComMixedReferenceForQuotedImage(t *testing.T) {
 	content := `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
 		`<type>3</type><svrid>3143822696652695030</svrid><fromusr>group@chatroom</fromusr>` +
 		`<chatusr>wxid_sender</chatusr><displayname>小鱼</displayname><createtime>1781703356</createtime>` +
 		`<content><![CDATA[<msg><img aeskey="secret" /></msg>]]></content></refermsg></appmsg></msg>`
 
 	message := normalizeMessage(49, content, false)
-	if message.kind != "text" || message.text != "虾虾 看看这个" || message.reference == nil || message.reference.Title != "" {
+	if message.kind != "text" || message.text != "虾虾 看看这个" || message.referenceImageID != "3143822696652695030" {
 		t.Fatalf("message=%#v", message)
-	}
-	reference := message.reference.MessageItem
-	if reference == nil || reference.Type != 2 || reference.MessageID != "3143822696652695030" || reference.Image == nil {
-		t.Fatalf("reference=%#v", reference)
 	}
 }
 
@@ -122,10 +128,61 @@ func TestQueryExtractsOrdinaryLinkMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "[链接] 文章标题\n文章摘要\nhttps://example.com/article?id=1&from=wechat"
-	if len(events) != 1 || len(events[0].message.Items) != 1 || events[0].message.Items[0].Text == nil ||
-		events[0].message.Items[0].Text.Text != want {
-		t.Fatalf("events=%#v want text=%q", events, want)
+	if len(events) != 1 {
+		t.Fatalf("events=%#v want one link item", events)
+	}
+	message := events[0].message
+	if message.MsgType != wecom.MessageTypeLink || message.Link == nil || message.Text != nil ||
+		message.Link.Title != "文章标题" || message.Link.Description != "文章摘要" ||
+		message.Link.LinkURL != "https://example.com/article?id=1&from=wechat" {
+		t.Fatalf("message=%#v want typed link", message)
+	}
+}
+
+func TestQueryExtractsFinderFeedMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	content := `<?xml version="1.0"?><msg><appmsg>` +
+		`<title>当前微信版本不支持展示该内容，请升级至最新版本。</title>` +
+		`<type>51</type><url>https://support.weixin.qq.com/update/</url>` +
+		`<finderFeed><objectId><![CDATA[14919669148928379072]]></objectId>` +
+		`<feedType><![CDATA[4]]></feedType><nickname><![CDATA[黄同学的移动小屋]]></nickname>` +
+		`<desc><![CDATA[自驾游装备收纳清单
+#自驾游 #床车旅行 #床车改装 #床车露营]]></desc>` +
+		`<mediaList><media><url><![CDATA[https://wxapp.tc.qq.com/video?id=1&from=finder]]></url>` +
+		`<coverUrl><![CDATA[https://wxapp.tc.qq.com/cover?id=1]]></coverUrl>` +
+		`<mediaType><![CDATA[4]]></mediaType></media></mediaList>` +
+		`</finderFeed></appmsg></msg>`
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := encoder.EncodeAll([]byte(content), nil)
+	encoder.Close()
+	mustExec(t, db, `INSERT INTO [Msg_test] (
+		local_id, server_id, local_type, create_time, real_sender_id,
+		message_content, WCDB_CT_message_content, status, origin_source
+	) VALUES (1, 101, ?, 1000, 0, ?, 4, 3, 2)`, int64(51)<<32|49, compressed)
+	defer func() { _ = db.Close() }()
+
+	events, err := queryNewTable(
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
+		"alice", false, MessagePosition{CreateTime: 999}, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events=%#v want one event", events)
+	}
+	message := events[0].message
+	if message.MsgType != wecom.MessageTypeSphFeed || message.SphFeed == nil || message.Text != nil {
+		t.Fatalf("message=%#v want typed sphfeed item", message)
+	}
+	feed := message.SphFeed
+	if feed.FeedType != 4 || feed.SphName != "黄同学的移动小屋" ||
+		feed.FeedDesc != "自驾游装备收纳清单\n#自驾游 #床车旅行 #床车改装 #床车露营" {
+		t.Fatalf("sphfeed=%#v", feed)
 	}
 }
 
@@ -160,38 +217,13 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 		t.Fatalf("events=%d want %d: %#v", len(events), len(rows), events)
 	}
 	for index, event := range events {
-		text := event.message.Items[0].Text.Text
+		text := event.message.Text.Content
 		if text != rows[index].text || event.position.LocalID != int64(rows[index].id) {
 			t.Fatalf("event[%d]=%#v want text=%q", index, event, rows[index].text)
 		}
-	}
-}
-
-func TestQueryExtractsAtUserIDsFromCompressedMessageSource(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "message.db")
-	db := createMessageDB(t, path)
-	encoder, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := encoder.EncodeAll([]byte(`<msgsource><atuserlist>wxid-self, wxid-other,wxid-self</atuserlist></msgsource>`), nil)
-	encoder.Close()
-	mustExec(t, db, `INSERT INTO [Msg_test] (
-		local_id, server_id, local_type, create_time, real_sender_id,
-		message_content, WCDB_CT_message_content, source, WCDB_CT_source, status, origin_source
-	) VALUES (1, 101, 1, 1000, 0, 'hello', 0, ?, 4, 3, 2)`, source)
-	defer func() { _ = db.Close() }()
-
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"group@chatroom", true, MessagePosition{CreateTime: 999}, 100,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"wxid-self", "wxid-other"}
-	if len(events) != 1 || !reflect.DeepEqual(events[0].message.MentionedUserIDs, want) {
-		t.Fatalf("events=%#v want at_user_ids=%v", events, want)
+		if event.message.Outgoing != (rows[index].origin == 1) {
+			t.Fatalf("event[%d] outgoing=%t want %t", index, event.message.Outgoing, rows[index].origin == 1)
+		}
 	}
 }
 

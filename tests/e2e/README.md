@@ -5,7 +5,7 @@
 测试覆盖：
 
 ```text
-peer UI -> 微信网络 -> SUT DB/WAL -> getupdates -> context_token
+peer UI -> 微信网络 -> SUT DB/WAL -> getupdates -> roomid/tolist
         -> sendmessage -> SUT UI -> 微信网络 -> peer DB/WAL -> getupdates
 ```
 
@@ -111,7 +111,7 @@ go run ./tests/e2e \
 }
 ```
 
-runner 会拒绝私聊与群聊相互误判，也会拒绝 `session_id` 与 `group_id` 不一致的群回复。
+runner 会根据企业微信格式中的 `roomid` 拒绝私聊与群聊相互误判。
 
 如果容器名、端口或 Docker CLI 不同，可使用参数或对应的 `WEBOX_E2E_*` 环境变量覆盖：
 

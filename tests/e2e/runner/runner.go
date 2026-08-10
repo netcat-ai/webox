@@ -92,7 +92,7 @@ func (runner *Runner) RunDirect(ctx context.Context) (Result, error) {
 	}
 	replyText := "ACK_" + requestText
 	runner.progress("sending SUT reply " + replyText)
-	if err := runner.sut.sendText(ctx, incoming.ContextToken, "reply-"+requestText, replyText); err != nil {
+	if err := runner.sut.sendText(ctx, incoming, "reply-"+requestText, replyText); err != nil {
 		return Result{}, fmt.Errorf("send SUT reply: %w", err)
 	}
 	runner.progress("waiting for peer to receive the SUT reply")
@@ -131,8 +131,8 @@ func (runner *Runner) RunOpenClawDirect(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("wait for OpenClaw agent reply: %w", err)
 	}
-	if strings.HasSuffix(reply.GroupID, "@chatroom") {
-		return Result{}, fmt.Errorf("matching reply is not a direct message: group_id=%q", reply.GroupID)
+	if strings.HasSuffix(reply.RoomID, "@chatroom") {
+		return Result{}, fmt.Errorf("matching reply is not a direct message: roomid=%q", reply.RoomID)
 	}
 	return Result{RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID}, nil
 }
@@ -162,15 +162,12 @@ func (runner *Runner) RunOpenClawGroup(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("wait for OpenClaw group reply: %w", err)
 	}
-	if !strings.HasSuffix(reply.GroupID, "@chatroom") {
-		return Result{}, fmt.Errorf("matching reply is not a group message: group_id=%q", reply.GroupID)
-	}
-	if reply.SessionID != reply.GroupID {
-		return Result{}, fmt.Errorf("group reply session mismatch: session_id=%q group_id=%q", reply.SessionID, reply.GroupID)
+	if !strings.HasSuffix(reply.RoomID, "@chatroom") {
+		return Result{}, fmt.Errorf("matching reply is not a group message: roomid=%q", reply.RoomID)
 	}
 	return Result{
 		RequestText: requestText, ReplyText: replyText, ReplyMessageID: reply.MessageID,
-		GroupID: reply.GroupID, ReplyFrom: reply.FromUserID,
+		GroupID: reply.RoomID, ReplyFrom: reply.From,
 	}, nil
 }
 
@@ -271,12 +268,15 @@ type updatesResponse struct {
 }
 
 type message struct {
-	MessageID    string `json:"msgid"`
-	Text         string `json:"text"`
-	ContextToken string `json:"context_token"`
-	FromUserID   string `json:"from_user_id"`
-	SessionID    string `json:"session_id"`
-	GroupID      string `json:"group_id"`
+	MessageID string   `json:"msgid"`
+	From      string   `json:"from"`
+	ToList    []string `json:"tolist"`
+	RoomID    string   `json:"roomid"`
+	MsgTime   int64    `json:"msgtime"`
+	MsgType   string   `json:"msgtype"`
+	Text      struct {
+		Content string `json:"content"`
+	} `json:"text"`
 }
 
 func newILinkClient(rawURL, token string) (*iLinkClient, error) {
@@ -323,29 +323,31 @@ func (client *iLinkClient) waitForText(ctx context.Context, cursor, expected str
 		}
 		cursor = updates.Cursor
 		for _, candidate := range updates.Messages {
-			if candidate.Text == expected {
-				if strings.TrimSpace(candidate.ContextToken) == "" {
-					return message{}, cursor, errors.New("matching message has no context_token")
-				}
+			if candidate.MsgType == "text" && candidate.Text.Content == expected {
 				return candidate, cursor, nil
 			}
 		}
 	}
 }
 
-func (client *iLinkClient) sendText(ctx context.Context, contextToken, clientID, text string) error {
+func (client *iLinkClient) sendText(ctx context.Context, incoming message, clientID, content string) error {
 	var response struct {
 		Ret     int    `json:"ret"`
 		ErrCode int    `json:"errcode"`
 		Errmsg  string `json:"errmsg"`
 	}
+	target := incoming.From
+	toList := []string{target}
+	if incoming.RoomID != "" {
+		target = incoming.RoomID
+		toList = []string{}
+	}
 	err := client.post(ctx, "/ilink/bot/sendmessage", map[string]any{
-		"msg": map[string]any{
-			"client_id": clientID, "context_token": contextToken,
-			"item_list": []any{map[string]any{
-				"type": 1, "text_item": map[string]any{"text": text},
-			}},
-		},
+		"msgs": []any{map[string]any{
+			"msgid": clientID, "action": "send", "from": "", "tolist": toList,
+			"roomid": incoming.RoomID, "msgtime": time.Now().UnixMilli(), "msgtype": "text",
+			"text": map[string]any{"content": content},
+		}},
 	}, &response)
 	if err != nil {
 		return err

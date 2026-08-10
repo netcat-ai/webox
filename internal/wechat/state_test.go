@@ -7,16 +7,16 @@ import (
 	"reflect"
 	"testing"
 
-	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
+	"github.com/netcat-ai/webox/wecom"
 )
 
 func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
-	messages := []ilinkprotocol.WeixinMessage{
-		{SessionID: "wxid-direct"},
-		{SessionID: "family@chatroom"},
-		{SessionID: "noise@chatroom"},
+	messages := []wecom.Message{
+		{ConversationID: "wxid-direct"},
+		{ConversationID: "family@chatroom"},
+		{ConversationID: "noise@chatroom"},
 	}
 	remarks := map[string]string{
 		"wxid-direct":     "webox.alice",
@@ -33,16 +33,16 @@ func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 	if len(filtered) != 2 {
 		t.Fatalf("filtered=%#v", filtered)
 	}
-	got := []string{filtered[0].SessionID, filtered[1].SessionID}
+	got := []string{filtered[0].ConversationID, filtered[1].ConversationID}
 	if want := []string{"wxid-direct", "family@chatroom"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rooms=%v want=%v", got, want)
 	}
 }
 
 func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
-	messages := []ilinkprotocol.WeixinMessage{
-		{SessionID: "wxid-direct"},
-		{SessionID: "wxid-direct"},
+	messages := []wecom.Message{
+		{ConversationID: "wxid-direct"},
+		{ConversationID: "wxid-direct"},
 		{},
 	}
 	lookupCalls := 0
@@ -61,7 +61,7 @@ func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
 
 func TestDisabledRemarkFilterDoesNotReadRemarksOrDropMessages(t *testing.T) {
 	state := New(t.TempDir(), "test-token", false)
-	messages := []ilinkprotocol.WeixinMessage{{SessionID: "unmarked"}}
+	messages := []wecom.Message{{ConversationID: "unmarked"}}
 	lookupCalled := false
 
 	filtered, err := state.applyRemarkFilter(messages, func(string) (string, error) {

@@ -24,7 +24,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	_ "github.com/mutecomm/go-sqlcipher/v4"
-	ilinkprotocol "github.com/netcat-ai/webox/ilink"
+	"github.com/netcat-ai/webox/wecom"
 )
 
 const (
@@ -93,7 +93,7 @@ func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 }
 
 type PollData struct {
-	Messages []ilinkprotocol.WeixinMessage
+	Messages []wecom.Message
 	NewState MessagePositions
 }
 
@@ -132,7 +132,7 @@ type messageEvent struct {
 	room     string
 	shard    string
 	position MessagePosition
-	message  *ilinkprotocol.WeixinMessage
+	message  *wecom.Message
 }
 
 func DetectStorage() string {
@@ -763,7 +763,7 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 	}
 	sort.Strings(changed)
 	if len(changed) == 0 {
-		return PollData{Messages: []ilinkprotocol.WeixinMessage{}, NewState: state}, nil
+		return PollData{Messages: []wecom.Message{}, NewState: state}, nil
 	}
 	perTableLimit := clamp(limit*4, 100, 2000)
 	var events []messageEvent
@@ -799,7 +799,7 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 	if state == nil {
 		state = make(MessagePositions)
 	}
-	messages := make([]ilinkprotocol.WeixinMessage, 0, limit)
+	messages := make([]wecom.Message, 0, limit)
 	for _, event := range events[:min(len(events), clamp(limit*10, 200, 5000))] {
 		if state[event.room] == nil {
 			state[event.room] = make(RoomMessagePositions)
@@ -819,7 +819,7 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	db := shard.db
 	idToUsername := loadIDToUsername(db)
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
-			message_content, WCDB_CT_message_content, source, WCDB_CT_source
+			message_content, WCDB_CT_message_content, status, origin_source
 		 FROM [%s]
 		 WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
 		   AND server_id > 0
@@ -831,81 +831,66 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 	defer func() { _ = rows.Close() }()
 	var events []messageEvent
 	for rows.Next() {
-		var localID, serverID, localType, timestamp, realSenderID int64
-		var contentType, sourceType sql.NullInt64
-		var content, source []byte
-		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType, &source, &sourceType); err != nil {
+		var localID, serverID, localType, timestamp, realSenderID, status, originSource int64
+		var contentType sql.NullInt64
+		var content []byte
+		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType, &status, &originSource); err != nil {
 			continue
 		}
 		decoded := decompressMessage(content, contentType.Int64)
-		atUserIDs := messageAtUserIDs(decompressMessage(source, sourceType.Int64))
 		normalized := normalizeMessage(localType, decoded, group)
 		messageID := strconv.FormatInt(serverID, 10)
 		createdAt := saturatingMilliseconds(timestamp)
-		item := ilinkprotocol.MessageItem{
-			Type:         ilinkprotocol.ItemTypeText,
-			CreateTimeMS: createdAt,
-			IsCompleted:  true,
-			MessageID:    messageID,
-			Text:         &ilinkprotocol.TextItem{Text: normalized.text},
-			Reference:    normalized.reference,
+		message := wecom.Message{
+			MsgID: messageID, Action: wecom.ActionSend,
+			From:   senderUsername(realSenderID, decoded, group, username, idToUsername),
+			ToList: []string{}, MsgTime: createdAt,
+			Sequence: localID, ConversationID: username, Outgoing: originSource == 1,
+		}
+		if group {
+			message.RoomID = username
 		}
 		switch normalized.kind {
+		case "text":
+			if normalized.referenceImageID != "" {
+				message.MsgType = wecom.MessageTypeMixed
+				message.Mixed = &wecom.Mixed{Items: []wecom.MixedItem{
+					{Type: wecom.MessageTypeText, Content: normalized.text},
+					{Type: wecom.MessageTypeImage, MessageID: normalized.referenceImageID},
+				}}
+			} else {
+				message.MsgType = wecom.MessageTypeText
+				message.Text = &wecom.Text{Content: normalized.text}
+			}
 		case "image":
-			item.Type = ilinkprotocol.ItemTypeImage
-			item.Text = nil
-			item.Image = &ilinkprotocol.ImageItem{}
+			message.MsgType = wecom.MessageTypeImage
+			message.Image = &wecom.Image{}
 		case "voice":
-			item.Type = ilinkprotocol.ItemTypeVoice
-			item.Text = nil
-			item.Voice = &ilinkprotocol.VoiceItem{}
+			message.MsgType = wecom.MessageTypeVoice
+			message.Voice = &wecom.Voice{}
 		case "file":
-			item.Type = ilinkprotocol.ItemTypeFile
-			item.Text = nil
-			item.File = &ilinkprotocol.FileItem{FileName: normalized.filename}
+			message.MsgType = wecom.MessageTypeFile
+			message.File = &wecom.File{FileName: normalized.filename, FileExt: strings.TrimPrefix(filepath.Ext(normalized.filename), ".")}
 		case "video":
-			item.Type = ilinkprotocol.ItemTypeVideo
-			item.Text = nil
-			item.Video = &ilinkprotocol.VideoItem{}
-		}
-		groupID := ""
-		if group {
-			groupID = username
+			message.MsgType = wecom.MessageTypeVideo
+			message.Video = &wecom.Video{}
+		case "link":
+			message.MsgType = wecom.MessageTypeLink
+			message.Link = normalized.link
+		case "sphfeed":
+			message.MsgType = wecom.MessageTypeSphFeed
+			message.SphFeed = normalized.sphFeed
+		default:
+			message.MsgType = normalized.kind
 		}
 		event := messageEvent{
 			room: username, shard: shard.relativePath,
 			position: MessagePosition{CreateTime: timestamp, LocalID: localID},
-			message: &ilinkprotocol.WeixinMessage{
-				Sequence: localID, MessageID: serverID, ClientID: messageID,
-				FromUserID:   senderUsername(realSenderID, decoded, group, username, idToUsername),
-				CreateTimeMS: createdAt, UpdateTimeMS: createdAt,
-				SessionID: username, GroupID: groupID,
-				MessageType: ilinkprotocol.MessageTypeUser, MessageState: ilinkprotocol.MessageStateFinish,
-				Items: []ilinkprotocol.MessageItem{item}, MentionedUserIDs: atUserIDs,
-			},
+			message:  &message,
 		}
 		events = append(events, event)
 	}
 	return events, rows.Err()
-}
-
-func messageAtUserIDs(source string) []string {
-	var metadata struct {
-		AtUserList string `xml:"atuserlist"`
-	}
-	if xml.Unmarshal([]byte(strings.TrimSpace(source)), &metadata) != nil {
-		return nil
-	}
-	var result []string
-	seen := make(map[string]bool)
-	for value := range strings.SplitSeq(metadata.AtUserList, ",") {
-		value = strings.TrimSpace(value)
-		if value != "" && !seen[value] {
-			result = append(result, value)
-			seen[value] = true
-		}
-	}
-	return result
 }
 
 func loadIDToUsername(db *sql.DB) map[int64]string {
@@ -937,10 +922,12 @@ func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error)
 }
 
 type normalizedContent struct {
-	kind      string
-	text      string
-	filename  string
-	reference *ilinkprotocol.RefMessage
+	kind             string
+	text             string
+	filename         string
+	referenceImageID string
+	link             *wecom.Link
+	sphFeed          *wecom.SphFeed
 }
 
 func normalizedMessage(localType int64, content string, group bool) (string, string) {
@@ -964,10 +951,7 @@ func normalizeMessage(localType int64, content string, group bool) normalizedCon
 		if baseType(reference.Type) == 3 && messageID != "" {
 			return normalizedContent{
 				kind: "text", text: cleanXMLText(message.AppMessage.Title),
-				reference: &ilinkprotocol.RefMessage{MessageItem: &ilinkprotocol.MessageItem{
-					Type: ilinkprotocol.ItemTypeImage, MessageID: messageID,
-					IsCompleted: true, Image: &ilinkprotocol.ImageItem{},
-				}},
+				referenceImageID: messageID,
 			}
 		}
 		return normalizedContent{kind: "text", text: quotedMessageText(document)}
@@ -977,8 +961,12 @@ func normalizeMessage(localType int64, content string, group bool) normalizedCon
 			return normalizedContent{kind: "file", text: "[文件] " + metadata.Filename, filename: metadata.Filename}
 		}
 		if metadata, ok := parseLinkMessage(content); ok {
-			parts := []string{metadata.Title, metadata.Description, metadata.URL}
-			return normalizedContent{kind: "link", text: compoundText("[链接]", parts...)}
+			if metadata.Kind == "finder" {
+				return normalizedContent{kind: "sphfeed", sphFeed: metadata.SphFeed}
+			}
+			return normalizedContent{kind: "link", link: &wecom.Link{
+				Title: metadata.Title, Description: metadata.Description, LinkURL: metadata.URL,
+			}}
 		}
 	}
 	labels := map[int64]struct{ kind, text string }{
@@ -1010,14 +998,32 @@ type linkedMessage struct {
 	AppMessage struct {
 		Title       string `xml:"title"`
 		Description string `xml:"des"`
+		Type        int64  `xml:"type"`
 		URL         string `xml:"url"`
+		FinderFeed  struct {
+			ObjectID    string `xml:"objectId"`
+			FeedType    int64  `xml:"feedType"`
+			Nickname    string `xml:"nickname"`
+			Description string `xml:"desc"`
+			MediaList   struct {
+				Media []struct {
+					URL          string `xml:"url"`
+					FullCoverURL string `xml:"fullCoverUrl"`
+					CoverURL     string `xml:"coverUrl"`
+					ThumbURL     string `xml:"thumbUrl"`
+					MediaType    int64  `xml:"mediaType"`
+				} `xml:"media"`
+			} `xml:"mediaList"`
+		} `xml:"finderFeed"`
 	} `xml:"appmsg"`
 }
 
 type linkMessageMetadata struct {
+	Kind        string
 	Title       string
 	Description string
 	URL         string
+	SphFeed     *wecom.SphFeed
 }
 
 func parseLinkMessage(content string) (linkMessageMetadata, bool) {
@@ -1029,10 +1035,44 @@ func parseLinkMessage(content string) (linkMessageMetadata, bool) {
 	if err := xml.Unmarshal([]byte(document), &message); err != nil {
 		return linkMessageMetadata{}, false
 	}
+	if metadata, ok := finderFeedMetadata(message); ok {
+		return metadata, true
+	}
 	metadata := linkMessageMetadata{
+		Kind:        "link",
 		Title:       cleanXMLText(message.AppMessage.Title),
 		Description: cleanXMLText(message.AppMessage.Description),
 		URL:         cleanXMLText(message.AppMessage.URL),
+	}
+	return metadata, metadata.Title != "" || metadata.Description != "" || metadata.URL != ""
+}
+
+func finderFeedMetadata(message linkedMessage) (linkMessageMetadata, bool) {
+	feed := message.AppMessage.FinderFeed
+	if message.AppMessage.Type != 51 && cleanXMLText(feed.ObjectID) == "" && cleanXMLText(feed.Nickname) == "" &&
+		cleanXMLText(feed.Description) == "" && len(feed.MediaList.Media) == 0 {
+		return linkMessageMetadata{}, false
+	}
+	sphFeed := &wecom.SphFeed{
+		FeedType: message.AppMessage.FinderFeed.FeedType,
+		SphName:  cleanXMLText(feed.Nickname),
+		FeedDesc: cleanXMLText(feed.Description),
+	}
+	metadata := linkMessageMetadata{
+		Kind:        "finder",
+		Title:       sphFeed.SphName,
+		Description: sphFeed.FeedDesc,
+		SphFeed:     sphFeed,
+	}
+	for _, media := range feed.MediaList.Media {
+		if metadata.URL == "" {
+			for _, candidate := range []string{media.URL, media.FullCoverURL, media.CoverURL, media.ThumbURL} {
+				if candidate = cleanXMLText(candidate); candidate != "" {
+					metadata.URL = candidate
+					break
+				}
+			}
+		}
 	}
 	return metadata, metadata.Title != "" || metadata.Description != "" || metadata.URL != ""
 }
@@ -1115,11 +1155,14 @@ func compoundText(prefix string, values ...string) string {
 }
 
 func quotedLinkText(content string) string {
-	result := "[引用消息][链接]"
 	metadata, ok := parseLinkMessage(content)
 	if !ok {
-		return result
+		return "[引用消息][链接]"
 	}
+	if metadata.Kind == "finder" {
+		return compoundText("[引用消息][视频号]", metadata.Title, metadata.Description, metadata.URL)
+	}
+	result := "[引用消息][链接]"
 	if metadata.Title != "" {
 		result += " " + metadata.Title
 	}

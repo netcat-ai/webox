@@ -9,18 +9,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/qrsource"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechat"
 	"github.com/netcat-ai/webox/internal/wechatdb"
+	"github.com/netcat-ai/webox/wecom"
 )
 
 const (
@@ -79,7 +78,7 @@ type getUpdatesRequest struct {
 }
 
 type sendMessageRequest struct {
-	Message ilinkprotocol.WeixinMessage `json:"msg"`
+	Messages []wecom.Message `json:"msgs"`
 }
 
 type contextToken struct {
@@ -321,7 +320,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		if len(result.Messages) == 0 {
 			cursor = result.Cursor
 		} else {
-			messages := make([]ilinkprotocol.WeixinMessage, 0, len(result.Messages))
+			messages := make([]wecom.Message, 0, len(result.Messages))
 			blocked := false
 			for _, message := range result.Messages {
 				mediaWaitExpired := inboundMediaWaitExpired(message, time.Now())
@@ -339,7 +338,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 					return
 				}
 				if mediaWaitExpired && hasMissingSharedMedia(view) {
-					server.logger.Warn("delivering WeChat media without shared_path after waiting one minute",
+					server.logger.Warn("delivering WeChat media without sdkfileid after waiting one minute",
 						"msgid", messageExternalID(message), "type", messageItemKind(message),
 					)
 				}
@@ -371,67 +370,96 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
-func inboundMediaWaitExpired(message ilinkprotocol.WeixinMessage, now time.Time) bool {
-	createdAt := message.CreateTimeMS
+func inboundMediaWaitExpired(message wecom.Message, now time.Time) bool {
+	createdAt := message.MsgTime
 	return createdAt <= 0 || !now.Before(time.UnixMilli(createdAt).Add(inboundMediaWait))
 }
 
-func (server *Server) prepareInboundMessage(message ilinkprotocol.WeixinMessage, accountID string, allowMissingMedia bool) (ilinkprotocol.WeixinMessage, error) {
-	view := message
-	view.ToUserID = accountID
-	view.ContextToken = server.contextToken(message.SessionID)
-	view.MentionedMe = containsAccountID(message.MentionedUserIDs, accountID)
-	view.Items = append([]ilinkprotocol.MessageItem(nil), message.Items...)
-	for index := range view.Items {
-		item := cloneMessageItem(view.Items[index])
-		if err := server.materializeInboundItem(message.SessionID, &item, allowMissingMedia); err != nil {
-			return ilinkprotocol.WeixinMessage{}, err
+func (server *Server) prepareInboundMessage(message wecom.Message, accountID string, allowMissingMedia bool) (wecom.Message, error) {
+	view := cloneMessage(message)
+	if view.Outgoing {
+		view.From = accountID
+		if view.RoomID == "" {
+			view.ToList = []string{view.ConversationID}
+		} else {
+			view.ToList = []string{}
 		}
-		view.Items[index] = item
+	} else {
+		view.ToList = []string{accountID}
+	}
+	if err := server.materializeInboundMessage(view.ConversationID, &view, allowMissingMedia); err != nil {
+		return wecom.Message{}, err
 	}
 	return view, nil
 }
 
-func cloneMessageItem(item ilinkprotocol.MessageItem) ilinkprotocol.MessageItem {
-	if item.Text != nil {
-		value := *item.Text
-		item.Text = &value
+func cloneMessage(message wecom.Message) wecom.Message {
+	message.ToList = append([]string(nil), message.ToList...)
+	if message.Text != nil {
+		value := *message.Text
+		message.Text = &value
 	}
-	if item.Image != nil {
-		value := *item.Image
-		item.Image = &value
+	if message.Image != nil {
+		value := *message.Image
+		message.Image = &value
 	}
-	if item.File != nil {
-		value := *item.File
-		item.File = &value
+	if message.Voice != nil {
+		value := *message.Voice
+		message.Voice = &value
 	}
-	if item.Reference != nil {
-		reference := *item.Reference
-		if reference.MessageItem != nil {
-			value := cloneMessageItem(*reference.MessageItem)
-			reference.MessageItem = &value
-		}
-		item.Reference = &reference
+	if message.File != nil {
+		value := *message.File
+		message.File = &value
 	}
-	return item
+	if message.Video != nil {
+		value := *message.Video
+		message.Video = &value
+	}
+	if message.Link != nil {
+		value := *message.Link
+		message.Link = &value
+	}
+	if message.SphFeed != nil {
+		value := *message.SphFeed
+		message.SphFeed = &value
+	}
+	if message.Mixed != nil {
+		value := *message.Mixed
+		value.Items = append([]wecom.MixedItem(nil), value.Items...)
+		message.Mixed = &value
+	}
+	return message
 }
 
-func (server *Server) materializeInboundItem(roomID string, item *ilinkprotocol.MessageItem, allowMissingMedia bool) error {
+func (server *Server) materializeInboundMessage(roomID string, message *wecom.Message, allowMissingMedia bool) error {
 	var err error
-	switch item.Type {
-	case ilinkprotocol.ItemTypeImage:
-		if item.Image == nil {
-			item.Image = &ilinkprotocol.ImageItem{}
+	switch message.MsgType {
+	case wecom.MessageTypeImage:
+		if message.Image == nil {
+			message.Image = &wecom.Image{}
 		}
-		item.Image.SharedPath, err = server.materializeInboundImage(roomID, item.MessageID)
-	case ilinkprotocol.ItemTypeFile:
-		if item.File == nil {
-			item.File = &ilinkprotocol.FileItem{}
+		message.Image.SDKFileID, err = server.materializeInboundImage(roomID, message.MsgID)
+	case wecom.MessageTypeFile:
+		if message.File == nil {
+			message.File = &wecom.File{}
 		}
 		var file *wechatdb.LocalFile
-		file, item.File.SharedPath, err = server.materializeInboundFile(roomID, item.MessageID)
+		file, message.File.SDKFileID, err = server.materializeInboundFile(roomID, message.MsgID)
 		if err == nil {
-			item.File.FileName = file.Filename
+			message.File.FileName = file.Filename
+		}
+	case wecom.MessageTypeMixed:
+		if message.Mixed != nil {
+			for index := range message.Mixed.Items {
+				item := &message.Mixed.Items[index]
+				if item.Type != wecom.MessageTypeImage {
+					continue
+				}
+				item.SDKFileID, err = server.materializeInboundImage(roomID, item.MessageID)
+				if err != nil {
+					break
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -439,69 +467,32 @@ func (server *Server) materializeInboundItem(roomID string, item *ilinkprotocol.
 			return err
 		}
 	}
-	if item.Reference != nil && item.Reference.MessageItem != nil {
-		return server.materializeInboundItem(roomID, item.Reference.MessageItem, allowMissingMedia)
-	}
 	return nil
 }
 
-func hasMissingSharedMedia(message ilinkprotocol.WeixinMessage) bool {
-	for index := range message.Items {
-		if itemMissingSharedMedia(&message.Items[index]) {
-			return true
+func hasMissingSharedMedia(message wecom.Message) bool {
+	if message.MsgType == wecom.MessageTypeImage && (message.Image == nil || strings.TrimSpace(message.Image.SDKFileID) == "") {
+		return true
+	}
+	if message.MsgType == wecom.MessageTypeFile && (message.File == nil || strings.TrimSpace(message.File.SDKFileID) == "") {
+		return true
+	}
+	if message.MsgType == wecom.MessageTypeMixed && message.Mixed != nil {
+		for _, item := range message.Mixed.Items {
+			if item.Type == wecom.MessageTypeImage && strings.TrimSpace(item.SDKFileID) == "" {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func itemMissingSharedMedia(item *ilinkprotocol.MessageItem) bool {
-	if item.Type == ilinkprotocol.ItemTypeImage && (item.Image == nil || strings.TrimSpace(item.Image.SharedPath) == "") {
-		return true
-	}
-	if item.Type == ilinkprotocol.ItemTypeFile && (item.File == nil || strings.TrimSpace(item.File.SharedPath) == "") {
-		return true
-	}
-	return item.Reference != nil && item.Reference.MessageItem != nil && itemMissingSharedMedia(item.Reference.MessageItem)
+func messageExternalID(message wecom.Message) string {
+	return message.MsgID
 }
 
-func messageExternalID(message ilinkprotocol.WeixinMessage) string {
-	if message.MessageID != 0 {
-		return strconv.FormatInt(message.MessageID, 10)
-	}
-	if message.ClientID != "" {
-		return message.ClientID
-	}
-	if len(message.Items) != 0 {
-		return message.Items[0].MessageID
-	}
-	return ""
-}
-
-func messageItemKind(message ilinkprotocol.WeixinMessage) string {
-	if len(message.Items) == 0 {
-		return "none"
-	}
-	switch message.Items[0].Type {
-	case ilinkprotocol.ItemTypeImage:
-		return "image"
-	case ilinkprotocol.ItemTypeFile:
-		return "file"
-	case ilinkprotocol.ItemTypeVoice:
-		return "voice"
-	case ilinkprotocol.ItemTypeVideo:
-		return "video"
-	default:
-		return "text"
-	}
-}
-
-func containsAccountID(userIDs []string, accountID string) bool {
-	for _, userID := range userIDs {
-		if userID == accountID {
-			return true
-		}
-	}
-	return false
+func messageItemKind(message wecom.Message) string {
+	return message.MsgType
 }
 
 func (server *Server) sendMessage(response http.ResponseWriter, request *http.Request) {
@@ -517,16 +508,11 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeJSON(response, http.StatusOK, sessionUnavailable(""))
 		return
 	}
-	items, err := outboundItems(body.Message)
+	target, items, err := outboundMessages(body.Messages)
 	if errors.Is(err, errUnsupportedOutboundItem) {
 		writeError(response, http.StatusNotImplemented, err.Error())
 		return
 	}
-	if err != nil {
-		writeError(response, http.StatusBadRequest, err.Error())
-		return
-	}
-	target, err := server.outboundTarget(body.Message.ContextToken)
 	if err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
@@ -540,8 +526,8 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		return
 	}
 	resultID := receipt.ClientMessageID
-	if body.Message.ClientID != "" {
-		resultID = body.Message.ClientID
+	if len(body.Messages) != 0 && strings.TrimSpace(body.Messages[0].MsgID) != "" {
+		resultID = body.Messages[0].MsgID
 	}
 	server.logger.Info("WeChat message sent", "target", target, "client_msg_id", resultID)
 	writeJSON(response, http.StatusOK, sendSuccess(resultID))
@@ -628,20 +614,6 @@ func (server *Server) authenticate(response http.ResponseWriter, request *http.R
 	return true
 }
 
-func (server *Server) outboundTarget(rawToken string) (string, error) {
-	if strings.TrimSpace(rawToken) == "" {
-		return "", errors.New("msg.context_token is required")
-	}
-	var context contextToken
-	if err := signedpayload.Decode(server.apiToken, rawToken, &context); err != nil {
-		return "", fmt.Errorf("invalid context_token: %w", err)
-	}
-	if strings.TrimSpace(context.Target) == "" {
-		return "", errors.New("msg.context_token has no outbound target")
-	}
-	return context.Target, nil
-}
-
 func (server *Server) contextToken(target string) string {
 	token, _ := signedpayload.Encode(server.apiToken, contextToken{Target: target})
 	return token
@@ -696,37 +668,53 @@ func containsToken(tokens []string, expected string) bool {
 
 var errUnsupportedOutboundItem = errors.New("only text, image, and file sending are supported")
 
-func outboundItems(message ilinkprotocol.WeixinMessage) ([]sender.Item, error) {
-	items := make([]sender.Item, 0, len(message.Items))
-	for _, item := range message.Items {
-		switch item.Type {
-		case ilinkprotocol.ItemTypeText:
-			if item.Text == nil {
-				return nil, errors.New("text_item must be an object")
+func outboundMessages(messages []wecom.Message) (string, []sender.Item, error) {
+	if len(messages) == 0 {
+		return "", nil, errors.New("msgs is required")
+	}
+	items := make([]sender.Item, 0, len(messages))
+	var target string
+	for _, message := range messages {
+		messageTarget, err := outboundMessageTarget(message)
+		if err != nil {
+			return "", nil, err
+		}
+		if target == "" {
+			target = messageTarget
+		} else if target != messageTarget {
+			return "", nil, errors.New("all msgs must have the same roomid or tolist target")
+		}
+		switch message.MsgType {
+		case wecom.MessageTypeText:
+			if message.Text == nil || strings.TrimSpace(message.Text.Content) == "" {
+				return "", nil, errors.New("text.content is required")
 			}
-			text := strings.TrimSpace(item.Text.Text)
-			if text == "" {
-				return nil, errors.New("text_item.text is required")
+			items = append(items, sender.Item{Kind: "text", Text: strings.TrimSpace(message.Text.Content)})
+		case wecom.MessageTypeImage:
+			if message.Image == nil || strings.TrimSpace(message.Image.SDKFileID) == "" {
+				return "", nil, errors.New("image.sdkfileid is required")
 			}
-			items = append(items, sender.Item{Kind: "text", Text: text})
-		case ilinkprotocol.ItemTypeImage:
-			if item.Image == nil || strings.TrimSpace(item.Image.SharedPath) == "" {
-				return nil, errors.New("image_item.shared_path is required")
+			items = append(items, sender.Item{Kind: "image", SharedPath: strings.TrimSpace(message.Image.SDKFileID)})
+		case wecom.MessageTypeFile:
+			if message.File == nil || strings.TrimSpace(message.File.SDKFileID) == "" {
+				return "", nil, errors.New("file.sdkfileid is required")
 			}
-			items = append(items, sender.Item{Kind: "image", SharedPath: strings.TrimSpace(item.Image.SharedPath)})
-		case ilinkprotocol.ItemTypeFile:
-			if item.File == nil || strings.TrimSpace(item.File.SharedPath) == "" {
-				return nil, errors.New("file_item.shared_path is required")
-			}
-			items = append(items, sender.Item{Kind: "file", SharedPath: strings.TrimSpace(item.File.SharedPath)})
+			items = append(items, sender.Item{Kind: "file", SharedPath: strings.TrimSpace(message.File.SDKFileID)})
 		default:
-			return nil, errUnsupportedOutboundItem
+			return "", nil, errUnsupportedOutboundItem
 		}
 	}
-	if len(items) == 0 {
-		return nil, errors.New("msg.item_list is required")
+	return target, items, nil
+}
+
+func outboundMessageTarget(message wecom.Message) (string, error) {
+	if target := strings.TrimSpace(message.RoomID); target != "" {
+		return target, nil
 	}
-	return items, nil
+	if len(message.ToList) != 1 || strings.TrimSpace(message.ToList[0]) == "" {
+		return "", errors.New("each private msg must have exactly one tolist target")
+	}
+	return strings.TrimSpace(message.ToList[0]), nil
 }
 
 func stringValue(value any) string {

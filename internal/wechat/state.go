@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	ilinkprotocol "github.com/netcat-ai/webox/ilink"
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
+	"github.com/netcat-ai/webox/wecom"
 )
 
 const (
@@ -61,7 +61,7 @@ type dbCursor struct {
 type PollResult struct {
 	AccountID string
 	Cursor    string
-	Messages  []ilinkprotocol.WeixinMessage
+	Messages  []wecom.Message
 }
 
 type UserInfo struct {
@@ -72,13 +72,13 @@ type UserInfo struct {
 }
 
 func filterMessagesByRemarkPrefix(
-	messages []ilinkprotocol.WeixinMessage,
+	messages []wecom.Message,
 	lookup func(string) (string, error),
-) ([]ilinkprotocol.WeixinMessage, error) {
-	filtered := make([]ilinkprotocol.WeixinMessage, 0, len(messages))
+) ([]wecom.Message, error) {
+	filtered := make([]wecom.Message, 0, len(messages))
 	remarks := make(map[string]string)
 	for _, message := range messages {
-		roomID := strings.TrimSpace(message.SessionID)
+		roomID := strings.TrimSpace(message.ConversationID)
 		if roomID == "" {
 			continue
 		}
@@ -108,9 +108,9 @@ func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
 }
 
 func (state *State) applyRemarkFilter(
-	messages []ilinkprotocol.WeixinMessage,
+	messages []wecom.Message,
 	lookup func(string) (string, error),
-) ([]ilinkprotocol.WeixinMessage, error) {
+) ([]wecom.Message, error) {
 	if !state.remarkFilterEnabled {
 		return messages, nil
 	}
@@ -299,7 +299,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 			return PollResult{}, state.dbError("baseline WeChat messages", err)
 		}
 		encoded, err := state.encodeCursor(cursor)
-		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []ilinkprotocol.WeixinMessage{}}, err
+		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []wecom.Message{}}, err
 	}
 	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
 		return PollResult{}, fmt.Errorf("decode get_updates_buf: %w", err)
@@ -486,11 +486,11 @@ type orderKey struct {
 	room      string
 }
 
-func messageOrder(message ilinkprotocol.WeixinMessage) orderKey {
+func messageOrder(message wecom.Message) orderKey {
 	return orderKey{
-		timestamp: message.CreateTimeMS,
+		timestamp: message.MsgTime,
 		localID:   message.Sequence,
-		room:      message.SessionID,
+		room:      message.ConversationID,
 	}
 }
 

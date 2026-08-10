@@ -58,48 +58,45 @@ POST getupdates(get_updates_buf)
   -> map rows to iLink msgs
   -> decode V2 image .dat files into /webox/state/media/inbox
   -> copy available WeChat files into /webox/state/media/inbox
-  -> issue signed context_token per target
   -> return msgs and next signed cursor
 ```
 
-首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `message_id` 去重。
+首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `msgid` 去重。
 数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
 
 主要字段映射：
 
-| 微信字段 | iLink 字段 |
+| 微信字段 | Webox 消息字段 |
 | --- | --- |
-| `msgid` | `client_id`、数值 `message_id` |
-| `local_id` | `seq` |
-| `from` | `from_user_id`、`ilink_user_id` |
-| 当前登录账号 `account_id` | `to_user_id` |
-| `roomid` | `session_id`、签名 `context_token` 目标 |
-| `msgtime` | `create_time_ms`、`update_time_ms` |
-| `text.content` | `item_list[].text_item.text` |
-| 图片 `appmsg.refermsg` | `item_list[].ref_msg.message_item` |
-| 群消息 `source.atuserlist` | `mentioned_me` |
-| V2 图片 `.dat` | `item_list[].image_item.shared_path` |
-| 文件 | `item_list[].file_item.file_name`、`item_list[].file_item.shared_path` |
+| `msgid` | `msgid` |
+| `from` | `from` |
+| 当前登录账号 `account_id` | 入站消息的 `tolist[]` |
+| 群会话 | `roomid`；私聊为空字符串 |
+| `msgtime` | `msgtime`（毫秒） |
+| 文本 | `msgtype=text`、`text.content` |
+| 普通链接 `appmsg` | `msgtype=link`、`link` |
+| 视频号 `appmsg.finderFeed` | `msgtype=sphfeed`、`sphfeed` |
+| 图片 | `msgtype=image`、`image.sdkfileid` |
+| 文件 | `msgtype=file`、`file.filename`、`file.sdkfileid` |
+| 带引用图片的文本 | `msgtype=mixed`、`mixed.item[]` |
 
-数据库消息先转换为公开 Go 包 `github.com/netcat-ai/webox/ilink` 中有类型的官方 iLink
-`WeixinMessage` / `MessageItem`，再由 `getupdates` 原样交付；其他 Go 消费者可直接复用同一协议类型。
-Webox 不再额外输出顶层 `text`、`msgid`、`wechat_msgtype`、`filename` 或会话名称/备注字段。
-当前协议扩展只有媒体对象中的 `shared_path`，以及待后续群聊 mention 重构的临时 `mentioned_me`。
+数据库消息直接转换为公开 Go 包 `github.com/netcat-ai/webox/wecom` 的 `Message`，字段与
+[企业微信会话内容存档消息格式](https://developer.work.weixin.qq.com/document/path/91774)一致。消息对象不包含
+`item_list`、`context_token`、`mentioned_me`、`is_completed` 或 `shared_path` 等 Webox 私有字段。
+媒体在共享目录中的相对路径作为 opaque `sdkfileid` 使用；Webox 不增加另一套路径字段。
+视频号分享的 `appmsg` 顶层可能只包含“当前微信版本不支持”的兼容标题和升级 URL；Webox 优先读取
+`finderFeed`，输出 `sphfeed` 消息体，不生成 `text`，也不把顶层兼容占位交付给消费者。
 
-群聊 `roomid` 以 `@chatroom` 结尾，并额外写入 `group_id`。Webox 解压并解析消息 `source` 中逗号分隔的
-`atuserlist`，仅当其中存在当前账号的完整 `account_id` 时返回 `mentioned_me=true`；不根据消息文本中的昵称
-推测 @，`notify@all` 等群体标记也不等价于明确 @ 当前账号。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件
-从微信本地目录复制到共享目录。媒体可用时返回 `inbox/` 相对 `shared_path`，不可用时不返回该字段。
+群聊 `roomid` 以 `@chatroom` 结尾。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件从微信本地目录复制到
+共享目录。媒体可用时 `sdkfileid` 是 `inbox/` 相对路径，不可用时为空字符串。
 
-引用图片在保留原有文本摘要的同时使用 iLink `ref_msg` 结构。Webox 从微信 `refermsg.svrid`
-定位被引用的图片，解码后将路径写入
-`ref_msg.message_item.image_item.shared_path`；图片尚未准备好时复用当前消息的一分钟媒体等待窗口。
+引用图片使用企业微信 `mixed` 结构：显式文本是 `type=text` item，被引用图片是带 `sdkfileid` 的
+`type=image` item。图片尚未准备好时复用当前消息的一分钟媒体等待窗口。
 
 图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
 到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，
 `getupdates` 不返回当前批次，也不推进 cursor；单次 HTTP 长轮询到期可返回空消息和原 cursor，由消费者继续请求。
-从微信消息时间起等待满 1 分钟仍不可用时，Webox 记录 WARN、返回不带 `shared_path` 的原媒体消息并推进 cursor，避免永久队头阻塞。
-因此 `shared_path` 是媒体可用性的唯一表达：存在表示媒体已经原子写入共享目录，缺失表示等待超时；原媒体消息仍然存在。
+从微信消息时间起等待满 1 分钟仍不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息并推进 cursor，避免永久队头阻塞。
 
 V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
 `libvoipCodec.so`，调用 `wxam_dec_wxam2pic_5` 输出 JPEG；加载 codec 前以 `RTLD_GLOBAL` 预载
@@ -109,19 +106,17 @@ V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信�
 ## 发消息
 
 ```text
-POST sendmessage(msg.context_token, msg.client_id, item_list[text/image/file...])
+POST sendmessage(msgs[text/image/file...])
   -> authenticate bot token
-  -> verify and decode context_token
-  -> resolve recipient and unique remark
-  -> resolve media shared_path under /webox/state/media/inbox or outbox
-  -> activate WeChat once, paste every item into the same composer, press Enter once
+  -> resolve the common target from roomid or tolist
+  -> resolve media sdkfileid under /webox/state/media/inbox or outbox
+  -> activate WeChat once, paste every message into the same composer, press Enter once
   -> verify every expected text, image, and file in the same local DB conversation
-  -> return client_id as client_msg_id with ret=0
+  -> return the first msgid as client_msg_id with ret=0
 ```
 
-服务只信任签名 `context_token` 中的目标，不信任调用方可修改的 `to_user_id`。`client_id` 是调用方提供的消息标识，Webox 原样返回，不赋予其请求幂等语义。
-
-整个发送路径由互斥锁串行化。一个 `item_list` 是一次 UI 发送：文本、图片和文件都通过剪贴板依次粘贴，最后只按一次 Enter，
+批内所有消息必须拥有相同的非空 `roomid`，或相同且唯一的 `tolist` 私聊目标。
+整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次 UI 发送：文本、图片和文件都通过剪贴板依次粘贴，最后只按一次 Enter，
 不使用附件按钮、文件选择器或坐标点击，也不维护逐 item 发送进度。HTTP 成功
 表示 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 
