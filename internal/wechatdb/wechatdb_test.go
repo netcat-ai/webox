@@ -224,6 +224,9 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 		if event.message.Outgoing != (rows[index].origin == 1) {
 			t.Fatalf("event[%d] outgoing=%t want %t", index, event.message.Outgoing, rows[index].origin == 1)
 		}
+		if event.message.RoomID != "alice" || len(event.message.ToList) != 0 {
+			t.Fatalf("event[%d] roomid=%q tolist=%#v", index, event.message.RoomID, event.message.ToList)
+		}
 	}
 }
 
@@ -245,6 +248,39 @@ func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 	}
 }
 
+func TestQueryResumesByLocalIDWhenTimestampMovesBackward(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1001, 0, 'first', 0, 3, 2)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 999, 0, 'second', 0, 3, 2)")
+	defer func() { _ = db.Close() }()
+	events, err := queryNewTable(
+		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
+		"alice", false, MessagePosition{CreateTime: 1001, LocalID: 1}, 100,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].position.LocalID != 2 {
+		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestMaxMessagePositionUsesLatestLocalID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message.db")
+	db := createMessageDB(t, path)
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1001, 0, 'first', 0, 3, 2)")
+	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 999, 0, 'second', 0, 3, 2)")
+	defer func() { _ = db.Close() }()
+	position, found, err := maxMessagePosition(db, "Msg_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || position.LocalID != 2 || position.CreateTime != 999 {
+		t.Fatalf("position=%#v found=%t", position, found)
+	}
+}
+
 func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)
@@ -260,6 +296,63 @@ func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].position.LocalID != 2 {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestResolveEventSendersByShardAndAdvancePastMissingMappings(t *testing.T) {
+	firstDB := createMessageDB(t, filepath.Join(t.TempDir(), "message-0.db"))
+	secondDB := createMessageDB(t, filepath.Join(t.TempDir(), "message-1.db"))
+	defer func() { _ = firstDB.Close() }()
+	defer func() { _ = secondDB.Close() }()
+	for _, db := range []*sql.DB{firstDB, secondDB} {
+		mustExec(t, db, "CREATE TABLE Name2Id (user_name TEXT)")
+	}
+	mustExec(t, firstDB, "INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid-first')")
+	mustExec(t, secondDB, "INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid-second')")
+
+	events := []messageEvent{
+		{
+			room: "first-room", shard: "message/message_0.db", db: firstDB,
+			position: MessagePosition{CreateTime: 1000, LocalID: 1}, realSenderID: 7,
+			message: &wecom.Message{MsgID: "101"},
+		},
+		{
+			room: "first-room", shard: "message/message_0.db", db: firstDB,
+			position: MessagePosition{CreateTime: 1000, LocalID: 2}, realSenderID: 8,
+			message: &wecom.Message{MsgID: "102"},
+		},
+		{
+			room: "second-room", shard: "message/message_1.db", db: secondDB,
+			position: MessagePosition{CreateTime: 1001, LocalID: 1}, realSenderID: 7,
+			message: &wecom.Message{MsgID: "103"},
+		},
+	}
+	if err := resolveEventSenders(events); err != nil {
+		t.Fatal(err)
+	}
+	data := pollDataFromEvents(events, nil, 100)
+	if len(data.Messages) != 2 || data.Messages[0].From != "wxid-first" || data.Messages[1].From != "wxid-second" {
+		t.Fatalf("messages=%#v", data.Messages)
+	}
+	if len(data.Skipped) != 1 || data.Skipped[0].MessageID != "102" || data.Skipped[0].RealSenderID != 8 {
+		t.Fatalf("skipped=%#v", data.Skipped)
+	}
+	position := data.NewState["first-room"]["message/message_0.db"]
+	if position.CreateTime != 1000 || position.LocalID != 2 {
+		t.Fatalf("missing sender position was not advanced: %#v", position)
+	}
+}
+
+func TestResolveEventSendersReturnsName2IDQueryFailure(t *testing.T) {
+	db := createMessageDB(t, filepath.Join(t.TempDir(), "message.db"))
+	defer func() { _ = db.Close() }()
+	events := []messageEvent{{
+		room: "room", shard: "message/message_0.db", db: db,
+		position: MessagePosition{CreateTime: 1000, LocalID: 1}, realSenderID: 7,
+		message: &wecom.Message{MsgID: "101"},
+	}}
+	if err := resolveEventSenders(events); err == nil || !strings.Contains(err.Error(), "Name2Id") {
+		t.Fatalf("resolveEventSenders() error=%v", err)
 	}
 }
 

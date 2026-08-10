@@ -95,7 +95,6 @@ type Message struct {
 	SphFeed *SphFeed `json:"sphfeed,omitempty"`
 	Mixed   *Mixed   `json:"mixed,omitempty"`
 
-	Sequence       int64  `json:"-"`
-	ConversationID string `json:"-"`
-	Outgoing       bool   `json:"-"`
+	Sequence int64 `json:"-"`
+	Outgoing bool  `json:"-"`
 }

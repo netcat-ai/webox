@@ -5,7 +5,7 @@
 测试覆盖：
 
 ```text
-peer UI -> 微信网络 -> SUT DB/WAL -> getupdates -> roomid/tolist
+peer UI -> 微信网络 -> SUT DB/WAL -> getupdates -> roomid
         -> sendmessage -> SUT UI -> 微信网络 -> peer DB/WAL -> getupdates
 ```
 
@@ -111,7 +111,7 @@ go run ./tests/e2e \
 }
 ```
 
-runner 会根据企业微信格式中的 `roomid` 拒绝私聊与群聊相互误判。
+runner 会根据 Webox `roomid` 是否以 `@chatroom` 结尾，拒绝私聊与群聊相互误判。
 
 如果容器名、端口或 Docker CLI 不同，可使用参数或对应的 `WEBOX_E2E_*` 环境变量覆盖：
 

@@ -62,6 +62,7 @@ type PollResult struct {
 	AccountID string
 	Cursor    string
 	Messages  []wecom.Message
+	Skipped   []wechatdb.SkippedMessage
 }
 
 type UserInfo struct {
@@ -78,7 +79,7 @@ func filterMessagesByRemarkPrefix(
 	filtered := make([]wecom.Message, 0, len(messages))
 	remarks := make(map[string]string)
 	for _, message := range messages {
-		roomID := strings.TrimSpace(message.ConversationID)
+		roomID := strings.TrimSpace(message.RoomID)
 		if roomID == "" {
 			continue
 		}
@@ -330,7 +331,7 @@ func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error
 	if err != nil {
 		return PollResult{}, err
 	}
-	return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: messages}, nil
+	return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: messages, Skipped: data.Skipped}, nil
 }
 
 func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, error) {
@@ -490,7 +491,7 @@ func messageOrder(message wecom.Message) orderKey {
 	return orderKey{
 		timestamp: message.MsgTime,
 		localID:   message.Sequence,
-		room:      message.ConversationID,
+		room:      message.RoomID,
 	}
 }
 

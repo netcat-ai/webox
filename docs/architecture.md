@@ -69,9 +69,9 @@ POST getupdates(get_updates_buf)
 | 微信字段 | Webox 消息字段 |
 | --- | --- |
 | `msgid` | `msgid` |
-| `from` | `from` |
-| 当前登录账号 `account_id` | 入站消息的 `tolist[]` |
-| 群会话 | `roomid`；私聊为空字符串 |
+| 实际发送者 | `from`；当前账号发出的消息使用登录账号 `account_id` |
+| `SessionTable.username` | `roomid`；私聊与群聊都非空 |
+| 暂不解析的 @ 接收者 | `tolist=[]` |
 | `msgtime` | `msgtime`（毫秒） |
 | 文本 | `msgtype=text`、`text.content` |
 | 普通链接 `appmsg` | `msgtype=link`、`link` |
@@ -80,14 +80,15 @@ POST getupdates(get_updates_buf)
 | 文件 | `msgtype=file`、`file.filename`、`file.sdkfileid` |
 | 带引用图片的文本 | `msgtype=mixed`、`mixed.item[]` |
 
-数据库消息直接转换为公开 Go 包 `github.com/netcat-ai/webox/wecom` 的 `Message`，字段与
-[企业微信会话内容存档消息格式](https://developer.work.weixin.qq.com/document/path/91774)一致。消息对象不包含
+数据库消息直接转换为公开 Go 包 `github.com/netcat-ai/webox/wecom` 的 `Message`。消息信封沿用
+[企业微信会话内容存档消息格式](https://developer.work.weixin.qq.com/document/path/91774)的字段形状，但 Webox 将
+`roomid` 统一定义为 `SessionTable.username`，并在当前版本固定输出空 `tolist`。消息对象不包含
 `item_list`、`context_token`、`mentioned_me`、`is_completed` 或 `shared_path` 等 Webox 私有字段。
 媒体在共享目录中的相对路径作为 opaque `sdkfileid` 使用；Webox 不增加另一套路径字段。
 视频号分享的 `appmsg` 顶层可能只包含“当前微信版本不支持”的兼容标题和升级 URL；Webox 优先读取
 `finderFeed`，输出 `sphfeed` 消息体，不生成 `text`，也不把顶层兼容占位交付给消费者。
 
-群聊 `roomid` 以 `@chatroom` 结尾。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件从微信本地目录复制到
+群聊 `roomid` 以 `@chatroom` 结尾，其他 `roomid` 表示私聊。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件从微信本地目录复制到
 共享目录。媒体可用时 `sdkfileid` 是 `inbox/` 相对路径，不可用时为空字符串。
 
 引用图片使用企业微信 `mixed` 结构：显式文本是 `type=text` item，被引用图片是带 `sdkfileid` 的
@@ -108,17 +109,17 @@ V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信�
 ```text
 POST sendmessage(msgs[text/image/file...])
   -> authenticate bot token
-  -> resolve the common target from roomid or tolist
+  -> resolve the common target from roomid
   -> resolve media sdkfileid under /webox/state/media/inbox or outbox
-  -> activate WeChat once, paste every message into the same composer, press Enter once
+  -> activate WeChat once, paste and press Enter for every message in order
   -> verify every expected text, image, and file in the same local DB conversation
   -> return the first msgid as client_msg_id with ret=0
 ```
 
-批内所有消息必须拥有相同的非空 `roomid`，或相同且唯一的 `tolist` 私聊目标。
-整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次 UI 发送：文本、图片和文件都通过剪贴板依次粘贴，最后只按一次 Enter，
-不使用附件按钮、文件选择器或坐标点击，也不维护逐 item 发送进度。HTTP 成功
-表示 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
+批内所有消息必须拥有相同的非空 `roomid`，且 `tolist` 必须为空。
+整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次有序 UI 发送批次：每条文本、图片和文件都通过剪贴板粘贴后立即按 Enter，
+不使用附件按钮、文件选择器或坐标点击。该批次不是原子操作，中途失败时前面的消息可能已经发出，调用方不能自动重试整个批次。
+HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 
 ## 辅助接口
 

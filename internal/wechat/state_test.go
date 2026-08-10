@@ -14,9 +14,9 @@ import (
 
 func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 	messages := []wecom.Message{
-		{ConversationID: "wxid-direct"},
-		{ConversationID: "family@chatroom"},
-		{ConversationID: "noise@chatroom"},
+		{RoomID: "wxid-direct"},
+		{RoomID: "family@chatroom"},
+		{RoomID: "noise@chatroom"},
 	}
 	remarks := map[string]string{
 		"wxid-direct":     "webox.alice",
@@ -33,7 +33,7 @@ func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 	if len(filtered) != 2 {
 		t.Fatalf("filtered=%#v", filtered)
 	}
-	got := []string{filtered[0].ConversationID, filtered[1].ConversationID}
+	got := []string{filtered[0].RoomID, filtered[1].RoomID}
 	if want := []string{"wxid-direct", "family@chatroom"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rooms=%v want=%v", got, want)
 	}
@@ -41,8 +41,8 @@ func TestRemarkFilterAllowsOnlyWBConversationRemarks(t *testing.T) {
 
 func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
 	messages := []wecom.Message{
-		{ConversationID: "wxid-direct"},
-		{ConversationID: "wxid-direct"},
+		{RoomID: "wxid-direct"},
+		{RoomID: "wxid-direct"},
 		{},
 	}
 	lookupCalls := 0
@@ -61,7 +61,7 @@ func TestRemarkFilterSkipsMissingRoomAndCachesConversationRemark(t *testing.T) {
 
 func TestDisabledRemarkFilterDoesNotReadRemarksOrDropMessages(t *testing.T) {
 	state := New(t.TempDir(), "test-token", false)
-	messages := []wecom.Message{{ConversationID: "unmarked"}}
+	messages := []wecom.Message{{RoomID: "unmarked"}}
 	lookupCalled := false
 
 	filtered, err := state.applyRemarkFilter(messages, func(string) (string, error) {

@@ -336,16 +336,14 @@ func (client *iLinkClient) sendText(ctx context.Context, incoming message, clien
 		ErrCode int    `json:"errcode"`
 		Errmsg  string `json:"errmsg"`
 	}
-	target := incoming.From
-	toList := []string{target}
-	if incoming.RoomID != "" {
-		target = incoming.RoomID
-		toList = []string{}
+	roomID := strings.TrimSpace(incoming.RoomID)
+	if roomID == "" {
+		return errors.New("incoming message has no roomid")
 	}
 	err := client.post(ctx, "/ilink/bot/sendmessage", map[string]any{
 		"msgs": []any{map[string]any{
-			"msgid": clientID, "action": "send", "from": "", "tolist": toList,
-			"roomid": incoming.RoomID, "msgtime": time.Now().UnixMilli(), "msgtype": "text",
+			"msgid": clientID, "action": "send", "from": "", "tolist": []string{},
+			"roomid": roomID, "msgtime": time.Now().UnixMilli(), "msgtype": "text",
 			"text": map[string]any{"content": content},
 		}},
 	}, &response)

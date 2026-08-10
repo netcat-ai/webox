@@ -45,12 +45,9 @@ func inboundMessage(id, room, senderID string, createdAt int64, body wecom.Messa
 	body.Action = wecom.ActionSend
 	body.From = senderID
 	body.ToList = []string{}
+	body.RoomID = room
 	body.MsgTime = createdAt
 	body.Sequence = 7
-	body.ConversationID = room
-	if strings.HasSuffix(room, "@chatroom") {
-		body.RoomID = room
-	}
 	return body
 }
 
@@ -200,7 +197,7 @@ func TestExpiredQRCodeIsRefreshedBeforeReissue(t *testing.T) {
 	}
 }
 
-func TestGetUpdatesUsesExactWeComTextMessageFormat(t *testing.T) {
+func TestGetUpdatesUsesUnifiedRoomTextMessageFormat(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
 	messages.accountID = "wxid-stale"
@@ -218,7 +215,7 @@ func TestGetUpdatesUsesExactWeComTextMessageFormat(t *testing.T) {
 	text := message["text"].(map[string]any)["content"]
 	toList := message["tolist"].([]any)
 	if message["msgid"] != "message-1" || message["action"] != "send" || message["from"] != "wxid-alice" ||
-		len(toList) != 1 || toList[0] != "wxid-self" || message["roomid"] != "" ||
+		len(toList) != 0 || message["roomid"] != "wxid-alice" ||
 		message["msgtype"] != "text" || text != "hello" {
 		t.Fatalf("message=%#v", message)
 	}
@@ -232,7 +229,7 @@ func TestGetUpdatesUsesExactWeComTextMessageFormat(t *testing.T) {
 	}
 }
 
-func TestGetUpdatesUsesWeComFieldsForOutgoingPrivateMessage(t *testing.T) {
+func TestGetUpdatesUsesRoomIDForOutgoingPrivateMessage(t *testing.T) {
 	server, messages, _, _ := testServer(t)
 	messages.initialized = true
 	message := inboundMessage("outgoing-1", "wxid-alice", "wxid-alice", 1781703356000, textItem("sent"))
@@ -243,7 +240,7 @@ func TestGetUpdatesUsesWeComFieldsForOutgoingPrivateMessage(t *testing.T) {
 	body := responseJSON(t, response)
 	view := body["msgs"].([]any)[0].(map[string]any)
 	toList := view["tolist"].([]any)
-	if response.Code != http.StatusOK || view["from"] != "wxid-self" || len(toList) != 1 || toList[0] != "wxid-alice" || view["roomid"] != "" {
+	if response.Code != http.StatusOK || view["from"] != "wxid-self" || len(toList) != 0 || view["roomid"] != "wxid-alice" {
 		t.Fatalf("message=%#v", view)
 	}
 }
@@ -281,7 +278,7 @@ func TestGetUpdatesPreservesSphFeedMessage(t *testing.T) {
 	messages.accountID = "wxid-self"
 	messages.pollResult = wechat.PollResult{AccountID: "wxid-self", Cursor: "next-cursor", Messages: []wecom.Message{{
 		MsgID: "8419589511486552249", Action: "send", From: "webox.xiaxia", ToList: []string{},
-		MsgTime: 1781703356000, MsgType: wecom.MessageTypeSphFeed, ConversationID: "webox.xiaxia",
+		RoomID: "webox.xiaxia", MsgTime: 1781703356000, MsgType: wecom.MessageTypeSphFeed,
 		SphFeed: &wecom.SphFeed{FeedType: 4, SphName: "黄同学的移动小屋", FeedDesc: "自驾游装备收纳清单"},
 	}}}
 
@@ -354,6 +351,41 @@ func TestGetUpdatesDoesNotAddMentionExtension(t *testing.T) {
 	_, secondMentioned := second["mentioned_me"]
 	if response.Code != http.StatusOK || firstMentioned || secondMentioned {
 		t.Fatalf("status=%d messages=%#v", response.Code, views)
+	}
+}
+
+func TestGetUpdatesLogsMessagesSkippedForUnresolvedSenders(t *testing.T) {
+	server, messages, _, _ := testServer(t)
+	messages.initialized = true
+	messages.pollResult = wechat.PollResult{
+		AccountID: "wxid-self",
+		Cursor:    "next-cursor",
+		Messages: []wecom.Message{
+			inboundMessage("message-1", "wxid-alice", "wxid-alice", 1781703356000, textItem("hello")),
+		},
+		Skipped: []wechatdb.SkippedMessage{{
+			MessageID: "message-skipped", Shard: "message/message_0.db", RealSenderID: 42,
+		}},
+	}
+	var logs bytes.Buffer
+	server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
+		"get_updates_buf": "cursor",
+	}, true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	output := logs.String()
+	for _, fragment := range []string{
+		"skipping WeChat message with unresolved sender",
+		"msgid=message-skipped",
+		"message_shard=message/message_0.db",
+		"real_sender_id=42",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("log %q does not contain %q", output, fragment)
+		}
 	}
 }
 
@@ -572,13 +604,19 @@ func TestSendMessageRejectsMissingTargetLegacyEnvelopeAndUnsupportedMedia(t *tes
 	if missing.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", missing.Code)
 	}
+	nonEmptyToList := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msgs": []any{map[string]any{
+		"roomid": "wxid-a", "tolist": []string{"wxid-b"}, "msgtype": "text", "text": map[string]any{"content": "hello"},
+	}}}, true)
+	if nonEmptyToList.Code != http.StatusBadRequest {
+		t.Fatalf("non-empty tolist status=%d", nonEmptyToList.Code)
+	}
 	legacy := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msg": map[string]any{"msgtype": "text"}}, true)
 	if legacy.Code != http.StatusBadRequest {
 		t.Fatalf("legacy status=%d", legacy.Code)
 	}
 
 	media := perform(server, http.MethodPost, "/ilink/bot/sendmessage", map[string]any{"msgs": []any{map[string]any{
-		"tolist": []string{"wxid-a"}, "msgtype": "voice", "voice": map[string]any{},
+		"roomid": "wxid-a", "tolist": []string{}, "msgtype": "voice", "voice": map[string]any{},
 	}}}, true)
 	if media.Code != http.StatusNotImplemented || outbound.calls != 0 {
 		t.Fatalf("status=%d calls=%d", media.Code, outbound.calls)

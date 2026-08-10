@@ -319,6 +319,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		}
 		if len(result.Messages) == 0 {
 			cursor = result.Cursor
+			server.logSkippedMessages(result.Skipped)
 		} else {
 			messages := make([]wecom.Message, 0, len(result.Messages))
 			blocked := false
@@ -346,6 +347,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 			}
 			if !blocked {
 				cursor = result.Cursor
+				server.logSkippedMessages(result.Skipped)
 				writeJSON(response, http.StatusOK, map[string]any{
 					"ret": 0, "msgs": messages, "get_updates_buf": cursor,
 					"longpolling_timeout_ms": server.pollTimeout.Milliseconds(),
@@ -370,6 +372,16 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
+func (server *Server) logSkippedMessages(messages []wechatdb.SkippedMessage) {
+	for _, message := range messages {
+		server.logger.Warn("skipping WeChat message with unresolved sender",
+			"msgid", message.MessageID,
+			"message_shard", message.Shard,
+			"real_sender_id", message.RealSenderID,
+		)
+	}
+}
+
 func inboundMediaWaitExpired(message wecom.Message, now time.Time) bool {
 	createdAt := message.MsgTime
 	return createdAt <= 0 || !now.Before(time.UnixMilli(createdAt).Add(inboundMediaWait))
@@ -379,15 +391,9 @@ func (server *Server) prepareInboundMessage(message wecom.Message, accountID str
 	view := cloneMessage(message)
 	if view.Outgoing {
 		view.From = accountID
-		if view.RoomID == "" {
-			view.ToList = []string{view.ConversationID}
-		} else {
-			view.ToList = []string{}
-		}
-	} else {
-		view.ToList = []string{accountID}
 	}
-	if err := server.materializeInboundMessage(view.ConversationID, &view, allowMissingMedia); err != nil {
+	view.ToList = []string{}
+	if err := server.materializeInboundMessage(view.RoomID, &view, allowMissingMedia); err != nil {
 		return wecom.Message{}, err
 	}
 	return view, nil
@@ -682,7 +688,7 @@ func outboundMessages(messages []wecom.Message) (string, []sender.Item, error) {
 		if target == "" {
 			target = messageTarget
 		} else if target != messageTarget {
-			return "", nil, errors.New("all msgs must have the same roomid or tolist target")
+			return "", nil, errors.New("all msgs must have the same roomid")
 		}
 		switch message.MsgType {
 		case wecom.MessageTypeText:
@@ -708,13 +714,14 @@ func outboundMessages(messages []wecom.Message) (string, []sender.Item, error) {
 }
 
 func outboundMessageTarget(message wecom.Message) (string, error) {
-	if target := strings.TrimSpace(message.RoomID); target != "" {
-		return target, nil
+	if len(message.ToList) != 0 {
+		return "", errors.New("tolist must be empty")
 	}
-	if len(message.ToList) != 1 || strings.TrimSpace(message.ToList[0]) == "" {
-		return "", errors.New("each private msg must have exactly one tolist target")
+	target := strings.TrimSpace(message.RoomID)
+	if target == "" {
+		return "", errors.New("roomid is required")
 	}
-	return strings.TrimSpace(message.ToList[0]), nil
+	return target, nil
 }
 
 func stringValue(value any) string {

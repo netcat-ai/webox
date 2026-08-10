@@ -95,6 +95,13 @@ func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 type PollData struct {
 	Messages []wecom.Message
 	NewState MessagePositions
+	Skipped  []SkippedMessage
+}
+
+type SkippedMessage struct {
+	MessageID    string
+	Shard        string
+	RealSenderID int64
 }
 
 type Recipient struct {
@@ -125,14 +132,16 @@ type messageShard struct {
 	relativePath string
 	db           *sql.DB
 	table        string
-	maxTimestamp int64
 }
 
 type messageEvent struct {
-	room     string
-	shard    string
-	position MessagePosition
-	message  *wecom.Message
+	room         string
+	shard        string
+	db           *sql.DB
+	position     MessagePosition
+	realSenderID int64
+	message      *wecom.Message
+	skipped      *SkippedMessage
 }
 
 func DetectStorage() string {
@@ -731,16 +740,9 @@ func findMessageShards(store *Store, username string) ([]messageShard, error) {
 		if err != nil {
 			return nil, err
 		}
-		var maxTimestamp sql.NullInt64
-		err = db.QueryRow(fmt.Sprintf("SELECT MAX(create_time) FROM [%s]", table)).Scan(&maxTimestamp)
-		if err != nil {
-			continue
-		}
-		if maxTimestamp.Valid {
-			shards = append(shards, messageShard{relativePath: relative, db: db, table: table, maxTimestamp: maxTimestamp.Int64})
-		}
+		shards = append(shards, messageShard{relativePath: relative, db: db, table: table})
 	}
-	sort.Slice(shards, func(i, j int) bool { return shards[i].maxTimestamp > shards[j].maxTimestamp })
+	sort.Slice(shards, func(i, j int) bool { return shards[i].relativePath < shards[j].relativePath })
 	return shards, nil
 }
 
@@ -786,25 +788,114 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].position != events[j].position {
-			if events[i].position.CreateTime != events[j].position.CreateTime {
-				return events[i].position.CreateTime < events[j].position.CreateTime
+			if events[i].position.LocalID != events[j].position.LocalID {
+				return events[i].position.LocalID < events[j].position.LocalID
 			}
-			return events[i].position.LocalID < events[j].position.LocalID
+			return events[i].position.CreateTime < events[j].position.CreateTime
 		}
 		if events[i].room != events[j].room {
 			return events[i].room < events[j].room
 		}
 		return events[i].shard < events[j].shard
 	})
+	events = events[:min(len(events), clamp(limit*10, 200, 5000))]
+	if err := resolveEventSenders(events); err != nil {
+		return PollData{}, err
+	}
+	return pollDataFromEvents(events, state, limit), nil
+}
+
+func resolveEventSenders(events []messageEvent) error {
+	type shardLookup struct {
+		db      *sql.DB
+		ids     map[int64]struct{}
+		indexes []int
+	}
+	byShard := make(map[string]*shardLookup)
+	for index := range events {
+		event := &events[index]
+		lookup := byShard[event.shard]
+		if lookup == nil {
+			lookup = &shardLookup{db: event.db, ids: make(map[int64]struct{})}
+			byShard[event.shard] = lookup
+		}
+		lookup.ids[event.realSenderID] = struct{}{}
+		lookup.indexes = append(lookup.indexes, index)
+	}
+	for shard, lookup := range byShard {
+		usernames, err := loadUsernamesByID(lookup.db, lookup.ids)
+		if err != nil {
+			return fmt.Errorf("resolve message senders from %s: %w", shard, err)
+		}
+		for _, index := range lookup.indexes {
+			event := &events[index]
+			if username := strings.TrimSpace(usernames[event.realSenderID]); username != "" {
+				event.message.From = username
+				continue
+			}
+			event.skipped = &SkippedMessage{
+				MessageID:    event.message.MsgID,
+				Shard:        event.shard,
+				RealSenderID: event.realSenderID,
+			}
+			event.message = nil
+		}
+	}
+	return nil
+}
+
+func loadUsernamesByID(db *sql.DB, ids map[int64]struct{}) (map[int64]string, error) {
+	result := make(map[int64]string, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	ordered := make([]int64, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	arguments := make([]any, len(ordered))
+	placeholders := make([]string, len(ordered))
+	for index, id := range ordered {
+		arguments[index] = id
+		placeholders[index] = "?"
+	}
+	rows, err := db.Query(
+		"SELECT rowid, user_name FROM Name2Id WHERE rowid IN ("+strings.Join(placeholders, ",")+")",
+		arguments...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id int64
+		var username sql.NullString
+		if err := rows.Scan(&id, &username); err != nil {
+			return nil, err
+		}
+		if username.Valid {
+			result[id] = username.String
+		}
+	}
+	return result, rows.Err()
+}
+
+func pollDataFromEvents(events []messageEvent, state MessagePositions, limit int) PollData {
 	if state == nil {
 		state = make(MessagePositions)
 	}
 	messages := make([]wecom.Message, 0, limit)
-	for _, event := range events[:min(len(events), clamp(limit*10, 200, 5000))] {
+	var skipped []SkippedMessage
+	for _, event := range events {
 		if state[event.room] == nil {
 			state[event.room] = make(RoomMessagePositions)
 		}
 		state[event.room][event.shard] = event.position
+		if event.skipped != nil {
+			skipped = append(skipped, *event.skipped)
+			continue
+		}
 		if event.message != nil {
 			messages = append(messages, *event.message)
 			if len(messages) >= limit {
@@ -812,19 +903,25 @@ func queryNewMessages(store *Store, state MessagePositions, startedAt int64, lim
 			}
 		}
 	}
-	return PollData{Messages: messages, NewState: state}, nil
+	return PollData{Messages: messages, NewState: state, Skipped: skipped}
 }
 
 func queryNewTable(shard messageShard, username string, group bool, position MessagePosition, limit int) ([]messageEvent, error) {
 	db := shard.db
-	idToUsername := loadIDToUsername(db)
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
 			message_content, WCDB_CT_message_content, status, origin_source
-		 FROM [%s]
-		 WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
+		 FROM [%s]`, shard.table)
+	var arguments []any
+	if position.LocalID > 0 {
+		query += ` WHERE local_id > ? AND server_id > 0 ORDER BY local_id ASC LIMIT ?`
+		arguments = []any{position.LocalID, limit}
+	} else {
+		query += ` WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
 		   AND server_id > 0
-		 ORDER BY create_time ASC, local_id ASC LIMIT ?`, shard.table)
-	rows, err := db.Query(query, position.CreateTime, position.CreateTime, position.LocalID, limit)
+		 ORDER BY create_time ASC, local_id ASC LIMIT ?`
+		arguments = []any{position.CreateTime, position.CreateTime, position.LocalID, limit}
+	}
+	rows, err := db.Query(query, arguments...)
 	if err != nil {
 		return nil, err
 	}
@@ -843,12 +940,8 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 		createdAt := saturatingMilliseconds(timestamp)
 		message := wecom.Message{
 			MsgID: messageID, Action: wecom.ActionSend,
-			From:   senderUsername(realSenderID, decoded, group, username, idToUsername),
-			ToList: []string{}, MsgTime: createdAt,
-			Sequence: localID, ConversationID: username, Outgoing: originSource == 1,
-		}
-		if group {
-			message.RoomID = username
+			ToList: []string{}, RoomID: username, MsgTime: createdAt,
+			Sequence: localID, Outgoing: originSource == 1,
 		}
 		switch normalized.kind {
 		case "text":
@@ -884,36 +977,20 @@ func queryNewTable(shard messageShard, username string, group bool, position Mes
 			message.MsgType = normalized.kind
 		}
 		event := messageEvent{
-			room: username, shard: shard.relativePath,
-			position: MessagePosition{CreateTime: timestamp, LocalID: localID},
-			message:  &message,
+			room: username, shard: shard.relativePath, db: shard.db,
+			position:     MessagePosition{CreateTime: timestamp, LocalID: localID},
+			realSenderID: realSenderID,
+			message:      &message,
 		}
 		events = append(events, event)
 	}
 	return events, rows.Err()
 }
 
-func loadIDToUsername(db *sql.DB) map[int64]string {
-	result := make(map[int64]string)
-	rows, err := db.Query("SELECT rowid, user_name FROM Name2Id")
-	if err != nil {
-		return result
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id int64
-		var username string
-		if rows.Scan(&id, &username) == nil {
-			result[id] = username
-		}
-	}
-	return result
-}
-
 func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error) {
 	var position MessagePosition
 	err := db.QueryRow(fmt.Sprintf(
-		"SELECT create_time, local_id FROM [%s] ORDER BY create_time DESC, local_id DESC LIMIT 1", table,
+		"SELECT create_time, local_id FROM [%s] ORDER BY local_id DESC LIMIT 1", table,
 	)).Scan(&position.CreateTime, &position.LocalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MessagePosition{}, false, nil
@@ -1170,23 +1247,6 @@ func quotedLinkText(content string) string {
 		result += "\n" + metadata.URL
 	}
 	return result
-}
-
-func senderUsername(realSenderID int64, content string, group bool, chatUsername string, idToUsername map[int64]string) string {
-	sender := idToUsername[realSenderID]
-	if group {
-		if sender != "" && sender != chatUsername {
-			return sender
-		}
-		if before, _, found := strings.Cut(content, ":\n"); found {
-			return before
-		}
-		return ""
-	}
-	if sender != "" && sender != chatUsername {
-		return sender
-	}
-	return chatUsername
 }
 
 var (

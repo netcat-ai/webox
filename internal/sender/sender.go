@@ -184,10 +184,12 @@ func sendItemsScript(searchBase64 string, items []preparedItem) string {
 				"sleep 1",
 			)
 		}
+		script = append(script,
+			"xdotool key --clearmodifiers Return",
+			"sleep 0.7",
+		)
 	}
 	script = append(script,
-		"xdotool key --clearmodifiers Return",
-		"sleep 0.7",
 		"xdotool key --clearmodifiers ctrl+2",
 		"sleep 0.2",
 	)

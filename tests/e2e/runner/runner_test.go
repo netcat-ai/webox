@@ -102,7 +102,7 @@ func TestDirectRoundTripCrossesBothILinkEndpoints(t *testing.T) {
 	if driver.target != "Webox私聊测试" || driver.text != result.RequestText {
 		t.Fatalf("peer send target=%q text=%q", driver.target, driver.text)
 	}
-	if state.replyText != result.ReplyText || state.replyContext != "" {
+	if state.replyText != result.ReplyText || state.replyContext != "wxid-peer" {
 		t.Fatalf("sut reply text=%q roomid=%q", state.replyText, state.replyContext)
 	}
 }
@@ -283,8 +283,8 @@ func (state *roundTripState) handleSUT(response http.ResponseWriter, request *ht
 		writeJSON(response, map[string]any{
 			"ret": 0, "get_updates_buf": "sut-next",
 			"msgs": []any{map[string]any{
-				"msgid": "incoming-1", "action": "send", "from": "wxid-peer", "tolist": []string{"wxid-self"},
-				"roomid": "", "msgtime": 1781703356000, "msgtype": "text",
+				"msgid": "incoming-1", "action": "send", "from": "wxid-peer", "tolist": []string{},
+				"roomid": "wxid-peer", "msgtime": 1781703356000, "msgtype": "text",
 				"text": map[string]any{"content": requestText},
 			}},
 		})
@@ -331,8 +331,8 @@ func (state *roundTripState) handlePeer(response http.ResponseWriter, request *h
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
 		"msgs": []any{map[string]any{
-			"msgid": "reply-1", "action": "send", "from": "wxid-self", "tolist": []string{"wxid-peer"},
-			"roomid": "", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": state.replyText},
+			"msgid": "reply-1", "action": "send", "from": "wxid-self", "tolist": []string{},
+			"roomid": "wxid-self", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": state.replyText},
 		}},
 	})
 }
@@ -363,8 +363,8 @@ func (state *roundTripState) handleOpenClawPeer(response http.ResponseWriter, re
 	writeJSON(response, map[string]any{
 		"ret": 0, "get_updates_buf": "peer-next",
 		"msgs": []any{map[string]any{
-			"msgid": "agent-reply-1", "action": "send", "from": "wxid-self", "tolist": []string{"wxid-peer"},
-			"roomid": "", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": replyText},
+			"msgid": "agent-reply-1", "action": "send", "from": "wxid-self", "tolist": []string{},
+			"roomid": "wxid-self", "msgtime": 1781703356000, "msgtype": "text", "text": map[string]any{"content": replyText},
 		}},
 	})
 }

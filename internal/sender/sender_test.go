@@ -33,7 +33,7 @@ func TestSendReturnsToContacts(t *testing.T) {
 	}
 }
 
-func TestSendItemsStagesEverythingAndSendsOnce(t *testing.T) {
+func TestSendItemsSendsEveryItemSeparately(t *testing.T) {
 	script := sendItemsScript("target", []preparedItem{
 		{Kind: "text", Text: "message"},
 		{Kind: "image", Path: "/tmp/image.png", ContentType: "image/png"},
@@ -49,8 +49,11 @@ func TestSendItemsStagesEverythingAndSendsOnce(t *testing.T) {
 			t.Fatalf("script does not contain %q: %s", required, script)
 		}
 	}
-	if strings.Count(script, "xdotool key --clearmodifiers Return") != 2 {
-		t.Fatalf("expected one search selection and one final send: %s", script)
+	if strings.Count(script, "xdotool key --clearmodifiers Return") != 4 {
+		t.Fatalf("expected one search selection and one send per item: %s", script)
+	}
+	if strings.Count(script, "xdotool key --clearmodifiers Return; sleep 0.7") != 3 {
+		t.Fatalf("each item was not submitted separately: %s", script)
 	}
 	if strings.Count(script, "xdotool key --clearmodifiers ctrl+2") != 1 {
 		t.Fatalf("expected one return to contacts: %s", script)
