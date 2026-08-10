@@ -43,8 +43,6 @@ type State struct {
 	dbMu             sync.Mutex
 	database         *wechatdb.Store
 	wxid             string
-	errorMu          sync.Mutex
-	lastError        string
 }
 
 type keyFile struct {
@@ -238,13 +236,11 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 	state.wxid = material.WXID
 	state.initialized.Store(true)
 	state.lastValidationAt.Store(time.Now().Unix())
-	state.setError("")
 	return Ready, nil
 }
 
-func (state *State) RecordInitError(err error) {
+func (state *State) MarkUninitialized() {
 	state.initialized.Store(false)
-	state.setError(err.Error())
 }
 
 func (state *State) ClickSavedAccountLogin() (bool, error) {
@@ -412,7 +408,7 @@ func (state *State) readyDatabase() (*wechatdb.Store, string, error) {
 		return nil, "", errors.New("wechat automatic initialization is not complete")
 	}
 	if state.database == nil {
-		state.RecordInitError(errors.New("WeChat database is not open"))
+		state.MarkUninitialized()
 		return nil, "", errors.New("WeChat database is not open")
 	}
 	return state.database, state.wxid, nil
@@ -471,14 +467,8 @@ func (state *State) encodeCursor(cursor dbCursor) (string, error) {
 
 func (state *State) dbError(operation string, err error) error {
 	wrapped := fmt.Errorf("%s: %w", operation, err)
-	state.RecordInitError(wrapped)
+	state.MarkUninitialized()
 	return wrapped
-}
-
-func (state *State) setError(message string) {
-	state.errorMu.Lock()
-	state.lastError = message
-	state.errorMu.Unlock()
 }
 
 type orderKey struct {

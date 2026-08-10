@@ -67,12 +67,12 @@ func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			kind, got := normalizedMessage(49, test.content, false)
-			if kind != "text" {
-				t.Fatalf("kind=%q want text", kind)
+			message := normalizeMessage(49, test.content, false)
+			if message.kind != "text" {
+				t.Fatalf("kind=%q want text", message.kind)
 			}
-			if got != test.want {
-				t.Fatalf("content=%q want %q", got, test.want)
+			if message.text != test.want {
+				t.Fatalf("content=%q want %q", message.text, test.want)
 			}
 		})
 	}
@@ -83,9 +83,9 @@ func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing
 		`<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
 		`<type>1</type><content><![CDATA[群里的问题]]></content></refermsg></appmsg></msg>`
 
-	kind, got := normalizedMessage(49, content, true)
-	if kind != "text" || got != "虾虾 回答一下\n[引用消息] 群里的问题" {
-		t.Fatalf("normalizedMessage()=(%q, %q)", kind, got)
+	message := normalizeMessage(49, content, true)
+	if message.kind != "text" || message.text != "虾虾 回答一下\n[引用消息] 群里的问题" {
+		t.Fatalf("normalizeMessage()=%#v", message)
 	}
 }
 
@@ -104,9 +104,9 @@ func TestNormalizedMessageUsesWeComMixedReferenceForQuotedImage(t *testing.T) {
 func TestNormalizedMessageRecognizesFileAppMessage(t *testing.T) {
 	content := "wxid_sender:\n" + `<msg><appmsg><title>report.pdf</title><type>6</type>` +
 		`<appattach><totallen>42</totallen></appattach></appmsg></msg>`
-	kind, got := normalizedMessage(int64(6)*4294967296+49, content, true)
-	if kind != "file" || got != "[文件] report.pdf" {
-		t.Fatalf("normalizedMessage()=(%q, %q)", kind, got)
+	message := normalizeMessage(int64(6)*4294967296+49, content, true)
+	if message.kind != "file" || message.text != "[文件] report.pdf" {
+		t.Fatalf("normalizeMessage()=%#v", message)
 	}
 }
 

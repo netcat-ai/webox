@@ -1,6 +1,7 @@
 .git
 data
 bin
+output
 target
 coverage.out
 *.log

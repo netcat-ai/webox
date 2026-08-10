@@ -328,7 +328,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 				view, materializeErr := server.prepareInboundMessage(message, accountID, mediaWaitExpired)
 				if errors.Is(materializeErr, errInboundMediaNotReady) {
 					server.logger.Debug("waiting for WeChat media",
-						"msgid", messageExternalID(message), "type", messageItemKind(message), "error", materializeErr,
+						"msgid", message.MsgID, "type", message.MsgType, "error", materializeErr,
 					)
 					blocked = true
 					break
@@ -340,7 +340,7 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 				}
 				if mediaWaitExpired && hasMissingSharedMedia(view) {
 					server.logger.Warn("delivering WeChat media without sdkfileid after waiting one minute",
-						"msgid", messageExternalID(message), "type", messageItemKind(message),
+						"msgid", message.MsgID, "type", message.MsgType,
 					)
 				}
 				messages = append(messages, view)
@@ -493,14 +493,6 @@ func hasMissingSharedMedia(message wecom.Message) bool {
 	return false
 }
 
-func messageExternalID(message wecom.Message) string {
-	return message.MsgID
-}
-
-func messageItemKind(message wecom.Message) string {
-	return message.MsgType
-}
-
 func (server *Server) sendMessage(response http.ResponseWriter, request *http.Request) {
 	if !server.authenticate(response, request) {
 		return
@@ -620,11 +612,6 @@ func (server *Server) authenticate(response http.ResponseWriter, request *http.R
 	return true
 }
 
-func (server *Server) contextToken(target string) string {
-	token, _ := signedpayload.Encode(server.apiToken, contextToken{Target: target})
-	return token
-}
-
 func (server *Server) baseURL(request *http.Request) string {
 	if server.publicBaseURL != "" {
 		return server.publicBaseURL
@@ -722,27 +709,6 @@ func outboundMessageTarget(message wecom.Message) (string, error) {
 		return "", errors.New("roomid is required")
 	}
 	return target, nil
-}
-
-func stringValue(value any) string {
-	result, _ := value.(string)
-	return result
-}
-
-func integerValue(value any) int64 {
-	switch value := value.(type) {
-	case int:
-		return int64(value)
-	case int64:
-		return value
-	case float64:
-		return int64(value)
-	case json.Number:
-		result, _ := value.Int64()
-		return result
-	default:
-		return 0
-	}
 }
 
 func randomID() string {

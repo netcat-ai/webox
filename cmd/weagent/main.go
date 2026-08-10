@@ -115,7 +115,7 @@ func runInitializer(ctx context.Context, state *wechat.State, source qrsource.So
 		initialization, err := state.InitializeIfReady()
 		if err != nil {
 			readyLogged = false
-			state.RecordInitError(err)
+			state.MarkUninitialized()
 			logger.Warn("wechat automatic initialization is not ready", "error", err)
 			if !wait(ctx, 2*time.Second) {
 				return

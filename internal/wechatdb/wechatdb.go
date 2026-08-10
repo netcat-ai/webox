@@ -1007,11 +1007,6 @@ type normalizedContent struct {
 	sphFeed          *wecom.SphFeed
 }
 
-func normalizedMessage(localType int64, content string, group bool) (string, string) {
-	message := normalizeMessage(localType, content, group)
-	return message.kind, message.text
-}
-
 func normalizeMessage(localType int64, content string, group bool) normalizedContent {
 	base := baseType(localType)
 	if base == 1 {

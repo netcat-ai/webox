@@ -1,9 +1,0 @@
-{
-  "visual_qa": "pass",
-  "qa_note": "Standard motions preserve one identity, outfit, proportion, and style; the 16-direction gaze forms a clear clockwise loop; blind and v2 validation pass.",
-  "review_warnings": [
-    "Continuity metrics flag the 337.5-to-000 pixel difference and area ratio, but normal-size ordered review shows no visible scale snap, identity change, or direction reversal."
-  ],
-  "repair_rows": [],
-  "repair_notes": []
-}

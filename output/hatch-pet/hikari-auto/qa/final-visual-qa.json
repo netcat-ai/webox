@@ -1,9 +1,0 @@
-{
-  "visual_qa": "pass",
-  "qa_note": "The merged pet preserves one character identity and coherent animation while applying the intended state-driven coat, stage, and sport outfit changes.",
-  "review_warnings": [
-    "337.5->000 has an 18% area-ratio outlier, but the visible change is consistent with oblique-to-frontal perspective and shows no unacceptable scale snap."
-  ],
-  "repair_rows": [],
-  "repair_notes": []
-}
