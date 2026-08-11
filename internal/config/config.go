@@ -6,53 +6,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
 type Config struct {
-	ListenAddr          string
-	APIToken            string
-	CursorKey           string
-	StateDir            string
-	MediaDir            string
-	RemarkFilterEnabled bool
+	ListenAddr string
+	APIToken   string
+	StateDir   string
+	SharedDir  string
 }
 
 func Load() (Config, error) {
 	stateDir := envOr("WEBOX_WEAGENT_STATE_DIR", "/webox/state/weagent")
-	remarkFilterEnabled, err := envBool("WEBOX_REMARK_FILTER_ENABLED", true)
-	if err != nil {
-		return Config{}, err
-	}
-	cursorKey, err := loadOrCreateID(stateDir, "cursor-key", "")
-	if err != nil {
-		return Config{}, err
-	}
 	apiToken, err := loadOrCreateID(stateDir, "api-token", "")
 	if err != nil {
 		return Config{}, err
 	}
 	return Config{
-		ListenAddr:          normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
-		APIToken:            apiToken,
-		CursorKey:           cursorKey,
-		StateDir:            stateDir,
-		MediaDir:            envOr("WEBOX_MEDIA_DIR", filepath.Join(filepath.Dir(stateDir), "media")),
-		RemarkFilterEnabled: remarkFilterEnabled,
+		ListenAddr: normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
+		APIToken:   apiToken,
+		StateDir:   stateDir,
+		SharedDir:  envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
 	}, nil
-}
-
-func envBool(key string, fallback bool) (bool, error) {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback, nil
-	}
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean: %w", key, err)
-	}
-	return value, nil
 }
 
 func loadOrCreateID(stateDir, filename, prefix string) (string, error) {
@@ -81,14 +56,13 @@ func loadOrCreateID(stateDir, filename, prefix string) (string, error) {
 }
 
 func envOr(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return fallback
 }
 
 func normalizeListenAddr(value string) string {
-	value = strings.TrimSpace(value)
 	if strings.HasPrefix(value, ":") {
 		return "0.0.0.0" + value
 	}

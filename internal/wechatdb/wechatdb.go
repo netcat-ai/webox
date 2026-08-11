@@ -28,10 +28,11 @@ import (
 )
 
 const (
-	hexPatternLength = 96
-	chunkSize        = 2 * 1024 * 1024
-	pageSize         = 4096
-	saltSize         = 16
+	hexPatternLength   = 96
+	chunkSize          = 2 * 1024 * 1024
+	pageSize           = 4096
+	saltSize           = 16
+	fileAppMessageType = 6
 )
 
 type InitData struct {
@@ -45,7 +46,6 @@ type MessagePosition struct {
 	LocalID    int64 `json:"local_id"`
 }
 
-type MessagePositions map[string]map[string]MessagePosition
 type RoomMessagePositions map[string]MessagePosition
 
 type OutgoingItem struct {
@@ -53,34 +53,13 @@ type OutgoingItem struct {
 	Value string
 }
 
-type storedMessage struct {
-	localID   int64
-	localType int64
-	createdAt int64
-	content   string
-}
-
-func messageByServerID(db *sql.DB, table string, serverID int64) (storedMessage, bool, error) {
-	query := fmt.Sprintf(`SELECT local_id, local_type, create_time, message_content, WCDB_CT_message_content
-        FROM [%s] WHERE server_id=? LIMIT 1`, table)
-	var message storedMessage
-	var content []byte
-	var contentType sql.NullInt64
-	err := db.QueryRow(query, serverID).Scan(&message.localID, &message.localType, &message.createdAt, &content, &contentType)
-	if errors.Is(err, sql.ErrNoRows) {
-		return storedMessage{}, false, nil
-	}
-	if err != nil {
-		return storedMessage{}, false, err
-	}
-	message.content = decompressMessage(content, contentType.Int64)
-	return message, true, nil
-}
-
 func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 	db, found, err := store.database("message/message_resource.db")
-	if err != nil || !found {
+	if err != nil {
 		return nil, 0, err
+	}
+	if !found {
+		return nil, 0, errors.New("message resource database not found")
 	}
 	var chatID int64
 	if err := db.QueryRow("SELECT rowid FROM ChatName2Id WHERE user_name=?", roomID).Scan(&chatID); err != nil {
@@ -90,18 +69,6 @@ func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 		return nil, 0, err
 	}
 	return db, chatID, nil
-}
-
-type PollData struct {
-	Messages []wecom.Message
-	NewState MessagePositions
-	Skipped  []SkippedMessage
-}
-
-type SkippedMessage struct {
-	MessageID    string
-	Shard        string
-	RealSenderID int64
 }
 
 type Recipient struct {
@@ -128,10 +95,11 @@ type keyEntry struct {
 }
 
 type Store struct {
-	dbDir string
-	keys  map[string]string
-	mu    sync.Mutex
-	dbs   map[string]*sql.DB
+	dbDir   string
+	keys    map[string]string
+	mu      sync.Mutex
+	dbs     map[string]*sql.DB
+	sources map[string]messageShard
 }
 
 type messageShard struct {
@@ -140,14 +108,14 @@ type messageShard struct {
 	table        string
 }
 
-type messageEvent struct {
-	room         string
-	shard        string
-	db           *sql.DB
-	position     MessagePosition
+type messageRecord struct {
+	localID      int64
+	serverID     int64
+	localType    int64
+	createdAt    int64
 	realSenderID int64
-	message      *wecom.Message
-	skipped      *SkippedMessage
+	content      string
+	originSource int64
 }
 
 func DetectStorage() string {
@@ -188,7 +156,7 @@ func AccountIDFromDBDir(dbDir string) string {
 			return base
 		}
 	}
-	return strings.TrimSpace(raw)
+	return raw
 }
 
 func InitFromMemory() (InitData, error) {
@@ -216,7 +184,7 @@ func InitFromMemory() (InitData, error) {
 
 func Open(dbDir string, keys map[string]string) (*Store, error) {
 	if strings.TrimSpace(dbDir) == "" {
-		return nil, errors.New("WeChat database directory is empty")
+		return nil, errors.New("empty WeChat database directory")
 	}
 	if err := ValidateMessageDBKeys(dbDir, keys); err != nil {
 		return nil, err
@@ -225,7 +193,10 @@ func Open(dbDir string, keys map[string]string) (*Store, error) {
 	for relative, key := range keys {
 		keyCopy[relative] = key
 	}
-	return &Store{dbDir: dbDir, keys: keyCopy, dbs: make(map[string]*sql.DB)}, nil
+	return &Store{
+		dbDir: dbDir, keys: keyCopy, dbs: make(map[string]*sql.DB),
+		sources: make(map[string]messageShard),
+	}, nil
 }
 
 func (store *Store) Close() error {
@@ -238,46 +209,128 @@ func (store *Store) Close() error {
 		}
 	}
 	store.dbs = make(map[string]*sql.DB)
+	store.sources = make(map[string]messageShard)
 	return result
 }
 
-func (store *Store) CurrentSessionState() (map[string]int64, error) {
-	return loadSessionState(store)
+func (store *Store) ValidateSessionDB() error {
+	db, found, err := store.database("session/session.db")
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("session database not found")
+	}
+	var exists bool
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='SessionTable')").Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("session table not found")
+	}
+	return nil
 }
 
-func (store *Store) BaselinePositions(startedAt int64) (MessagePositions, error) {
-	sessions, err := loadSessionState(store)
+func (store *Store) EnabledRoomSessions() (map[string]int64, error) {
+	contactDB, found, err := store.database("contact/contact.db")
 	if err != nil {
 		return nil, err
 	}
-	positions := make(MessagePositions)
-	for username := range sessions {
-		room := make(RoomMessagePositions)
-		shards, err := findMessageShards(store, username)
-		if err != nil {
-			return nil, err
-		}
-		for _, shard := range shards {
-			position, found, err := maxMessagePosition(shard.db, shard.table)
-			if err != nil {
-				continue
-			}
-			if !found {
-				position = MessagePosition{CreateTime: startedAt}
-			}
-			room[shard.relativePath] = position
-		}
-		positions[username] = room
+	if !found {
+		return nil, errors.New("contact database not found")
 	}
-	return positions, nil
+	sessionDB, found, err := store.database("session/session.db")
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("session database not found")
+	}
+	return enabledRoomSessionsFromDB(contactDB, sessionDB)
 }
 
-func (store *Store) PollNewMessages(state MessagePositions, startedAt int64, limit int) (PollData, error) {
-	return queryNewMessages(store, state, startedAt, limit)
+func (store *Store) MessagesForRoom(roomID string, after int64, limit int) ([]wecom.Message, error) {
+	shard, found, err := store.messageSource(roomID)
+	if err != nil || !found {
+		return nil, err
+	}
+	records, err := queryMessageRecords(shard, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertMessages(shard, roomID, records)
+}
+
+func (store *Store) messageSource(roomID string) (messageShard, bool, error) {
+	if source, ok := store.sources[roomID]; ok {
+		return source, true, nil
+	}
+	shards, err := findMessageShards(store, roomID)
+	if err != nil {
+		return messageShard{}, false, err
+	}
+	if len(shards) == 0 {
+		return messageShard{}, false, nil
+	}
+	if len(shards) > 1 {
+		paths := make([]string, 0, len(shards))
+		for _, shard := range shards {
+			paths = append(paths, shard.relativePath)
+		}
+		return messageShard{}, false, fmt.Errorf("room %s message table exists in multiple databases: %s", roomID, strings.Join(paths, ", "))
+	}
+	store.sources[roomID] = shards[0]
+	return shards[0], true, nil
+}
+
+func enabledRoomSessionsFromDB(contactDB, sessionDB *sql.DB) (map[string]int64, error) {
+	contactRows, err := contactDB.Query(
+		"SELECT username FROM contact WHERE delete_flag=0 AND remark LIKE 'webox.%' ORDER BY username",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer contactRows.Close()
+	names := make([]any, 0)
+	var placeholders strings.Builder
+	for contactRows.Next() {
+		var username string
+		if err := contactRows.Scan(&username); err != nil {
+			return nil, err
+		}
+		names = append(names, username)
+		placeholders.WriteString("?,")
+	}
+	if err := contactRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return map[string]int64{}, nil
+	}
+
+	placeholderList := placeholders.String()[:placeholders.Len()-1]
+	sessionRows, err := sessionDB.Query(
+		"SELECT username, last_msg_locald_id FROM SessionTable WHERE last_msg_locald_id > 0 AND username IN ("+placeholderList+")",
+		names...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer sessionRows.Close()
+	sessions := make(map[string]int64, len(names))
+	for sessionRows.Next() {
+		var username string
+		var lastMessageLocalID int64
+		if err := sessionRows.Scan(&username, &lastMessageLocalID); err != nil {
+			return nil, err
+		}
+		sessions[username] = lastMessageLocalID
+	}
+	return sessions, sessionRows.Err()
 }
 
 func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, error) {
-	username := strings.TrimSpace(raw)
+	username := raw
 	if username == "" {
 		return nil, nil
 	}
@@ -300,8 +353,8 @@ func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, err
 	if storedUsername == currentUserID {
 		return &Recipient{Username: storedUsername, SearchTerm: recipientDisplayName(storedUsername, nickname.String, remark.String, alias.String)}, nil
 	}
-	searchTerm := strings.TrimSpace(remark.String)
-	if searchTerm == "" {
+	searchTerm := remark.String
+	if strings.TrimSpace(searchTerm) == "" {
 		return nil, errors.New("联系人或群聊必须设置唯一备注作为发送搜索词")
 	}
 	var duplicate string
@@ -321,34 +374,11 @@ func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, err
 	return &Recipient{Username: storedUsername, SearchTerm: searchTerm}, nil
 }
 
-func conversationRemarkFromDB(db *sql.DB, username string) (string, error) {
-	var remark sql.NullString
-	err := db.QueryRow(
-		"SELECT remark FROM contact WHERE delete_flag=0 AND username=? LIMIT 1",
-		strings.TrimSpace(username),
-	).Scan(&remark)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(remark.String), nil
-}
-
-func (store *Store) ConversationRemark(username string) (string, error) {
-	db, found, err := store.database("contact/contact.db")
-	if err != nil || !found {
-		return "", err
-	}
-	return conversationRemarkFromDB(db, username)
-}
-
 func contactsByRemarkFromDB(db *sql.DB, remark string) ([]Contact, error) {
 	rows, err := db.Query(
 		`SELECT username, remark, nick_name FROM contact
 		 WHERE delete_flag=0 AND remark=? ORDER BY username`,
-		strings.TrimSpace(remark),
+		remark,
 	)
 	if err != nil {
 		return nil, err
@@ -361,8 +391,7 @@ func contactsByRemarkFromDB(db *sql.DB, remark string) ([]Contact, error) {
 		if err := rows.Scan(&contact.RoomID, &storedRemark, &nickname); err != nil {
 			return nil, err
 		}
-		contact.RoomID = strings.TrimSpace(contact.RoomID)
-		contact.Remark = strings.TrimSpace(storedRemark.String)
+		contact.Remark = storedRemark.String
 		contact.Nickname = strings.TrimSpace(nickname.String)
 		contacts = append(contacts, contact)
 	}
@@ -392,7 +421,6 @@ func (store *Store) AccountInfoFor(username string) (AccountInfo, error) {
 }
 
 func accountInfoFromDB(db *sql.DB, username string) (AccountInfo, error) {
-	username = strings.TrimSpace(username)
 	var accountID string
 	var alias, nickname, bigHeadURL, smallHeadURL sql.NullString
 	err := db.QueryRow(
@@ -406,16 +434,16 @@ func accountInfoFromDB(db *sql.DB, username string) (AccountInfo, error) {
 	if err != nil {
 		return AccountInfo{}, err
 	}
-	wechatID := strings.TrimSpace(alias.String)
+	wechatID := alias.String
 	if wechatID == "" {
-		wechatID = strings.TrimSpace(accountID)
+		wechatID = accountID
 	}
 	avatarURL := strings.TrimSpace(bigHeadURL.String)
 	if avatarURL == "" {
 		avatarURL = strings.TrimSpace(smallHeadURL.String)
 	}
 	return AccountInfo{
-		AccountID: strings.TrimSpace(accountID),
+		AccountID: accountID,
 		WeChatID:  wechatID,
 		Nickname:  strings.TrimSpace(nickname.String),
 		AvatarURL: avatarURL,
@@ -471,8 +499,10 @@ func (store *Store) OutgoingItemsAfter(roomID string, positions RoomMessagePosit
 				items = append(items, OutgoingItem{Kind: "image"})
 			case 49:
 				content := decompressMessage(content, contentType.Int64)
-				if metadata, ok := parseFileMessage(content); ok {
-					items = append(items, OutgoingItem{Kind: "file", Value: metadata.Filename})
+				app, ok := parseAppMessage(content)
+				filename := safeLocalFilename(cleanXMLText(app.AppMessage.Title))
+				if ok && app.AppMessage.Type == fileAppMessageType && filename != "" {
+					items = append(items, OutgoingItem{Kind: "file", Value: filename})
 				}
 			}
 		}
@@ -695,30 +725,6 @@ func (store *Store) database(relative string) (*sql.DB, bool, error) {
 	return db, true, nil
 }
 
-func loadSessionState(store *Store) (map[string]int64, error) {
-	db, found, err := store.database("session/session.db")
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, errors.New("无法打开 session.db")
-	}
-	rows, err := db.Query("SELECT username, last_timestamp FROM SessionTable WHERE last_timestamp > 0")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	sessions := make(map[string]int64)
-	for rows.Next() {
-		var username string
-		var timestamp int64
-		if rows.Scan(&username, &timestamp) == nil {
-			sessions[username] = timestamp
-		}
-	}
-	return sessions, rows.Err()
-}
-
 func ValidateMessageDBKeys(dbDir string, keys map[string]string) error {
 	messageDir := filepath.Join(dbDir, "message")
 	entries, err := os.ReadDir(messageDir)
@@ -788,104 +794,6 @@ func findMessageShards(store *Store, username string) ([]messageShard, error) {
 	return shards, nil
 }
 
-func queryNewMessages(store *Store, state MessagePositions, startedAt int64, limit int) (PollData, error) {
-	sessions, err := loadSessionState(store)
-	if err != nil {
-		return PollData{}, err
-	}
-	var changed []string
-	for username, timestamp := range sessions {
-		lastKnown := startedAt
-		for _, position := range state[username] {
-			if position.CreateTime > lastKnown {
-				lastKnown = position.CreateTime
-			}
-		}
-		if timestamp >= lastKnown {
-			changed = append(changed, username)
-		}
-	}
-	sort.Strings(changed)
-	if len(changed) == 0 {
-		return PollData{Messages: []wecom.Message{}, NewState: state}, nil
-	}
-	perTableLimit := clamp(limit*4, 100, 2000)
-	var events []messageEvent
-	for _, username := range changed {
-		shards, err := findMessageShards(store, username)
-		if err != nil {
-			return PollData{}, err
-		}
-		for _, shard := range shards {
-			position, found := state[username][shard.relativePath]
-			if !found {
-				position = MessagePosition{CreateTime: startedAt}
-			}
-			rows, err := queryNewTable(shard, username, strings.HasSuffix(username, "@chatroom"), position, perTableLimit)
-			if err != nil {
-				continue
-			}
-			events = append(events, rows...)
-		}
-	}
-	sort.Slice(events, func(i, j int) bool {
-		if events[i].position != events[j].position {
-			if events[i].position.LocalID != events[j].position.LocalID {
-				return events[i].position.LocalID < events[j].position.LocalID
-			}
-			return events[i].position.CreateTime < events[j].position.CreateTime
-		}
-		if events[i].room != events[j].room {
-			return events[i].room < events[j].room
-		}
-		return events[i].shard < events[j].shard
-	})
-	events = events[:min(len(events), clamp(limit*10, 200, 5000))]
-	if err := resolveEventSenders(events); err != nil {
-		return PollData{}, err
-	}
-	return pollDataFromEvents(events, state, limit), nil
-}
-
-func resolveEventSenders(events []messageEvent) error {
-	type shardLookup struct {
-		db      *sql.DB
-		ids     map[int64]struct{}
-		indexes []int
-	}
-	byShard := make(map[string]*shardLookup)
-	for index := range events {
-		event := &events[index]
-		lookup := byShard[event.shard]
-		if lookup == nil {
-			lookup = &shardLookup{db: event.db, ids: make(map[int64]struct{})}
-			byShard[event.shard] = lookup
-		}
-		lookup.ids[event.realSenderID] = struct{}{}
-		lookup.indexes = append(lookup.indexes, index)
-	}
-	for shard, lookup := range byShard {
-		usernames, err := loadUsernamesByID(lookup.db, lookup.ids)
-		if err != nil {
-			return fmt.Errorf("resolve message senders from %s: %w", shard, err)
-		}
-		for _, index := range lookup.indexes {
-			event := &events[index]
-			if username := strings.TrimSpace(usernames[event.realSenderID]); username != "" {
-				event.message.From = username
-				continue
-			}
-			event.skipped = &SkippedMessage{
-				MessageID:    event.message.MsgID,
-				Shard:        event.shard,
-				RealSenderID: event.realSenderID,
-			}
-			event.message = nil
-		}
-	}
-	return nil
-}
-
 func loadUsernamesByID(db *sql.DB, ids map[int64]struct{}) (map[int64]string, error) {
 	result := make(map[int64]string, len(ids))
 	if len(ids) == 0 {
@@ -923,110 +831,63 @@ func loadUsernamesByID(db *sql.DB, ids map[int64]struct{}) (map[int64]string, er
 	return result, rows.Err()
 }
 
-func pollDataFromEvents(events []messageEvent, state MessagePositions, limit int) PollData {
-	if state == nil {
-		state = make(MessagePositions)
-	}
-	messages := make([]wecom.Message, 0, limit)
-	var skipped []SkippedMessage
-	for _, event := range events {
-		if state[event.room] == nil {
-			state[event.room] = make(RoomMessagePositions)
-		}
-		state[event.room][event.shard] = event.position
-		if event.skipped != nil {
-			skipped = append(skipped, *event.skipped)
-			continue
-		}
-		if event.message != nil {
-			messages = append(messages, *event.message)
-			if len(messages) >= limit {
-				break
-			}
-		}
-	}
-	return PollData{Messages: messages, NewState: state, Skipped: skipped}
-}
-
-func queryNewTable(shard messageShard, username string, group bool, position MessagePosition, limit int) ([]messageEvent, error) {
-	db := shard.db
+func queryMessageRecords(shard messageShard, after int64, limit int) ([]messageRecord, error) {
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
-			message_content, WCDB_CT_message_content, status, origin_source
-		 FROM [%s]`, shard.table)
-	var arguments []any
-	if position.LocalID > 0 {
-		query += ` WHERE local_id > ? AND server_id > 0 ORDER BY local_id ASC LIMIT ?`
-		arguments = []any{position.LocalID, limit}
-	} else {
-		query += ` WHERE (create_time > ? OR (create_time = ? AND local_id > ?))
-		   AND server_id > 0
-		 ORDER BY create_time ASC, local_id ASC LIMIT ?`
-		arguments = []any{position.CreateTime, position.CreateTime, position.LocalID, limit}
-	}
-	rows, err := db.Query(query, arguments...)
+			message_content, WCDB_CT_message_content, origin_source
+		 FROM [%s] WHERE local_id > ? AND server_id > 0
+		 ORDER BY local_id ASC LIMIT ?`, shard.table)
+	rows, err := shard.db.Query(query, after, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var events []messageEvent
+	var records []messageRecord
 	for rows.Next() {
-		var localID, serverID, localType, timestamp, realSenderID, status, originSource int64
+		var record messageRecord
 		var contentType sql.NullInt64
 		var content []byte
-		if err := rows.Scan(&localID, &serverID, &localType, &timestamp, &realSenderID, &content, &contentType, &status, &originSource); err != nil {
-			continue
+		if err := rows.Scan(
+			&record.localID, &record.serverID, &record.localType, &record.createdAt,
+			&record.realSenderID, &content, &contentType, &record.originSource,
+		); err != nil {
+			return nil, err
 		}
-		decoded := decompressMessage(content, contentType.Int64)
-		normalized := normalizeMessage(localType, decoded, group)
-		messageID := strconv.FormatInt(serverID, 10)
-		createdAt := saturatingMilliseconds(timestamp)
-		message := wecom.Message{
-			MsgID: messageID, Action: wecom.ActionSend,
-			ToList: []string{}, RoomID: username, MsgTime: createdAt,
-			Sequence: localID, Outgoing: originSource == 1,
-		}
-		switch normalized.kind {
-		case "text":
-			if normalized.referenceImageID != "" {
-				message.MsgType = wecom.MessageTypeMixed
-				message.Mixed = &wecom.Mixed{Items: []wecom.MixedItem{
-					{Type: wecom.MessageTypeText, Content: normalized.text},
-					{Type: wecom.MessageTypeImage, MessageID: normalized.referenceImageID},
-				}}
-			} else {
-				message.MsgType = wecom.MessageTypeText
-				message.Text = &wecom.Text{Content: normalized.text}
-			}
-		case "image":
-			message.MsgType = wecom.MessageTypeImage
-			message.Image = &wecom.Image{}
-		case "voice":
-			message.MsgType = wecom.MessageTypeVoice
-			message.Voice = &wecom.Voice{}
-		case "file":
-			message.MsgType = wecom.MessageTypeFile
-			message.File = &wecom.File{FileName: normalized.filename, FileExt: strings.TrimPrefix(filepath.Ext(normalized.filename), ".")}
-		case "video":
-			message.MsgType = wecom.MessageTypeVideo
-			message.Video = &wecom.Video{}
-		case "link":
-			message.MsgType = wecom.MessageTypeLink
-			message.Link = normalized.link
-		case "sphfeed":
-			message.MsgType = wecom.MessageTypeSphFeed
-			message.SphFeed = normalized.sphFeed
-		default:
-			message.MsgType = normalized.kind
-		}
-		event := messageEvent{
-			room: username, shard: shard.relativePath, db: shard.db,
-			position:     MessagePosition{CreateTime: timestamp, LocalID: localID},
-			realSenderID: realSenderID,
-			message:      &message,
-		}
-		events = append(events, event)
+		record.content = decompressMessage(content, contentType.Int64)
+		records = append(records, record)
 	}
-	return events, rows.Err()
+	return records, rows.Err()
+}
+
+func convertMessages(shard messageShard, roomID string, records []messageRecord) ([]wecom.Message, error) {
+	ids := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		ids[record.realSenderID] = struct{}{}
+	}
+	usernames, err := loadUsernamesByID(shard.db, ids)
+	if err != nil {
+		return nil, fmt.Errorf("resolve message senders from %s: %w", shard.relativePath, err)
+	}
+	group := strings.HasSuffix(roomID, "@chatroom")
+	messages := make([]wecom.Message, 0, len(records))
+	for _, record := range records {
+		from := usernames[record.realSenderID]
+		if from == "" {
+			from = strconv.FormatInt(record.realSenderID, 10)
+		}
+		message := wecom.Message{
+			MsgID:    strconv.FormatInt(record.serverID, 10),
+			Action:   wecom.ActionSend,
+			From:     from,
+			ToList:   []string{},
+			RoomID:   roomID,
+			MsgTime:  saturatingMilliseconds(record.createdAt),
+			Sequence: record.localID,
+			Outgoing: record.originSource == 1,
+		}
+		normalizeMessage(&message, record.localType, record.content, group)
+		messages = append(messages, message)
+	}
+	return messages, nil
 }
 
 func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error) {
@@ -1040,80 +901,116 @@ func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error)
 	return position, err == nil, err
 }
 
-type normalizedContent struct {
-	kind             string
-	text             string
-	filename         string
-	referenceImageID string
-	link             *wecom.Link
-	sphFeed          *wecom.SphFeed
+func normalizeMessage(message *wecom.Message, localType int64, content string, group bool) {
+	switch baseType(localType) {
+	case 1:
+		message.MsgType = wecom.MessageTypeText
+		message.Text = &wecom.Text{Content: stripGroupPrefix(content, group)}
+	case 3:
+		message.MsgType = wecom.MessageTypeImage
+		message.Image = &wecom.Image{MD5Sum: strings.ToLower(xmlAttribute(content, "md5"))}
+	case 34:
+		message.MsgType = wecom.MessageTypeVoice
+		message.Voice = &wecom.Voice{}
+	case 42:
+		message.MsgType = "card"
+	case 43:
+		message.MsgType = wecom.MessageTypeVideo
+		message.Video = &wecom.Video{}
+	case 47:
+		message.MsgType = "emotion"
+	case 48:
+		message.MsgType = "location"
+	case 49:
+		normalizeAppMessage(message, content, group)
+	case 50:
+		message.MsgType = "voip"
+	case 10000:
+		message.MsgType = "system"
+	case 10002:
+		message.MsgType = "revoke"
+	default:
+		message.MsgType = "unknown"
+	}
 }
 
-func normalizeMessage(localType int64, content string, group bool) normalizedContent {
-	base := baseType(localType)
-	if base == 1 {
-		return normalizedContent{kind: "text", text: stripGroupPrefix(content, group)}
-	}
-	if base == 49 && strings.Contains(content, "<refermsg>") {
-		document := stripGroupPrefix(content, group)
-		message, ok := parseQuotedMessage(document)
-		if !ok {
-			return normalizedContent{kind: "text", text: quotedMessageText(document)}
+func normalizeAppMessage(message *wecom.Message, content string, group bool) {
+	app, ok := parseAppMessage(content)
+	if !ok {
+		if strings.Contains(content, "<refermsg>") {
+			message.MsgType = wecom.MessageTypeText
+			message.Text = &wecom.Text{Content: cleanXMLText(extractXMLText(content, "title"))}
+			return
 		}
-		reference := message.AppMessage.Reference
-		messageID := cleanXMLText(reference.ServerID)
-		if baseType(reference.Type) == 3 && messageID != "" {
-			return normalizedContent{
-				kind: "text", text: cleanXMLText(message.AppMessage.Title),
-				referenceImageID: messageID,
-			}
+		message.MsgType = wecom.MessageTypeLink
+		return
+	}
+	switch {
+	case app.AppMessage.Reference != nil:
+		message.MsgType = wecom.MessageTypeReply
+		message.Reply = quotedReply(app, group)
+	case app.AppMessage.Type == fileAppMessageType:
+		filename := safeLocalFilename(cleanXMLText(app.AppMessage.Title))
+		if filename == "" {
+			message.MsgType = wecom.MessageTypeLink
+			return
 		}
-		return normalizedContent{kind: "text", text: quotedMessageText(document)}
-	}
-	if base == 49 {
-		if metadata, ok := parseFileMessage(content); ok {
-			return normalizedContent{kind: "file", text: "[文件] " + metadata.Filename, filename: metadata.Filename}
+		message.MsgType = wecom.MessageTypeFile
+		message.File = &wecom.File{
+			FileName: filename,
+			FileExt:  strings.TrimPrefix(filepath.Ext(filename), "."),
 		}
-		if metadata, ok := parseLinkMessage(content); ok {
-			if metadata.Kind == "finder" {
-				return normalizedContent{kind: "sphfeed", sphFeed: metadata.SphFeed}
-			}
-			return normalizedContent{kind: "link", link: &wecom.Link{
-				Title: metadata.Title, Description: metadata.Description, LinkURL: metadata.URL,
-			}}
+	default:
+		if finder, found := finderFeedMetadata(app); found {
+			message.MsgType = wecom.MessageTypeSphFeed
+			message.SphFeed = finder.SphFeed
+			return
+		}
+		metadata := linkMetadata(app)
+		message.MsgType = wecom.MessageTypeLink
+		message.Link = &wecom.Link{
+			Title: metadata.Title, Description: metadata.Description, LinkURL: metadata.URL,
 		}
 	}
-	labels := map[int64]struct{ kind, text string }{
-		3: {"image", "[图片]"}, 34: {"voice", "[语音]"}, 42: {"card", "[名片]"},
-		43: {"video", "[视频]"}, 47: {"emotion", "[表情]"}, 48: {"location", "[位置]"},
-		49: {"link", "[链接]"}, 50: {"voip", "[通话]"}, 10000: {"system", "[系统消息]"},
-		10002: {"revoke", "[撤回了一条消息]"},
-	}
-	if value, found := labels[base]; found {
-		return normalizedContent{kind: value.kind, text: value.text}
-	}
-	return normalizedContent{kind: "unknown", text: stripGroupPrefix(content, group)}
-}
-
-type quotedMessage struct {
-	AppMessage struct {
-		Title     string          `xml:"title"`
-		Reference quotedReference `xml:"refermsg"`
-	} `xml:"appmsg"`
 }
 
 type quotedReference struct {
-	Type     int64  `xml:"type"`
-	ServerID string `xml:"svrid"`
-	Content  string `xml:"content"`
+	Type       int64  `xml:"type"`
+	ServerID   string `xml:"svrid"`
+	FromUser   string `xml:"fromusr"`
+	ChatUser   string `xml:"chatusr"`
+	CreateTime int64  `xml:"createtime"`
+	Content    string `xml:"content"`
 }
 
-type linkedMessage struct {
+func quotedReply(message appMessage, group bool) *wecom.Reply {
+	reference := *message.AppMessage.Reference
+	parent := wecom.Message{}
+	normalizeMessage(&parent, reference.Type, reference.Content, false)
+	from := cleanXMLText(reference.FromUser)
+	if chatUser := cleanXMLText(reference.ChatUser); group && chatUser != "" {
+		from = chatUser
+	} else if from == "" {
+		from = chatUser
+	}
+	return &wecom.Reply{
+		Title: cleanXMLText(message.AppMessage.Title),
+		Parent: wecom.MessageReference{
+			MsgID:   cleanXMLText(reference.ServerID),
+			From:    from,
+			MsgType: parent.MsgType,
+			MsgTime: saturatingMilliseconds(reference.CreateTime),
+		},
+	}
+}
+
+type appMessage struct {
 	AppMessage struct {
-		Title       string `xml:"title"`
-		Description string `xml:"des"`
-		Type        int64  `xml:"type"`
-		URL         string `xml:"url"`
+		Title       string           `xml:"title"`
+		Description string           `xml:"des"`
+		Type        int64            `xml:"type"`
+		URL         string           `xml:"url"`
+		Reference   *quotedReference `xml:"refermsg"`
 		FinderFeed  struct {
 			ObjectID    string `xml:"objectId"`
 			FeedType    int64  `xml:"feedType"`
@@ -1133,35 +1030,21 @@ type linkedMessage struct {
 }
 
 type linkMessageMetadata struct {
-	Kind        string
 	Title       string
 	Description string
 	URL         string
 	SphFeed     *wecom.SphFeed
 }
 
-func parseLinkMessage(content string) (linkMessageMetadata, bool) {
-	document := xmlMessageDocument(content)
-	if document == "" {
-		return linkMessageMetadata{}, false
-	}
-	var message linkedMessage
-	if err := xml.Unmarshal([]byte(document), &message); err != nil {
-		return linkMessageMetadata{}, false
-	}
-	if metadata, ok := finderFeedMetadata(message); ok {
-		return metadata, true
-	}
-	metadata := linkMessageMetadata{
-		Kind:        "link",
+func linkMetadata(message appMessage) linkMessageMetadata {
+	return linkMessageMetadata{
 		Title:       cleanXMLText(message.AppMessage.Title),
 		Description: cleanXMLText(message.AppMessage.Description),
 		URL:         cleanXMLText(message.AppMessage.URL),
 	}
-	return metadata, metadata.Title != "" || metadata.Description != "" || metadata.URL != ""
 }
 
-func finderFeedMetadata(message linkedMessage) (linkMessageMetadata, bool) {
+func finderFeedMetadata(message appMessage) (linkMessageMetadata, bool) {
 	feed := message.AppMessage.FinderFeed
 	if message.AppMessage.Type != 51 && cleanXMLText(feed.ObjectID) == "" && cleanXMLText(feed.Nickname) == "" &&
 		cleanXMLText(feed.Description) == "" && len(feed.MediaList.Media) == 0 {
@@ -1173,7 +1056,6 @@ func finderFeedMetadata(message linkedMessage) (linkMessageMetadata, bool) {
 		FeedDesc: cleanXMLText(feed.Description),
 	}
 	metadata := linkMessageMetadata{
-		Kind:        "finder",
 		Title:       sphFeed.SphName,
 		Description: sphFeed.FeedDesc,
 		SphFeed:     sphFeed,
@@ -1191,99 +1073,25 @@ func finderFeedMetadata(message linkedMessage) (linkMessageMetadata, bool) {
 	return metadata, metadata.Title != "" || metadata.Description != "" || metadata.URL != ""
 }
 
-func quotedMessageText(document string) string {
-	message, ok := parseQuotedMessage(document)
-	if !ok {
-		return cleanXMLText(extractXMLText(document, "title"))
-	}
-	current := cleanXMLText(message.AppMessage.Title)
-	reference := quotedReferenceText(message.AppMessage.Reference)
-	if reference == "" {
-		return current
-	}
-	if current == "" {
-		return reference
-	}
-	return current + "\n" + reference
-}
-
-func parseQuotedMessage(document string) (quotedMessage, bool) {
-	document = xmlMessageDocument(document)
+func parseAppMessage(content string) (appMessage, bool) {
+	document := xmlMessageDocument(content)
 	if document == "" {
-		return quotedMessage{}, false
+		return appMessage{}, false
 	}
-	var message quotedMessage
+	var message appMessage
 	if err := xml.Unmarshal([]byte(document), &message); err != nil {
-		return quotedMessage{}, false
+		return appMessage{}, false
 	}
 	return message, true
 }
 
-func quotedReferenceText(reference quotedReference) string {
-	switch baseType(reference.Type) {
-	case 1:
-		content := cleanXMLText(reference.Content)
-		if content == "" {
-			return ""
-		}
-		return "[引用消息] " + content
-	case 3:
-		return "[引用消息][图片]"
-	case 34:
-		return "[引用消息][语音]"
-	case 42:
-		return "[引用消息][名片]"
-	case 43:
-		return "[引用消息][视频]"
-	case 47:
-		return "[引用消息][表情]"
-	case 48:
-		return "[引用消息][位置]"
-	case 49:
-		return quotedLinkText(reference.Content)
-	case 50:
-		return "[引用消息][通话]"
-	case 10000:
-		return "[引用消息][系统消息]"
-	case 10002:
-		return "[引用消息][撤回了一条消息]"
-	default:
-		return ""
-	}
-}
-
-func compoundText(prefix string, values ...string) string {
-	parts := make([]string, 0, len(values))
-	seen := make(map[string]bool)
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" && !seen[value] {
-			parts = append(parts, value)
-			seen[value] = true
+func xmlMessageDocument(content string) string {
+	for _, marker := range []string{"<?xml", "<msg"} {
+		if index := strings.Index(content, marker); index >= 0 {
+			return strings.TrimSpace(content[index:])
 		}
 	}
-	if len(parts) == 0 {
-		return prefix
-	}
-	return prefix + " " + strings.Join(parts, "\n")
-}
-
-func quotedLinkText(content string) string {
-	metadata, ok := parseLinkMessage(content)
-	if !ok {
-		return "[引用消息][链接]"
-	}
-	if metadata.Kind == "finder" {
-		return compoundText("[引用消息][视频号]", metadata.Title, metadata.Description, metadata.URL)
-	}
-	result := "[引用消息][链接]"
-	if metadata.Title != "" {
-		result += " " + metadata.Title
-	}
-	if metadata.URL != "" {
-		result += "\n" + metadata.URL
-	}
-	return result
+	return ""
 }
 
 var (

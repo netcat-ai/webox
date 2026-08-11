@@ -32,11 +32,11 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	wechatState := wechat.New(configuration.StateDir, configuration.CursorKey, configuration.RemarkFilterEnabled)
+	wechatState := wechat.New(configuration.StateDir)
 	if err := wechatState.EnsureStateDir(); err != nil {
 		return err
 	}
-	media, err := sharedmedia.New(configuration.MediaDir)
+	media, err := sharedmedia.New(configuration.SharedDir)
 	if err != nil {
 		return err
 	}
@@ -49,7 +49,6 @@ func run(logger *slog.Logger) error {
 		defer workers.Done()
 		runInitializer(ctx, wechatState, logger)
 	}()
-
 	protocol := ilink.New(
 		configuration.APIToken,
 		media,

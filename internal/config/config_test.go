@@ -18,18 +18,18 @@ func TestNormalizeListenAddr(t *testing.T) {
 
 func TestLoadOrCreateIDIsStable(t *testing.T) {
 	dir := t.TempDir()
-	first, err := loadOrCreateID(dir, "cursor-key", "")
+	first, err := loadOrCreateID(dir, "api-token", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := loadOrCreateID(dir, "cursor-key", "")
+	second, err := loadOrCreateID(dir, "api-token", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first != second || len(first) != 32 {
 		t.Fatalf("ID is not stable: first=%q second=%q", first, second)
 	}
-	info, err := os.Stat(filepath.Join(dir, "cursor-key"))
+	info, err := os.Stat(filepath.Join(dir, "api-token"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,23 +56,7 @@ func TestLoadCreatesStableILinkCredentials(t *testing.T) {
 	if first.APIToken == "" || first.APIToken != second.APIToken {
 		t.Fatalf("unstable API token: %q %q", first.APIToken, second.APIToken)
 	}
-	if first.MediaDir != filepath.Join(filepath.Dir(dir), "media") {
-		t.Fatalf("media directory=%q", first.MediaDir)
-	}
-	if !first.RemarkFilterEnabled {
-		t.Fatal("remark filter should be enabled by default")
-	}
-}
-
-func TestLoadCanDisableRemarkFilter(t *testing.T) {
-	t.Setenv("WEBOX_WEAGENT_STATE_DIR", t.TempDir())
-	t.Setenv("WEBOX_REMARK_FILTER_ENABLED", "false")
-
-	configuration, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if configuration.RemarkFilterEnabled {
-		t.Fatal("remark filter should be disabled")
+	if first.SharedDir != filepath.Join(filepath.Dir(dir), "shared") {
+		t.Fatalf("shared directory=%q", first.SharedDir)
 	}
 }

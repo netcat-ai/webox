@@ -15,23 +15,23 @@ import (
 	"github.com/netcat-ai/webox/wecom"
 )
 
-func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
+func TestNormalizedMessageMapsQuotedContentToReply(t *testing.T) {
 	tests := []struct {
-		name    string
-		content string
-		want    string
+		name        string
+		content     string
+		wantMsgType string
 	}{
 		{
 			name: "text",
 			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><type>57</type><refermsg>` +
 				`<type>1</type><content><![CDATA[这车油耗多少]]></content></refermsg></appmsg></msg>`,
-			want: "虾虾 回答一下\n[引用消息] 这车油耗多少",
+			wantMsgType: wecom.MessageTypeText,
 		},
 		{
 			name: "image",
 			content: `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
 				`<type>3</type><content><![CDATA[<msg><img aeskey="secret" /></msg>]]></content></refermsg></appmsg></msg>`,
-			want: "虾虾 看看这个\n[引用消息][图片]",
+			wantMsgType: wecom.MessageTypeImage,
 		},
 		{
 			name: "link",
@@ -39,7 +39,7 @@ func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
 				`<type>49</type><content><![CDATA[<msg><appmsg><title>文章标题</title>` +
 				`<url>https://example.com/article?id=1&amp;from=wechat</url></appmsg></msg>]]></content>` +
 				`</refermsg></appmsg></msg>`,
-			want: "虾虾 总结一下\n[引用消息][链接] 文章标题\nhttps://example.com/article?id=1&from=wechat",
+			wantMsgType: wecom.MessageTypeLink,
 		},
 		{
 			name: "finder feed",
@@ -48,55 +48,65 @@ func TestNormalizedMessageFlattensQuotedContent(t *testing.T) {
 				`<nickname>黄同学的移动小屋</nickname><desc>自驾游装备收纳清单</desc>` +
 				`<mediaList><media><url>https://example.com/video?id=1&amp;from=finder</url></media></mediaList>` +
 				`</finderFeed></appmsg></msg>]]></content></refermsg></appmsg></msg>`,
-			want: "虾虾 看看这个\n[引用消息][视频号] 黄同学的移动小屋\n自驾游装备收纳清单\n" +
-				"https://example.com/video?id=1&from=finder",
+			wantMsgType: wecom.MessageTypeSphFeed,
 		},
 		{
 			name: "malformed reference",
 			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><type>57</type>` +
 				`<refermsg><type>1</type></refermsg></appmsg></msg>`,
-			want: "虾虾 回答一下",
-		},
-		{
-			name: "malformed xml",
-			content: `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
-				`<type>1</type><content><![CDATA[不完整的引用]]></content>`,
-			want: "虾虾 回答一下",
+			wantMsgType: wecom.MessageTypeText,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			message := normalizeMessage(49, test.content, false)
-			if message.kind != "text" {
-				t.Fatalf("kind=%q want text", message.kind)
+			message := wecom.Message{}
+			normalizeMessage(&message, 49, test.content, false)
+			if message.MsgType != wecom.MessageTypeReply || message.Reply == nil {
+				t.Fatalf("message=%#v want reply", message)
 			}
-			if message.text != test.want {
-				t.Fatalf("content=%q want %q", message.text, test.want)
+			if message.Reply.Parent.MsgType != test.wantMsgType {
+				t.Fatalf("parent msgtype=%q want %q", message.Reply.Parent.MsgType, test.wantMsgType)
 			}
 		})
 	}
 }
 
-func TestNormalizedMessageFlattensGroupQuotedContentAfterSenderPrefix(t *testing.T) {
-	content := "wxid_sender:\n" +
-		`<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
-		`<type>1</type><content><![CDATA[群里的问题]]></content></refermsg></appmsg></msg>`
-
-	message := normalizeMessage(49, content, true)
-	if message.kind != "text" || message.text != "虾虾 回答一下\n[引用消息] 群里的问题" {
+func TestNormalizedMessageFallsBackToTextForMalformedQuotedXML(t *testing.T) {
+	content := `<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
+		`<type>1</type><content><![CDATA[不完整的引用]]></content>`
+	message := wecom.Message{}
+	normalizeMessage(&message, 49, content, false)
+	if message.MsgType != wecom.MessageTypeText || message.Text == nil || message.Text.Content != "虾虾 回答一下" {
 		t.Fatalf("normalizeMessage()=%#v", message)
 	}
 }
 
-func TestNormalizedMessageUsesWeComMixedReferenceForQuotedImage(t *testing.T) {
+func TestNormalizedMessageMapsGroupQuotedContentAfterSenderPrefix(t *testing.T) {
+	content := "wxid_sender:\n" +
+		`<msg><appmsg><title><![CDATA[虾虾 回答一下]]></title><refermsg>` +
+		`<type>1</type><svrid>123</svrid><fromusr>group@chatroom</fromusr>` +
+		`<chatusr>wxid_parent</chatusr><content><![CDATA[群里的问题]]></content></refermsg></appmsg></msg>`
+
+	message := wecom.Message{}
+	normalizeMessage(&message, 49, content, true)
+	if message.MsgType != wecom.MessageTypeReply || message.Reply == nil || message.Reply.Title != "虾虾 回答一下" ||
+		message.Reply.Parent.MsgID != "123" || message.Reply.Parent.From != "wxid_parent" {
+		t.Fatalf("normalizeMessage()=%#v", message)
+	}
+}
+
+func TestNormalizedMessageUsesReplyReferenceForQuotedImage(t *testing.T) {
 	content := `<msg><appmsg><title><![CDATA[虾虾 看看这个]]></title><type>57</type><refermsg>` +
 		`<type>3</type><svrid>3143822696652695030</svrid><fromusr>group@chatroom</fromusr>` +
 		`<chatusr>wxid_sender</chatusr><displayname>小鱼</displayname><createtime>1781703356</createtime>` +
 		`<content><![CDATA[<msg><img aeskey="secret" /></msg>]]></content></refermsg></appmsg></msg>`
 
-	message := normalizeMessage(49, content, false)
-	if message.kind != "text" || message.text != "虾虾 看看这个" || message.referenceImageID != "3143822696652695030" {
+	message := wecom.Message{}
+	normalizeMessage(&message, 49, content, true)
+	if message.MsgType != wecom.MessageTypeReply || message.Reply == nil || message.Reply.Title != "虾虾 看看这个" ||
+		message.Reply.Parent.MsgID != "3143822696652695030" || message.Reply.Parent.From != "wxid_sender" ||
+		message.Reply.Parent.MsgType != wecom.MessageTypeImage || message.Reply.Parent.MsgTime != 1781703356000 {
 		t.Fatalf("message=%#v", message)
 	}
 }
@@ -104,8 +114,10 @@ func TestNormalizedMessageUsesWeComMixedReferenceForQuotedImage(t *testing.T) {
 func TestNormalizedMessageRecognizesFileAppMessage(t *testing.T) {
 	content := "wxid_sender:\n" + `<msg><appmsg><title>report.pdf</title><type>6</type>` +
 		`<appattach><totallen>42</totallen></appattach></appmsg></msg>`
-	message := normalizeMessage(int64(6)*4294967296+49, content, true)
-	if message.kind != "file" || message.text != "[文件] report.pdf" {
+	message := wecom.Message{}
+	normalizeMessage(&message, int64(6)*4294967296+49, content, true)
+	if message.MsgType != wecom.MessageTypeFile || message.File == nil ||
+		message.File.FileName != "report.pdf" || message.File.FileExt != "pdf" {
 		t.Fatalf("normalizeMessage()=%#v", message)
 	}
 }
@@ -121,17 +133,11 @@ func TestQueryExtractsOrdinaryLinkMetadata(t *testing.T) {
 	) VALUES (1, 101, 49, 1000, 0, ?, 0, 3, 2)`, content)
 	defer func() { _ = db.Close() }()
 
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 999}, 100,
-	)
-	if err != nil {
-		t.Fatal(err)
+	messages := queryTestMessages(t, db, "alice", 0)
+	if len(messages) != 1 {
+		t.Fatalf("messages=%#v want one link item", messages)
 	}
-	if len(events) != 1 {
-		t.Fatalf("events=%#v want one link item", events)
-	}
-	message := events[0].message
+	message := &messages[0]
 	if message.MsgType != wecom.MessageTypeLink || message.Link == nil || message.Text != nil ||
 		message.Link.Title != "文章标题" || message.Link.Description != "文章摘要" ||
 		message.Link.LinkURL != "https://example.com/article?id=1&from=wechat" {
@@ -165,17 +171,11 @@ func TestQueryExtractsFinderFeedMetadata(t *testing.T) {
 	) VALUES (1, 101, ?, 1000, 0, ?, 4, 3, 2)`, int64(51)<<32|49, compressed)
 	defer func() { _ = db.Close() }()
 
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 999}, 100,
-	)
-	if err != nil {
-		t.Fatal(err)
+	messages := queryTestMessages(t, db, "alice", 0)
+	if len(messages) != 1 {
+		t.Fatalf("messages=%#v want one message", messages)
 	}
-	if len(events) != 1 {
-		t.Fatalf("events=%#v want one event", events)
-	}
-	message := events[0].message
+	message := &messages[0]
 	if message.MsgType != wecom.MessageTypeSphFeed || message.SphFeed == nil || message.Text != nil {
 		t.Fatalf("message=%#v want typed sphfeed item", message)
 	}
@@ -206,26 +206,20 @@ func TestQueryEmitsRowsWithoutDirectionOrStatusFiltering(t *testing.T) {
 		)
 	}
 	defer func() { _ = db.Close() }()
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 999}, 100,
-	)
-	if err != nil {
-		t.Fatal(err)
+	messages := queryTestMessages(t, db, "alice", 0)
+	if len(messages) != len(rows) {
+		t.Fatalf("messages=%d want %d: %#v", len(messages), len(rows), messages)
 	}
-	if len(events) != len(rows) {
-		t.Fatalf("events=%d want %d: %#v", len(events), len(rows), events)
-	}
-	for index, event := range events {
-		text := event.message.Text.Content
-		if text != rows[index].text || event.position.LocalID != int64(rows[index].id) {
-			t.Fatalf("event[%d]=%#v want text=%q", index, event, rows[index].text)
+	for index, message := range messages {
+		text := message.Text.Content
+		if text != rows[index].text || message.Sequence != int64(rows[index].id) {
+			t.Fatalf("message[%d]=%#v want text=%q", index, message, rows[index].text)
 		}
-		if event.message.Outgoing != (rows[index].origin == 1) {
-			t.Fatalf("event[%d] outgoing=%t want %t", index, event.message.Outgoing, rows[index].origin == 1)
+		if message.Outgoing != (rows[index].origin == 1) {
+			t.Fatalf("message[%d] outgoing=%t want %t", index, message.Outgoing, rows[index].origin == 1)
 		}
-		if event.message.RoomID != "alice" || len(event.message.ToList) != 0 {
-			t.Fatalf("event[%d] roomid=%q tolist=%#v", index, event.message.RoomID, event.message.ToList)
+		if message.RoomID != "alice" || len(message.ToList) != 0 {
+			t.Fatalf("message[%d] roomid=%q tolist=%#v", index, message.RoomID, message.ToList)
 		}
 	}
 }
@@ -236,15 +230,12 @@ func TestQueryResumesByLocalIDWithinSameSecond(t *testing.T) {
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1000, 0, 'first', 0, 3, 2)")
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 1000, 0, 'second', 0, 3, 2)")
 	defer func() { _ = db.Close() }()
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 1000, LocalID: 1}, 100,
-	)
+	records, err := queryMessageRecords(messageShard{db: db, table: "Msg_test"}, 1, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].position.LocalID != 2 {
-		t.Fatalf("unexpected events: %#v", events)
+	if len(records) != 1 || records[0].localID != 2 {
+		t.Fatalf("unexpected records: %#v", records)
 	}
 }
 
@@ -254,15 +245,12 @@ func TestQueryResumesByLocalIDWhenTimestampMovesBackward(t *testing.T) {
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1001, 0, 'first', 0, 3, 2)")
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 999, 0, 'second', 0, 3, 2)")
 	defer func() { _ = db.Close() }()
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 1001, LocalID: 1}, 100,
-	)
+	records, err := queryMessageRecords(messageShard{db: db, table: "Msg_test"}, 1, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].position.LocalID != 2 {
-		t.Fatalf("unexpected events: %#v", events)
+	if len(records) != 1 || records[0].localID != 2 {
+		t.Fatalf("unexpected records: %#v", records)
 	}
 }
 
@@ -287,77 +275,115 @@ func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 0, 1, 1000, 0, 'pending', 0, 2, 1)")
 	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 1000, 0, 'ready', 0, 3, 2)")
 	defer func() { _ = db.Close() }()
-	events, err := queryNewTable(
-		messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"},
-		"alice", false, MessagePosition{CreateTime: 999}, 100,
-	)
+	records, err := queryMessageRecords(messageShard{db: db, table: "Msg_test"}, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].position.LocalID != 2 {
-		t.Fatalf("unexpected events: %#v", events)
+	if len(records) != 1 || records[0].localID != 2 {
+		t.Fatalf("unexpected records: %#v", records)
 	}
 }
 
-func TestResolveEventSendersByShardAndAdvancePastMissingMappings(t *testing.T) {
+func TestConvertMessagesResolvesSendersByShardAndFallsBackForMissingMappings(t *testing.T) {
 	firstDB := createMessageDB(t, filepath.Join(t.TempDir(), "message-0.db"))
 	secondDB := createMessageDB(t, filepath.Join(t.TempDir(), "message-1.db"))
 	defer func() { _ = firstDB.Close() }()
 	defer func() { _ = secondDB.Close() }()
-	for _, db := range []*sql.DB{firstDB, secondDB} {
-		mustExec(t, db, "CREATE TABLE Name2Id (user_name TEXT)")
-	}
 	mustExec(t, firstDB, "INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid-first')")
 	mustExec(t, secondDB, "INSERT INTO Name2Id (rowid, user_name) VALUES (7, 'wxid-second')")
-
-	events := []messageEvent{
-		{
-			room: "first-room", shard: "message/message_0.db", db: firstDB,
-			position: MessagePosition{CreateTime: 1000, LocalID: 1}, realSenderID: 7,
-			message: &wecom.Message{MsgID: "101"},
-		},
-		{
-			room: "first-room", shard: "message/message_0.db", db: firstDB,
-			position: MessagePosition{CreateTime: 1000, LocalID: 2}, realSenderID: 8,
-			message: &wecom.Message{MsgID: "102"},
-		},
-		{
-			room: "second-room", shard: "message/message_1.db", db: secondDB,
-			position: MessagePosition{CreateTime: 1001, LocalID: 1}, realSenderID: 7,
-			message: &wecom.Message{MsgID: "103"},
-		},
-	}
-	if err := resolveEventSenders(events); err != nil {
+	first, err := convertMessages(messageShard{relativePath: "message/message_0.db", db: firstDB}, "first-room", []messageRecord{
+		{serverID: 101, realSenderID: 7}, {serverID: 102, realSenderID: 8},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	data := pollDataFromEvents(events, nil, 100)
-	if len(data.Messages) != 2 || data.Messages[0].From != "wxid-first" || data.Messages[1].From != "wxid-second" {
-		t.Fatalf("messages=%#v", data.Messages)
+	second, err := convertMessages(messageShard{relativePath: "message/message_1.db", db: secondDB}, "second-room", []messageRecord{{serverID: 103, realSenderID: 7}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(data.Skipped) != 1 || data.Skipped[0].MessageID != "102" || data.Skipped[0].RealSenderID != 8 {
-		t.Fatalf("skipped=%#v", data.Skipped)
+	if first[0].From != "wxid-first" || second[0].From != "wxid-second" {
+		t.Fatalf("first=%#v second=%#v", first, second)
 	}
-	position := data.NewState["first-room"]["message/message_0.db"]
-	if position.CreateTime != 1000 || position.LocalID != 2 {
-		t.Fatalf("missing sender position was not advanced: %#v", position)
+	if first[1].From != "8" {
+		t.Fatalf("fallback message=%#v", first[1])
 	}
 }
 
-func TestResolveEventSendersReturnsName2IDQueryFailure(t *testing.T) {
+func TestConvertMessagesReturnsName2IDQueryFailure(t *testing.T) {
 	db := createMessageDB(t, filepath.Join(t.TempDir(), "message.db"))
 	defer func() { _ = db.Close() }()
-	events := []messageEvent{{
-		room: "room", shard: "message/message_0.db", db: db,
-		position: MessagePosition{CreateTime: 1000, LocalID: 1}, realSenderID: 7,
-		message: &wecom.Message{MsgID: "101"},
-	}}
-	if err := resolveEventSenders(events); err == nil || !strings.Contains(err.Error(), "Name2Id") {
-		t.Fatalf("resolveEventSenders() error=%v", err)
+	mustExec(t, db, "DROP TABLE Name2Id")
+	_, err := convertMessages(
+		messageShard{relativePath: "message/message_0.db", db: db}, "room",
+		[]messageRecord{{serverID: 101, realSenderID: 7}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "Name2Id") {
+		t.Fatalf("convertMessages() error=%v", err)
+	}
+}
+
+func TestEnabledRoomSessionsUsesRemarkAndLatestLocalID(t *testing.T) {
+	contact, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "contact.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = contact.Close() }()
+	session, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "session.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+	mustExec(t, contact, "CREATE TABLE contact (username TEXT, remark TEXT, delete_flag INTEGER)")
+	mustExec(t, contact, "INSERT INTO contact VALUES ('enabled', 'webox.jishu', 0), ('enabled-2', 'webox.test', 0), ('spaced', '  webox.invalid  ', 0), ('disabled', 'friend', 0), ('deleted', 'webox.old', 1)")
+	mustExec(t, session, "CREATE TABLE SessionTable (username TEXT, last_msg_locald_id INTEGER)")
+	mustExec(t, session, "INSERT INTO SessionTable VALUES ('enabled', 123), ('enabled-2', 321), ('spaced', 654), ('disabled', 456), ('deleted', 789), ('missing', 999)")
+
+	sessions, err := enabledRoomSessionsFromDB(contact, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 || sessions["enabled"] != 123 || sessions["enabled-2"] != 321 {
+		t.Fatalf("sessions=%v", sessions)
+	}
+}
+
+func TestEnabledRoomSessionsSkipsSessionQueryWithoutEnabledContacts(t *testing.T) {
+	contact, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "contact.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = contact.Close() }()
+	session, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "session.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.Close() }()
+	mustExec(t, contact, "CREATE TABLE contact (username TEXT, remark TEXT, delete_flag INTEGER)")
+
+	sessions, err := enabledRoomSessionsFromDB(contact, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("sessions=%v", sessions)
 	}
 }
 
 func TestSQLCipherStoreReadsCommittedWALChanges(t *testing.T) {
 	dbDir := t.TempDir()
+	contactDir := filepath.Join(dbDir, "contact")
+	if err := os.MkdirAll(contactDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	contactKey := strings.Repeat("20", 32)
+	contact, err := sql.Open("sqlite3", filepath.Join(contactDir, "contact.db")+"?_pragma_key=x'"+contactKey+"'&_pragma_cipher_page_size=4096")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = contact.Close() }()
+	mustExec(t, contact, "CREATE TABLE contact (username TEXT PRIMARY KEY, remark TEXT, delete_flag INTEGER)")
+	mustExec(t, contact, "INSERT INTO contact VALUES ('alice', 'webox.alice', 0)")
+
 	sessionDir := filepath.Join(dbDir, "session")
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -371,23 +397,23 @@ func TestSQLCipherStoreReadsCommittedWALChanges(t *testing.T) {
 	defer func() { _ = writer.Close() }()
 	mustExec(t, writer, "PRAGMA journal_mode=WAL")
 	mustExec(t, writer, "PRAGMA wal_autocheckpoint=0")
-	mustExec(t, writer, "CREATE TABLE SessionTable (username TEXT PRIMARY KEY, last_timestamp INTEGER)")
+	mustExec(t, writer, "CREATE TABLE SessionTable (username TEXT PRIMARY KEY, last_msg_locald_id INTEGER)")
 	mustExec(t, writer, "INSERT INTO SessionTable VALUES ('alice', 100)")
 
-	store, err := Open(dbDir, map[string]string{"session/session.db": key})
+	store, err := Open(dbDir, map[string]string{"contact/contact.db": contactKey, "session/session.db": key})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	state, err := store.CurrentSessionState()
+	state, err := store.EnabledRoomSessions()
 	if err != nil || state["alice"] != 100 {
-		t.Fatalf("initial state=%v err=%v", state, err)
+		t.Fatalf("initial sessions=%v err=%v", state, err)
 	}
 
-	mustExec(t, writer, "UPDATE SessionTable SET last_timestamp=200 WHERE username='alice'")
-	state, err = store.CurrentSessionState()
+	mustExec(t, writer, "UPDATE SessionTable SET last_msg_locald_id=200 WHERE username='alice'")
+	state, err = store.EnabledRoomSessions()
 	if err != nil || state["alice"] != 200 {
-		t.Fatalf("updated state=%v err=%v", state, err)
+		t.Fatalf("updated sessions=%v err=%v", state, err)
 	}
 	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() == 0 {
 		t.Fatalf("encrypted WAL was not present: info=%v err=%v", info, err)
@@ -472,7 +498,22 @@ func createMessageDB(t *testing.T, path string) *sql.DB {
 		WCDB_CT_message_content INTEGER, source BLOB, WCDB_CT_source INTEGER,
 		status INTEGER, origin_source INTEGER
     )`)
+	mustExec(t, db, "CREATE TABLE Name2Id (user_name TEXT)")
 	return db
+}
+
+func queryTestMessages(t *testing.T, db *sql.DB, roomID string, after int64) []wecom.Message {
+	t.Helper()
+	shard := messageShard{relativePath: "message/message_0.db", db: db, table: "Msg_test"}
+	records, err := queryMessageRecords(shard, after, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := convertMessages(shard, roomID, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return messages
 }
 
 func mustExec(t *testing.T, db *sql.DB, query string, arguments ...any) {

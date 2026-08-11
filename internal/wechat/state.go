@@ -7,25 +7,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
 	"github.com/netcat-ai/webox/wecom"
 )
 
 const (
-	maxPollLimit                    = 500
 	keyValidationPeriod             = 30 * time.Second
 	mainWindowMissingGrace          = 15 * time.Second
 	postLoginOverlayDismissAttempts = 3
 	postLoginOverlayDismissInterval = time.Second
-	agentRemarkPrefix               = "webox."
 )
 
 type InitializationState int
@@ -36,10 +32,8 @@ const (
 )
 
 type State struct {
-	stateDir            string
-	keyFile             string
-	cursorKey           string
-	remarkFilterEnabled bool
+	stateDir string
+	keyFile  string
 
 	initialized         atomic.Bool
 	lastValidationAt    atomic.Int64
@@ -55,18 +49,6 @@ type keyFile struct {
 	Keys  map[string]string `json:"keys"`
 }
 
-type dbCursor struct {
-	StartedAt int64                     `json:"started_at"`
-	Positions wechatdb.MessagePositions `json:"positions"`
-}
-
-type PollResult struct {
-	AccountID string
-	Cursor    string
-	Messages  []wecom.Message
-	Skipped   []wechatdb.SkippedMessage
-}
-
 type UserInfo struct {
 	AccountID string
 	WeChatID  string
@@ -74,50 +56,11 @@ type UserInfo struct {
 	AvatarURL string
 }
 
-func filterMessagesByRemarkPrefix(
-	messages []wecom.Message,
-	lookup func(string) (string, error),
-) ([]wecom.Message, error) {
-	filtered := make([]wecom.Message, 0, len(messages))
-	remarks := make(map[string]string)
-	for _, message := range messages {
-		roomID := strings.TrimSpace(message.RoomID)
-		if roomID == "" {
-			continue
-		}
-		remark, found := remarks[roomID]
-		if !found {
-			var err error
-			remark, err = lookup(roomID)
-			if err != nil {
-				return nil, err
-			}
-			remarks[roomID] = remark
-		}
-		if strings.HasPrefix(strings.TrimSpace(remark), agentRemarkPrefix) {
-			filtered = append(filtered, message)
-		}
-	}
-	return filtered, nil
-}
-
-func New(stateDir, cursorKey string, remarkFilterEnabled bool) *State {
+func New(stateDir string) *State {
 	return &State{
-		stateDir:            stateDir,
-		keyFile:             filepath.Join(stateDir, "wechat.key"),
-		cursorKey:           cursorKey,
-		remarkFilterEnabled: remarkFilterEnabled,
+		stateDir: stateDir,
+		keyFile:  filepath.Join(stateDir, "wechat.key"),
 	}
-}
-
-func (state *State) applyRemarkFilter(
-	messages []wecom.Message,
-	lookup func(string) (string, error),
-) ([]wecom.Message, error) {
-	if !state.remarkFilterEnabled {
-		return messages, nil
-	}
-	return filterMessagesByRemarkPrefix(messages, lookup)
 }
 
 func (state *State) EnsureStateDir() error {
@@ -158,20 +101,6 @@ func (state *State) currentAccountInfo(database *wechatdb.Store, username string
 	return info, nil
 }
 
-func (state *State) ValidatePollCursor(rawCursor string) error {
-	if strings.TrimSpace(rawCursor) == "" {
-		return nil
-	}
-	var cursor dbCursor
-	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
-		return fmt.Errorf("decode get_updates_buf: %w", err)
-	}
-	if cursor.StartedAt <= 0 {
-		return errors.New("unsupported get_updates_buf")
-	}
-	return nil
-}
-
 func (state *State) InitializeIfReady() (InitializationState, error) {
 	visible, known := wechatMainWindowReady()
 	if !state.acceptMainWindowObservation(visible, known, time.Now()) {
@@ -200,7 +129,7 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 		if time.Since(time.Unix(state.lastValidationAt.Load(), 0)) < keyValidationPeriod {
 			return Ready, nil
 		}
-		if _, err := state.database.CurrentSessionState(); err == nil {
+		if err := state.database.ValidateSessionDB(); err == nil {
 			state.lastValidationAt.Store(time.Now().Unix())
 			return Ready, nil
 		}
@@ -279,58 +208,37 @@ func dismissPostLoginOverlay() error {
 	return nil
 }
 
-func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error) {
+func (state *State) RoomSessions() (map[string]int64, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, _, err := state.readyDatabase()
+	if err != nil {
+		return nil, err
+	}
+	sessions, err := database.EnabledRoomSessions()
+	if err != nil {
+		return nil, state.dbError("read enabled WeChat sessions", err)
+	}
+	return sessions, nil
+}
+
+func (state *State) RoomMessages(roomID string, after int64, limit int) ([]wecom.Message, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, wxid, err := state.readyDatabase()
 	if err != nil {
-		return PollResult{}, err
+		return nil, err
 	}
-	account, err := state.currentAccountInfo(database, wxid)
+	messages, err := database.MessagesForRoom(roomID, after, limit)
 	if err != nil {
-		return PollResult{}, err
+		return nil, fmt.Errorf("read WeChat Room messages: %w", err)
 	}
-	limit = min(max(limit, 1), maxPollLimit)
-	var cursor dbCursor
-	if strings.TrimSpace(rawCursor) == "" {
-		cursor.StartedAt = time.Now().Unix()
-		cursor.Positions, err = database.BaselinePositions(cursor.StartedAt)
-		if err != nil {
-			return PollResult{}, state.dbError("baseline WeChat messages", err)
+	for index := range messages {
+		if messages[index].Outgoing {
+			messages[index].From = wxid
 		}
-		encoded, err := state.encodeCursor(cursor)
-		return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: []wecom.Message{}}, err
 	}
-	if err := signedpayload.Decode(state.cursorKey, rawCursor, &cursor); err != nil {
-		return PollResult{}, fmt.Errorf("decode get_updates_buf: %w", err)
-	}
-	if cursor.StartedAt <= 0 {
-		return PollResult{}, errors.New("unsupported get_updates_buf")
-	}
-	data, err := database.PollNewMessages(cursor.Positions, cursor.StartedAt, limit)
-	if err != nil {
-		return PollResult{}, state.dbError("poll WeChat messages", err)
-	}
-	sort.SliceStable(data.Messages, func(i, j int) bool {
-		left, right := messageOrder(data.Messages[i]), messageOrder(data.Messages[j])
-		if left.timestamp != right.timestamp {
-			return left.timestamp < right.timestamp
-		}
-		if left.localID != right.localID {
-			return left.localID < right.localID
-		}
-		return left.room < right.room
-	})
-	messages, err := state.applyRemarkFilter(data.Messages, database.ConversationRemark)
-	if err != nil {
-		return PollResult{}, state.dbError("filter WeChat messages by conversation remark", err)
-	}
-	cursor.Positions = data.NewState
-	encoded, err := state.encodeCursor(cursor)
-	if err != nil {
-		return PollResult{}, err
-	}
-	return PollResult{AccountID: account.AccountID, Cursor: encoded, Messages: messages, Skipped: data.Skipped}, nil
+	return messages, nil
 }
 
 func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, error) {
@@ -392,30 +300,30 @@ func (state *State) OutgoingItemsAfter(positions wechatdb.RoomMessagePositions, 
 	return items, nil
 }
 
-func (state *State) ReadImage(roomID, messageID string) (*wechatdb.MediaFile, error) {
+func (state *State) ReadImage(roomID string, localID, createTime int64, md5 string) (*wechatdb.MediaFile, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	media, err := database.ReadImage(roomID, messageID)
+	media, err := database.ReadImage(roomID, localID, createTime, md5)
 	if err != nil {
-		return nil, state.dbError("read WeChat image", err)
+		return nil, fmt.Errorf("read WeChat image: %w", err)
 	}
 	return media, nil
 }
 
-func (state *State) ReadFile(roomID, messageID string) (*wechatdb.LocalFile, error) {
+func (state *State) ReadFile(roomID string, localID, createTime int64, filename string) (*wechatdb.LocalFile, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	file, err := database.ReadFile(roomID, messageID)
+	file, err := database.ReadFile(roomID, localID, createTime, filename)
 	if err != nil {
-		return nil, state.dbError("read WeChat file", err)
+		return nil, fmt.Errorf("read WeChat file: %w", err)
 	}
 	return file, nil
 }
@@ -426,7 +334,7 @@ func (state *State) readyDatabase() (*wechatdb.Store, string, error) {
 	}
 	if state.database == nil {
 		state.MarkUninitialized()
-		return nil, "", errors.New("WeChat database is not open")
+		return nil, "", errors.New("database for WeChat is not open")
 	}
 	return state.database, state.wxid, nil
 }
@@ -436,7 +344,7 @@ func openDatabase(material keyFile) (*wechatdb.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := database.CurrentSessionState(); err != nil {
+	if err := database.ValidateSessionDB(); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -478,28 +386,10 @@ func (state *State) writeKey(material keyFile) error {
 	return os.Rename(tmp, state.keyFile)
 }
 
-func (state *State) encodeCursor(cursor dbCursor) (string, error) {
-	return signedpayload.Encode(state.cursorKey, cursor)
-}
-
 func (state *State) dbError(operation string, err error) error {
 	wrapped := fmt.Errorf("%s: %w", operation, err)
 	state.MarkUninitialized()
 	return wrapped
-}
-
-type orderKey struct {
-	timestamp int64
-	localID   int64
-	room      string
-}
-
-func messageOrder(message wecom.Message) orderKey {
-	return orderKey{
-		timestamp: message.MsgTime,
-		localID:   message.Sequence,
-		room:      message.RoomID,
-	}
 }
 
 func wechatMainWindowReady() (bool, bool) {

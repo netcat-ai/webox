@@ -41,7 +41,7 @@ noVNC desktop
 初始化循环不会解析 Xvfb framebuffer，也不会通过固定坐标点击登录按钮。未登录时它只记录一次提示并等待；首次登录、登录失效和已保存账号确认都由使用者在 noVNC 中处理。登录状态和提取出的数据库密钥持久化在 `/webox/state`。
 已经初始化后，UI 自动发送造成的主窗口短暂不可见不会立即撤销 `ready`；主窗口持续消失超过宽限期才视为退出登录。
 
-HTTP token 和游标签名密钥分别持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
+HTTP token 单独持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
 `account_id` 直接取自 contact 自账号记录的 `username`，不假设它具有 `wxid_` 前缀。受 token 保护的
 `GET /ilink/bot/userinfo` 返回必需的 `account_id`、可见且可修改的 `wechat_id`，并在可用时附带
 `nickname` 和 `avatar_url`；这些字段来自同一条 contact 记录。`avatar_url` 优先使用 `big_head_url`，
@@ -57,16 +57,18 @@ HTTP token 和游标签名密钥分别持久化。Webox 不再生成额外的 pr
 ## 收消息
 
 ```text
-POST getupdates(get_updates_buf)
-  -> verify signed cursor
+POST getupdates(rooms[roomid].seq)
+  -> batch-discover enabled webox. sessions
+  -> skip Rooms whose SessionTable last local id has not changed
   -> query encrypted WeChat DB and WAL through SQLCipher
-  -> map rows to Webox msgs
-  -> decode V2 image .dat files into /webox/state/media/inbox
-  -> copy available WeChat files into /webox/state/media/inbox
-  -> return msgs and next signed cursor
+  -> map each Room's rows to ordered Webox messages with seq
+  -> decode/copy ready media into /webox/state/shared/rooms/<roomid>/inbox
+  -> return a sparse rooms map
 ```
 
-首次空游标在当前数据库末尾建立基线，不回放登录前历史。后续长轮询最多等待 35 秒；同一个旧游标可重新读取相同消息，因此消费者使用稳定 `msgid` 去重。
+请求中已有 Room 使用消费者提交的 `seq`；新发现的 `webox.` Room 从
+`max(0, SessionTable.last_msg_locald_id-100)` 开始。长轮询最多等待 35 秒，一旦任意 Room 有 ready 消息即返回；
+没有更新的 Room 不出现在响应中。同一个旧 `seq` 可重新读取相同消息，消费者必须在持久化成功后才推进进度。
 数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
 
 主要字段映射：
@@ -74,6 +76,7 @@ POST getupdates(get_updates_buf)
 | 微信字段 | Webox 消息字段 |
 | --- | --- |
 | `msgid` | `msgid` |
+| `local_id` | `seq`；当前 Room 的增量读取位置 |
 | 实际发送者 | `from`；当前账号发出的消息使用登录账号 `account_id` |
 | `SessionTable.username` | `roomid`；私聊与群聊都非空 |
 | 暂不解析的 @ 接收者 | `tolist=[]` |
@@ -83,7 +86,7 @@ POST getupdates(get_updates_buf)
 | 视频号 `appmsg.finderFeed` | `msgtype=sphfeed`、`sphfeed` |
 | 图片 | `msgtype=image`、`image.sdkfileid` |
 | 文件 | `msgtype=file`、`file.filename`、`file.sdkfileid` |
-| 带引用图片的文本 | `msgtype=mixed`、`mixed.item[]` |
+| 引用/回复 `appmsg.type=57` | `msgtype=reply`、`reply.title`、`reply.parent` |
 
 数据库消息直接转换为公开 Go 包 `github.com/netcat-ai/webox/wecom` 的 `Message`。消息信封沿用
 [企业微信会话内容存档消息格式](https://developer.work.weixin.qq.com/document/path/91774)的字段形状，但 Webox 将
@@ -96,13 +99,15 @@ POST getupdates(get_updates_buf)
 群聊 `roomid` 以 `@chatroom` 结尾，其他 `roomid` 表示私聊。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件从微信本地目录复制到
 共享目录。媒体可用时 `sdkfileid` 是 `inbox/` 相对路径，不可用时为空字符串。
 
-引用图片使用企业微信 `mixed` 结构：显式文本是 `type=text` item，被引用图片是带 `sdkfileid` 的
-`type=image` item。图片尚未准备好时复用当前消息的一分钟媒体等待窗口。
+引用/回复消息使用 Webox 扩展的 `reply` 类型。`reply.title` 是当前消息正文；`reply.parent` 只保存同一
+`roomid` 内直接父消息的 `msgid`、`from`、`msgtype` 和 `msgtime`，不重复嵌入父消息正文或媒体。
+消费者需要父消息内容时，可用 `reply.parent.msgid` 在自己已保存的同 Room 有序消息流中查找。若父消息
+本身也是 `reply`，消费者按需继续查找，不在单条消息中递归展开。引用媒体不会因为 `reply` 再次物化或阻塞当前消息。
 
 图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
-到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，
-`getupdates` 不返回当前批次，也不推进 cursor；单次 HTTP 长轮询到期可返回空消息和原 cursor，由消费者继续请求。
-从微信消息时间起等待满 1 分钟仍不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息并推进 cursor，避免永久队头阻塞。
+到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，`getupdates` 返回该 Room 在它之前的 ready 前缀并保留
+它之后的消息；其他 Room 不受阻塞。消费者只推进实际持久化消息的 `seq`。从微信消息时间起等待满 1 分钟仍
+不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。
 
 V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
 `libvoipCodec.so`，调用 `wxam_dec_wxam2pic_5` 输出 JPEG；加载 codec 前以 `RTLD_GLOBAL` 预载
@@ -115,7 +120,7 @@ V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信�
 POST sendmessage(msgs[text/image/file...])
   -> authenticate bot token
   -> resolve the common target from roomid
-  -> resolve media sdkfileid under /webox/state/media/inbox or outbox
+  -> resolve media sdkfileid under /webox/state/shared/rooms/<roomid>/inbox or outbox
   -> activate WeChat once, paste and press Enter for every message in order
   -> verify every expected text, image, and file in the same local DB conversation
   -> return the first msgid as client_msg_id with ret=0
@@ -141,10 +146,10 @@ Webox 只暴露以下接口：
 ## 可靠性边界
 
 - WeChat DB 是持久事件源，不增加独立业务消息库。
-- 游标带 HMAC 签名，调用方只能原样回传。
-- 进程重启后，空游标从当前数据库末尾建立新基线。
+- 消费进度是调用方提交的 `roomid -> seq`；Webox 不保存调用方 checkpoint。
+- 新 Room 默认只读取接近数据库末尾的 100 个 `local_id` 范围。
 - UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
-- `client_id` 由调用方标识出站消息；`msgid` 处理入站重复。
+- `client_id` 由调用方标识出站消息；`msgid` 标识消息身份，`seq` 标识 Room 读取位置。
 - 微信会话退出后，业务接口返回 `ret=-14`；使用者通过 noVNC 重新登录。
 
 ## 非目标
@@ -163,7 +168,7 @@ Webox 只暴露以下接口：
 cmd/weagent       process lifecycle and HTTP server
 internal/config   persistent HTTP credentials and environment configuration
 internal/ilink    HTTP routes, authentication and message mapping
-internal/wechat   initialization, signed cursor and DB coordination
+internal/wechat   initialization and DB coordination
 internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher
 internal/sender   serialized xdotool/xclip text sender and DB verification
 ```

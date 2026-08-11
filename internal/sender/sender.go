@@ -48,11 +48,10 @@ func New(state *wechat.State, media *sharedmedia.Store) *Service {
 }
 
 func (service *Service) Send(ctx context.Context, target string, items []Item) (Receipt, error) {
-	target = strings.TrimSpace(target)
 	if target == "" || len(target) > 200 {
 		return Receipt{}, errors.New("recipient is empty or too long")
 	}
-	prepared, err := service.prepareItems(items)
+	prepared, err := service.prepareItems(target, items)
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -89,7 +88,7 @@ func (service *Service) Send(ctx context.Context, target string, items []Item) (
 	return Receipt{}, errors.New("send verification failed: not every item was found in WeChat db")
 }
 
-func (service *Service) prepareItems(items []Item) ([]preparedItem, error) {
+func (service *Service) prepareItems(target string, items []Item) ([]preparedItem, error) {
 	if len(items) == 0 {
 		return nil, errors.New("message items are empty")
 	}
@@ -97,16 +96,15 @@ func (service *Service) prepareItems(items []Item) ([]preparedItem, error) {
 	for _, item := range items {
 		switch item.Kind {
 		case "text":
-			text := strings.TrimSpace(item.Text)
-			if text == "" || len(text) > maxTextLength {
+			if strings.TrimSpace(item.Text) == "" || len(item.Text) > maxTextLength {
 				return nil, errors.New("text is empty or too long")
 			}
-			prepared = append(prepared, preparedItem{Kind: "text", Text: text})
+			prepared = append(prepared, preparedItem{Kind: "text", Text: item.Text})
 		case "image":
 			if service.media == nil {
 				return nil, errors.New("shared media store is unavailable")
 			}
-			path, contentType, err := service.media.ResolveImage(item.SharedPath)
+			path, contentType, err := service.media.ResolveImage(target, item.SharedPath)
 			if err != nil {
 				return nil, err
 			}
@@ -115,7 +113,7 @@ func (service *Service) prepareItems(items []Item) ([]preparedItem, error) {
 			if service.media == nil {
 				return nil, errors.New("shared media store is unavailable")
 			}
-			path, filename, err := service.media.ResolveFile(item.SharedPath)
+			path, filename, err := service.media.ResolveFile(target, item.SharedPath)
 			if err != nil {
 				return nil, err
 			}

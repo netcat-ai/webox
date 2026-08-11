@@ -1,6 +1,6 @@
-// Package wecom defines the message JSON format used by the WeCom
-// conversation archive API. Webox uses this format for both inbound and
-// outbound WeChat messages.
+// Package wecom defines Webox's WeCom-shaped message JSON. Webox keeps the
+// one-message-type/one-body envelope and adds explicit types such as reply
+// when the WeCom archive representation would lose WeChat semantics.
 package wecom
 
 const ActionSend = "send"
@@ -14,6 +14,7 @@ const (
 	MessageTypeLink    = "link"
 	MessageTypeSphFeed = "sphfeed"
 	MessageTypeMixed   = "mixed"
+	MessageTypeReply   = "reply"
 )
 
 type Text struct {
@@ -75,8 +76,23 @@ type Mixed struct {
 	Items []MixedItem `json:"item"`
 }
 
-// Message follows the WeCom conversation-archive message envelope. Fields
-// tagged json:"-" are local database bookkeeping and never cross the API.
+// MessageReference identifies an earlier message in the same room. Its full
+// body is intentionally not embedded; consumers can resolve MsgID from their
+// own ordered message log when they need the referenced content.
+type MessageReference struct {
+	MsgID   string `json:"msgid"`
+	From    string `json:"from"`
+	MsgType string `json:"msgtype"`
+	MsgTime int64  `json:"msgtime"`
+}
+
+type Reply struct {
+	Title  string           `json:"title"`
+	Parent MessageReference `json:"parent"`
+}
+
+// Message follows the WeCom conversation-archive message envelope. Sequence is
+// the public per-Room database position; fields tagged json:"-" stay local.
 type Message struct {
 	MsgID   string   `json:"msgid"`
 	Action  string   `json:"action"`
@@ -94,7 +110,8 @@ type Message struct {
 	Link    *Link    `json:"link,omitempty"`
 	SphFeed *SphFeed `json:"sphfeed,omitempty"`
 	Mixed   *Mixed   `json:"mixed,omitempty"`
+	Reply   *Reply   `json:"reply,omitempty"`
 
-	Sequence int64 `json:"-"`
+	Sequence int64 `json:"seq"`
 	Outgoing bool  `json:"-"`
 }

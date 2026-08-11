@@ -17,7 +17,6 @@ type Store struct {
 }
 
 func New(root string) (*Store, error) {
-	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, errors.New("shared media directory is required")
 	}
@@ -25,16 +24,27 @@ func New(root string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve shared media directory: %w", err)
 	}
-	for _, name := range []string{"inbox", "outbox"} {
-		if err := os.MkdirAll(filepath.Join(absolute, name), 0o700); err != nil {
-			return nil, fmt.Errorf("create shared media directory: %w", err)
-		}
+	if err := os.MkdirAll(filepath.Join(absolute, "rooms"), 0o700); err != nil {
+		return nil, fmt.Errorf("create shared rooms directory: %w", err)
 	}
 	canonical, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return nil, fmt.Errorf("resolve shared media directory: %w", err)
 	}
 	return &Store{root: canonical}, nil
+}
+
+func (store *Store) RoomDirectory(roomID string) (string, error) {
+	if roomID == "" || roomID == "." || roomID == ".." || strings.ContainsAny(roomID, "/\\\x00") {
+		return "", errors.New("roomid is not a safe directory name")
+	}
+	directory := filepath.Join(store.root, "rooms", roomID)
+	for _, path := range []string{directory, filepath.Join(directory, "inbox"), filepath.Join(directory, "outbox")} {
+		if err := ensureDirectory(path); err != nil {
+			return "", err
+		}
+	}
+	return directory, nil
 }
 
 func (store *Store) WriteInbox(roomID, messageID string, data []byte, contentType string) (string, error) {
@@ -50,7 +60,7 @@ func (store *Store) CopyInboxFile(roomID, messageID, filename, sourcePath string
 	if filename == "" {
 		return "", errors.New("incoming file has an invalid filename")
 	}
-	source, err := os.Open(strings.TrimSpace(sourcePath))
+	source, err := os.Open(sourcePath)
 	if err != nil {
 		return "", fmt.Errorf("open incoming file: %w", err)
 	}
@@ -63,9 +73,12 @@ func (store *Store) CopyInboxFile(roomID, messageID, filename, sourcePath string
 }
 
 func (store *Store) writeInbox(roomID, name string, source io.Reader) (string, error) {
-	roomHash := sha256.Sum256([]byte(strings.TrimSpace(roomID)))
-	relative := filepath.Join("inbox", hex.EncodeToString(roomHash[:8]), name)
-	destination := filepath.Join(store.root, relative)
+	roomDirectory, err := store.RoomDirectory(roomID)
+	if err != nil {
+		return "", err
+	}
+	relative := filepath.Join("inbox", name)
+	destination := filepath.Join(roomDirectory, relative)
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return "", fmt.Errorf("create incoming media directory: %w", err)
 	}
@@ -93,12 +106,12 @@ func (store *Store) writeInbox(roomID, name string, source io.Reader) (string, e
 }
 
 func messageIDHash(messageID string) string {
-	hash := sha256.Sum256([]byte(strings.TrimSpace(messageID)))
+	hash := sha256.Sum256([]byte(messageID))
 	return hex.EncodeToString(hash[:16])
 }
 
-func (store *Store) ResolveImage(sharedPath string) (string, string, error) {
-	resolved, err := store.resolve(sharedPath)
+func (store *Store) ResolveImage(roomID, sharedPath string) (string, string, error) {
+	resolved, err := store.resolve(roomID, sharedPath)
 	if err != nil {
 		return "", "", err
 	}
@@ -119,8 +132,8 @@ func (store *Store) ResolveImage(sharedPath string) (string, string, error) {
 	return resolved, contentType, nil
 }
 
-func (store *Store) ResolveFile(sharedPath string) (string, string, error) {
-	resolved, err := store.resolve(sharedPath)
+func (store *Store) ResolveFile(roomID, sharedPath string) (string, string, error) {
+	resolved, err := store.resolve(roomID, sharedPath)
 	if err != nil {
 		return "", "", err
 	}
@@ -131,8 +144,11 @@ func (store *Store) ResolveFile(sharedPath string) (string, string, error) {
 	return resolved, filename, nil
 }
 
-func (store *Store) resolve(sharedPath string) (string, error) {
-	sharedPath = strings.TrimSpace(sharedPath)
+func (store *Store) resolve(roomID, sharedPath string) (string, error) {
+	roomDirectory, err := store.RoomDirectory(roomID)
+	if err != nil {
+		return "", err
+	}
 	if sharedPath == "" || filepath.IsAbs(sharedPath) {
 		return "", errors.New("shared_path must be relative")
 	}
@@ -144,11 +160,11 @@ func (store *Store) resolve(sharedPath string) (string, error) {
 	if len(parts) < 2 || parts[0] != "outbox" && parts[0] != "inbox" {
 		return "", errors.New("shared_path must be under an allowed shared media directory")
 	}
-	root, err := filepath.EvalSymlinks(store.root)
+	root, err := filepath.EvalSymlinks(roomDirectory)
 	if err != nil {
 		return "", fmt.Errorf("resolve shared media root: %w", err)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(store.root, clean))
+	resolved, err := filepath.EvalSymlinks(filepath.Join(roomDirectory, clean))
 	if err != nil {
 		return "", fmt.Errorf("resolve shared file: %w", err)
 	}
@@ -166,9 +182,25 @@ func (store *Store) resolve(sharedPath string) (string, error) {
 	return resolved, nil
 }
 
+func ensureDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("shared path %s is not a directory", path)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect shared directory %s: %w", path, err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create shared directory %s: %w", path, err)
+	}
+	return ensureDirectory(path)
+}
+
 func safeFilename(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || strings.ContainsRune(value, 0) || filepath.Base(value) != value || value == "." || value == ".." {
+	if strings.TrimSpace(value) == "" || strings.ContainsRune(value, 0) || filepath.Base(value) != value || value == "." || value == ".." {
 		return ""
 	}
 	return value

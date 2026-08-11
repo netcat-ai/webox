@@ -47,56 +47,35 @@ type v2ImageCandidate struct {
 	modTime int64
 }
 
-func (store *Store) ReadImage(roomID, messageID string) (*MediaFile, error) {
-	serverID, err := strconv.ParseInt(strings.TrimSpace(messageID), 10, 64)
-	if err != nil || serverID <= 0 || strings.TrimSpace(roomID) == "" {
-		return nil, nil
-	}
-	shards, err := findMessageShards(store, roomID)
-	if err != nil {
-		return nil, err
+func (store *Store) ReadImage(roomID string, localID, createTime int64, messageMD5 string) (*MediaFile, error) {
+	if roomID == "" || localID <= 0 || createTime <= 0 {
+		return nil, errors.New("invalid WeChat image message location")
 	}
 	accountDir := filepath.Dir(store.dbDir)
 	attachRoot := filepath.Join(accountDir, "msg", "attach")
-	for _, shard := range shards {
-		localID, createTime, content, found, err := imageMessage(shard.db, shard.table, serverID)
-		if err != nil {
-			return nil, err
+	md5Value, err := resourceImageMD5(store, roomID, localID, createTime)
+	if err != nil {
+		return nil, err
+	}
+	if md5Value == "" {
+		md5Value = messageMD5
+	}
+	if !isHexValue(md5Value, 32) {
+		return nil, nil
+	}
+	md5Value = strings.ToLower(md5Value)
+	var decodeErr error
+	for _, path := range findImageDats(attachRoot, roomID, md5Value) {
+		media, err := decodeImageDat(accountDir, attachRoot, path, md5Value)
+		if err == nil {
+			return media, nil
 		}
-		if !found {
-			continue
-		}
-		md5Value, err := resourceImageMD5(store, roomID, localID, createTime)
-		if err != nil {
-			return nil, err
-		}
-		if md5Value == "" {
-			md5Value = xmlAttribute(content, "md5")
-		}
-		if !isHexValue(md5Value, 32) {
-			continue
-		}
-		var decodeErr error
-		for _, path := range findImageDats(attachRoot, roomID, strings.ToLower(md5Value)) {
-			media, err := decodeImageDat(accountDir, attachRoot, path, strings.ToLower(md5Value))
-			if err == nil {
-				return media, nil
-			}
-			decodeErr = errors.Join(decodeErr, fmt.Errorf("decode %s: %w", filepath.Base(path), err))
-		}
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
+		decodeErr = errors.Join(decodeErr, fmt.Errorf("decode %s: %w", filepath.Base(path), err))
+	}
+	if decodeErr != nil {
+		return nil, decodeErr
 	}
 	return nil, nil
-}
-
-func imageMessage(db *sql.DB, table string, serverID int64) (int64, int64, string, bool, error) {
-	message, found, err := messageByServerID(db, table, serverID)
-	if err != nil || !found || baseType(message.localType) != 3 {
-		return 0, 0, "", false, err
-	}
-	return message.localID, message.createdAt, message.content, true, nil
 }
 
 func resourceImageMD5(store *Store, roomID string, localID, createTime int64) (string, error) {
@@ -109,15 +88,9 @@ func resourceImageMD5(store *Store, roomID string, localID, createTime int64) (s
 	}
 	var packed []byte
 	err = db.QueryRow(`SELECT packed_info FROM MessageResourceInfo
-        WHERE chat_id=? AND message_local_id=?
-          AND (message_local_type=3 OR message_local_type % 4294967296=3)
-          AND message_create_time=? ORDER BY rowid DESC LIMIT 1`, chatID, localID, createTime).Scan(&packed)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = db.QueryRow(`SELECT packed_info FROM MessageResourceInfo
-            WHERE chat_id=? AND message_local_id=?
-              AND (message_local_type=3 OR message_local_type % 4294967296=3)
-            ORDER BY message_create_time DESC LIMIT 1`, chatID, localID).Scan(&packed)
-	}
+	        WHERE chat_id=? AND message_local_id=?
+	          AND (message_local_type=3 OR message_local_type % 4294967296=3)
+	          AND message_create_time=? ORDER BY rowid DESC LIMIT 1`, chatID, localID, createTime).Scan(&packed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -221,7 +194,7 @@ func convertWXGFToJPEG(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	if imageContentType(jpeg) != "image/jpeg" {
-		return nil, errors.New("WeChat WXGF decoder did not produce a JPEG image")
+		return nil, errors.New("decoder for WeChat WXGF input did not produce a JPEG image")
 	}
 	return jpeg, nil
 }
@@ -281,11 +254,11 @@ func deriveImageKey(accountDir string, files []v2ImageCandidate) (imageKeyMateri
 	raw := filepath.Base(accountDir)
 	separator := strings.LastIndexByte(raw, '_')
 	if separator < 1 || len(raw)-separator-1 != 4 {
-		return imageKeyMaterial{}, errors.New("WeChat account directory has no four-hex suffix")
+		return imageKeyMaterial{}, errors.New("account directory for WeChat has no four-hex suffix")
 	}
 	suffix, err := hex.DecodeString(raw[separator+1:])
 	if err != nil || len(suffix) != 2 {
-		return imageKeyMaterial{}, errors.New("WeChat account directory has an invalid suffix")
+		return imageKeyMaterial{}, errors.New("account directory for WeChat has an invalid suffix")
 	}
 	for _, wxid := range []string{raw[:separator], raw} {
 		if aesKey, found := bruteForceImageKey(xorKey, suffix, wxid, templates); found {

@@ -114,7 +114,7 @@ var (
 
 func decodeWXGF(data []byte) ([]byte, error) {
 	if len(data) == 0 || len(data) > math.MaxInt32 {
-		return nil, errors.New("WXGF input has an invalid size")
+		return nil, errors.New("invalid WXGF input size")
 	}
 	if err := loadWXGFDecoder(); err != nil {
 		return nil, err
@@ -133,16 +133,16 @@ func decodeWXGF(data []byte) ([]byte, error) {
 	outputLength, result := callWXGFDecoder(data, output)
 	if result == wxgfBufferTooSmall {
 		if outputLength <= capacity || outputLength > maxWXGFDecodedSize {
-			return nil, fmt.Errorf("WeChat WXGF decoder requested an invalid output size: %d", outputLength)
+			return nil, fmt.Errorf("invalid output size requested by WeChat WXGF decoder: %d", outputLength)
 		}
 		output = make([]byte, outputLength)
 		outputLength, result = callWXGFDecoder(data, output)
 	}
 	if result != 0 {
-		return nil, fmt.Errorf("WeChat WXGF decoder failed with code %d", result)
+		return nil, fmt.Errorf("decode WeChat WXGF input: decoder failed with code %d", result)
 	}
 	if outputLength <= 0 || outputLength > len(output) {
-		return nil, fmt.Errorf("WeChat WXGF decoder returned an invalid output size: %d", outputLength)
+		return nil, fmt.Errorf("invalid output size returned by WeChat WXGF decoder: %d", outputLength)
 	}
 	return output[:outputLength], nil
 }

@@ -8,7 +8,7 @@ import (
 )
 
 func TestReadKeyRejectsMissingMessageShardKey(t *testing.T) {
-	state := New(t.TempDir(), "test-token", true)
+	state := New(t.TempDir())
 	dbDir := t.TempDir()
 	messageDir := filepath.Join(dbDir, "message")
 	if err := os.MkdirAll(messageDir, 0o700); err != nil {
