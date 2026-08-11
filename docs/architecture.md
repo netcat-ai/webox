@@ -6,7 +6,7 @@
 
 ## 设计原则
 
-1. 对外只保留 aicat 实际使用的 HTTP 接口，不维持通用 iLink 兼容面。
+1. 对外只保留 aicat 和验收工具实际使用的 HTTP 接口，不维持通用 iLink 兼容面。
 2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
 3. WeChat Linux 客户端是真实终端：收消息读本地 DB，发消息驱动客户端 UI。
 4. WeChat DB 是消息事实源，不复制一套业务消息库。
@@ -34,10 +34,12 @@ noVNC desktop
   -> scan the WeChat QR code or confirm the saved account
   -> initializer observes the main window
   -> extract and persist WeChat DB keys
+  -> dismiss post-login overlays while the API is not ready
   -> expose ready=true from /healthz
 ```
 
 初始化循环不会解析 Xvfb framebuffer，也不会通过固定坐标点击登录按钮。未登录时它只记录一次提示并等待；首次登录、登录失效和已保存账号确认都由使用者在 noVNC 中处理。登录状态和提取出的数据库密钥持久化在 `/webox/state`。
+已经初始化后，UI 自动发送造成的主窗口短暂不可见不会立即撤销 `ready`；主窗口持续消失超过宽限期才视为退出登录。
 
 HTTP token 和游标签名密钥分别持久化。Webox 不再生成额外的 provider account ID；登录账号的稳定内部
 `account_id` 直接取自 contact 自账号记录的 `username`，不假设它具有 `wxid_` 前缀。受 token 保护的
@@ -47,6 +49,10 @@ HTTP token 和游标签名密钥分别持久化。Webox 不再生成额外的 pr
 这里的 `username` 始终作为稳定 `account_id`；部分旧账号的 `username` 恰好与当前可见微信号相同，
 但两者语义不同。用户以后修改微信号时，新的可见值进入 `alias`，`account_id` 仍保持原 `username`。
 `/healthz` 仍只返回 `ok` 和 `ready`，不暴露这些身份或凭据。
+
+受 token 保护的 `GET /ilink/bot/contacts?remark=...` 在 contact 数据库中精确匹配未删除记录，返回
+`roomid`、`remark` 和可用时的 `nickname`。接口不支持空条件枚举整个通讯录；返回数组而不是假定备注唯一，
+调用方遇到多个匹配时可以明确拒绝目标歧义。
 
 ## 收消息
 
@@ -126,10 +132,11 @@ Webox 只暴露以下接口：
 
 - `GET /healthz`：返回进程存活与微信初始化状态。
 - `GET /ilink/bot/userinfo`：返回当前微信账号身份。
+- `GET /ilink/bot/contacts?remark=...`：按备注精确查询联系人或群聊的 `roomid`。
 - `POST /ilink/bot/getupdates`：长轮询接收消息。
 - `POST /ilink/bot/sendmessage`：发送文本、图片和文件。
 
-后三个接口要求 Webox token。语音和视频出站 item 返回 HTTP 501，不伪造成功。
+除 `/healthz` 外的接口都要求 Webox token。语音和视频出站 item 返回 HTTP 501，不伪造成功。
 
 ## 可靠性边界
 

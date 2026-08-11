@@ -20,9 +20,12 @@ import (
 )
 
 const (
-	maxPollLimit        = 500
-	keyValidationPeriod = 30 * time.Second
-	agentRemarkPrefix   = "webox."
+	maxPollLimit                    = 500
+	keyValidationPeriod             = 30 * time.Second
+	mainWindowMissingGrace          = 15 * time.Second
+	postLoginOverlayDismissAttempts = 3
+	postLoginOverlayDismissInterval = time.Second
+	agentRemarkPrefix               = "webox."
 )
 
 type InitializationState int
@@ -38,11 +41,12 @@ type State struct {
 	cursorKey           string
 	remarkFilterEnabled bool
 
-	initialized      atomic.Bool
-	lastValidationAt atomic.Int64
-	dbMu             sync.Mutex
-	database         *wechatdb.Store
-	wxid             string
+	initialized         atomic.Bool
+	lastValidationAt    atomic.Int64
+	mainWindowMissingAt atomic.Int64
+	dbMu                sync.Mutex
+	database            *wechatdb.Store
+	wxid                string
 }
 
 type keyFile struct {
@@ -169,10 +173,13 @@ func (state *State) ValidatePollCursor(rawCursor string) error {
 }
 
 func (state *State) InitializeIfReady() (InitializationState, error) {
-	ready, known := wechatMainWindowReady()
-	if !known || !ready {
+	visible, known := wechatMainWindowReady()
+	if !state.acceptMainWindowObservation(visible, known, time.Now()) {
 		state.initialized.Store(false)
 		return WaitingForLogin, nil
+	}
+	if !visible {
+		return Ready, nil
 	}
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
@@ -218,6 +225,10 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 			return WaitingForLogin, err
 		}
 	}
+	if err := dismissPostLoginOverlay(); err != nil {
+		_ = database.Close()
+		return WaitingForLogin, err
+	}
 	if state.database != nil && state.database != database {
 		_ = state.database.Close()
 	}
@@ -228,19 +239,44 @@ func (state *State) InitializeIfReady() (InitializationState, error) {
 	return Ready, nil
 }
 
+func (state *State) acceptMainWindowObservation(visible, known bool, now time.Time) bool {
+	if !known {
+		state.mainWindowMissingAt.Store(0)
+		return false
+	}
+	if visible {
+		state.mainWindowMissingAt.Store(0)
+		return true
+	}
+	if !state.IsInitialized() {
+		return false
+	}
+	missingAt := state.mainWindowMissingAt.Load()
+	if missingAt == 0 {
+		state.mainWindowMissingAt.Store(now.UnixNano())
+		return true
+	}
+	return now.Sub(time.Unix(0, missingAt)) < mainWindowMissingGrace
+}
+
 func (state *State) MarkUninitialized() {
 	state.initialized.Store(false)
 }
 
-func (state *State) DismissPostLoginOverlay() (bool, error) {
-	window := wechatMainWindow()
-	if window == "" {
-		return false, nil
+func dismissPostLoginOverlay() error {
+	for attempt := range postLoginOverlayDismissAttempts {
+		if attempt != 0 {
+			time.Sleep(postLoginOverlayDismissInterval)
+		}
+		window := wechatMainWindow()
+		if window == "" {
+			return errors.New("wechat main window disappeared during post-login initialization")
+		}
+		if output, err := exec.Command("xdotool", "windowactivate", "--sync", window, "key", "--clearmodifiers", "Escape").CombinedOutput(); err != nil {
+			return fmt.Errorf("run xdotool for post-login overlay: %w: %s", err, strings.TrimSpace(string(output)))
+		}
 	}
-	if output, err := exec.Command("xdotool", "windowactivate", "--sync", window, "key", "--clearmodifiers", "Escape").CombinedOutput(); err != nil {
-		return false, fmt.Errorf("run xdotool for post-login overlay: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return true, nil
+	return nil
 }
 
 func (state *State) PollMessages(rawCursor string, limit int) (PollResult, error) {
@@ -312,6 +348,20 @@ func (state *State) ResolveRecipient(username string) (*wechatdb.Recipient, erro
 		return nil, errors.New("recipient not found: target must be a WeChat internal id")
 	}
 	return recipient, nil
+}
+
+func (state *State) ContactsByRemark(remark string) ([]wechatdb.Contact, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, _, err := state.readyDatabase()
+	if err != nil {
+		return nil, err
+	}
+	contacts, err := database.ContactsByRemark(remark)
+	if err != nil {
+		return nil, state.dbError("query WeChat contacts", err)
+	}
+	return contacts, nil
 }
 
 func (state *State) RoomMessagePositions(target string) (wechatdb.RoomMessagePositions, error) {

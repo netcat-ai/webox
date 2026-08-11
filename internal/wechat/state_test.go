@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/netcat-ai/webox/internal/signedpayload"
 	"github.com/netcat-ai/webox/internal/wechatdb"
@@ -141,5 +142,28 @@ func TestMissingKeyMaterialInvalidatesReadyState(t *testing.T) {
 	}
 	if state.IsInitialized() {
 		t.Fatal("ready state was not invalidated")
+	}
+}
+
+func TestInitializedStateToleratesTransientMissingMainWindow(t *testing.T) {
+	state := New(t.TempDir(), "test-token", true)
+	now := time.Unix(100, 0)
+	if state.acceptMainWindowObservation(false, true, now) {
+		t.Fatal("uninitialized state accepted a missing main window")
+	}
+	state.initialized.Store(true)
+	if !state.acceptMainWindowObservation(false, true, now) ||
+		!state.acceptMainWindowObservation(false, true, now.Add(mainWindowMissingGrace-time.Millisecond)) {
+		t.Fatal("transient missing main window was not tolerated")
+	}
+	if state.acceptMainWindowObservation(false, true, now.Add(mainWindowMissingGrace)) {
+		t.Fatal("persistently missing main window was accepted")
+	}
+	if !state.acceptMainWindowObservation(true, true, now.Add(mainWindowMissingGrace)) ||
+		state.mainWindowMissingAt.Load() != 0 {
+		t.Fatal("visible main window did not reset the grace period")
+	}
+	if state.acceptMainWindowObservation(false, false, now) {
+		t.Fatal("unobservable main window was accepted")
 	}
 }

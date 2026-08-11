@@ -19,20 +19,6 @@ import (
 	"github.com/netcat-ai/webox/internal/wechat"
 )
 
-type postLoginUIState struct {
-	dismissed bool
-}
-
-func (state *postLoginUIState) shouldDismiss(initialization wechat.InitializationState) bool {
-	if initialization == wechat.WaitingForLogin {
-		state.dismissed = false
-		return false
-	}
-	return !state.dismissed
-}
-
-func (state *postLoginUIState) markDismissed() { state.dismissed = true }
-
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
@@ -106,7 +92,6 @@ func runInitializer(ctx context.Context, state *wechat.State, logger *slog.Logge
 		return
 	}
 	readyLogged, loginRequiredLogged := false, false
-	var postLogin postLoginUIState
 	for {
 		initialization, err := state.InitializeIfReady()
 		if err != nil {
@@ -117,17 +102,6 @@ func runInitializer(ctx context.Context, state *wechat.State, logger *slog.Logge
 				return
 			}
 		} else if initialization == wechat.Ready {
-			if postLogin.shouldDismiss(wechat.Ready) {
-				if !wait(ctx, 300*time.Millisecond) {
-					return
-				}
-				if dismissed, err := state.DismissPostLoginOverlay(); err != nil {
-					logger.Warn("could not dismiss post-login WeChat overlay", "error", err)
-				} else if dismissed {
-					postLogin.markDismissed()
-					logger.Info("dismissed post-login WeChat overlay")
-				}
-			}
 			if !readyLogged {
 				logger.Info("wechat automatic initialization is ready")
 				readyLogged = true
@@ -135,7 +109,6 @@ func runInitializer(ctx context.Context, state *wechat.State, logger *slog.Logge
 			loginRequiredLogged = false
 		} else {
 			readyLogged = false
-			postLogin.shouldDismiss(wechat.WaitingForLogin)
 			if !loginRequiredLogged {
 				logger.Info("wechat login is required; complete it through noVNC")
 				loginRequiredLogged = true

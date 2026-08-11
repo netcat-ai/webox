@@ -34,6 +34,9 @@ type fakeMessages struct {
 	mediaErr    error
 	file        *wechatdb.LocalFile
 	fileErr     error
+	contacts    []wechatdb.Contact
+	contactsErr error
+	remark      string
 }
 
 func inboundMessage(id, room, senderID string, createdAt int64, body wecom.Message) wecom.Message {
@@ -62,6 +65,10 @@ func fileItem(filename string) wecom.Message {
 func (source *fakeMessages) IsInitialized() bool { return source.initialized }
 func (source *fakeMessages) UserInfo() (wechat.UserInfo, error) {
 	return source.userInfo, source.userInfoErr
+}
+func (source *fakeMessages) ContactsByRemark(remark string) ([]wechatdb.Contact, error) {
+	source.remark = remark
+	return source.contacts, source.contactsErr
 }
 func (source *fakeMessages) ValidatePollCursor(string) error { return source.validateErr }
 func (source *fakeMessages) PollMessages(string, int) (wechat.PollResult, error) {
@@ -124,6 +131,38 @@ func TestHealthOnlyExposesReadiness(t *testing.T) {
 	body := responseJSON(t, response)
 	if response.Code != http.StatusOK || body["ok"] != true || body["ready"] != false || len(body) != 2 {
 		t.Fatalf("status=%d body=%#v", response.Code, body)
+	}
+}
+
+func TestGetContactsReturnsExactRemarkMatches(t *testing.T) {
+	server, messages, _ := testServer(t)
+	messages.initialized = true
+	messages.contacts = []wechatdb.Contact{{
+		RoomID: "50261801724@chatroom", Remark: "webox.test", Nickname: "测试群",
+	}}
+
+	response := perform(server, http.MethodGet, "/ilink/bot/contacts?remark=webox.test", nil, true)
+	body := responseJSON(t, response)
+	contacts := body["contacts"].([]any)
+	contact := contacts[0].(map[string]any)
+	if response.Code != http.StatusOK || body["ret"] != float64(0) || messages.remark != "webox.test" ||
+		len(contacts) != 1 || contact["roomid"] != "50261801724@chatroom" ||
+		contact["remark"] != "webox.test" || contact["nickname"] != "测试群" {
+		t.Fatalf("status=%d body=%#v remark=%q", response.Code, body, messages.remark)
+	}
+}
+
+func TestGetContactsRequiresAuthenticatedNonEmptyRemark(t *testing.T) {
+	server, messages, _ := testServer(t)
+	messages.initialized = true
+
+	unauthorized := perform(server, http.MethodGet, "/ilink/bot/contacts?remark=webox.test", nil, false)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d", unauthorized.Code)
+	}
+	missing := perform(server, http.MethodGet, "/ilink/bot/contacts", nil, true)
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("missing remark status=%d", missing.Code)
 	}
 }
 

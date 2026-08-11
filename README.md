@@ -40,7 +40,7 @@ http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale
 curl http://127.0.0.1:38080/healthz
 ```
 
-返回值中的 `ready` 为 `true` 表示微信数据库已经初始化。给需要交给 aicat 处理的联系人或群聊设置以 `webox.` 开头的备注，例如 `webox.test`。
+返回值中的 `ready` 为 `true` 表示微信数据库和主界面已经完成初始化。给需要交给 aicat 处理的联系人或群聊设置以 `webox.` 开头的备注，例如 `webox.test`。
 
 ## 接入 aicat
 
@@ -66,16 +66,18 @@ claw:
 
 `claw.agents` 非空时，`aicat serve` 会自动启用 Claw。`wechatID` 是当前账号可见的微信号；aicat 会在 polling 前通过 Webox 核对账号身份。详细配置见 [aicat README](https://github.com/netcat-ai/aicat#readme)。
 
-Webox 当前只保留 aicat 使用的四个 HTTP 接口：
+Webox 提供以下 HTTP 接口：
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/healthz` | 进程和微信初始化状态 |
 | `GET` | `/ilink/bot/userinfo` | 当前微信账号身份 |
+| `GET` | `/ilink/bot/contacts?remark=webox.test` | 按备注精确查询联系人或群聊的 `roomid` |
 | `POST` | `/ilink/bot/getupdates` | 长轮询接收消息 |
 | `POST` | `/ilink/bot/sendmessage` | 发送文本、图片和文件 |
 
 除 `/healthz` 外，其余接口使用 `state/weagent/api-token` 中的 token 鉴权。
+`contacts` 只做 `remark` 精确匹配，并返回未删除记录；`contacts` 数组保留重复备注，调用方可以据此拒绝不唯一的发送目标。
 
 ## 参考与致谢
 

@@ -27,6 +27,7 @@ const (
 type messageSource interface {
 	IsInitialized() bool
 	UserInfo() (wechat.UserInfo, error)
+	ContactsByRemark(string) ([]wechatdb.Contact, error)
 	ValidatePollCursor(string) error
 	PollMessages(string, int) (wechat.PollResult, error)
 	ReadImage(string, string) (*wechatdb.MediaFile, error)
@@ -73,6 +74,7 @@ func (server *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /ilink/bot/userinfo", server.getUserInfo)
+	mux.HandleFunc("GET /ilink/bot/contacts", server.getContacts)
 	mux.HandleFunc("POST /ilink/bot/getupdates", server.getUpdates)
 	mux.HandleFunc("POST /ilink/bot/sendmessage", server.sendMessage)
 	return mux
@@ -115,6 +117,28 @@ func (server *Server) getUserInfo(response http.ResponseWriter, request *http.Re
 		result["avatar_url"] = avatarURL
 	}
 	writeJSON(response, http.StatusOK, result)
+}
+
+func (server *Server) getContacts(response http.ResponseWriter, request *http.Request) {
+	if !server.authenticate(response, request) {
+		return
+	}
+	remark := strings.TrimSpace(request.URL.Query().Get("remark"))
+	if remark == "" {
+		writeError(response, http.StatusBadRequest, "remark is required")
+		return
+	}
+	if !server.messages.IsInitialized() {
+		writeJSON(response, http.StatusOK, sessionUnavailable(""))
+		return
+	}
+	contacts, err := server.messages.ContactsByRemark(remark)
+	if err != nil {
+		server.logger.Error("could not query WeChat contacts", "remark", remark, "error", err)
+		writeError(response, http.StatusInternalServerError, "could not query WeChat contacts")
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"ret": 0, "contacts": contacts})
 }
 
 func (server *Server) getUpdates(response http.ResponseWriter, request *http.Request) {

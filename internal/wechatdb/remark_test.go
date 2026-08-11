@@ -3,6 +3,7 @@ package wechatdb
 import (
 	"database/sql"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -27,6 +28,41 @@ func TestConversationRemarkReadsTheExplicitContactRemark(t *testing.T) {
 	}
 	if remark != "webox.family" {
 		t.Fatalf("remark=%q", remark)
+	}
+}
+
+func TestContactsByRemarkReturnsExactLiveMatchesInRoomIDOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "contact.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `CREATE TABLE contact (
+		username TEXT, nick_name TEXT, remark TEXT, alias TEXT, delete_flag INTEGER
+	)`)
+	for _, row := range [][]any{
+		{"room-b@chatroom", "测试群 B", "webox.test", "", 0},
+		{"room-a@chatroom", "测试群 A", "webox.test", "", 0},
+		{"deleted@chatroom", "已删除", "webox.test", "", 1},
+		{"other@chatroom", "其它群", "webox.other", "", 0},
+	} {
+		mustExec(t, db,
+			"INSERT INTO contact(username, nick_name, remark, alias, delete_flag) VALUES (?, ?, ?, ?, ?)",
+			row...,
+		)
+	}
+	defer func() { _ = db.Close() }()
+
+	contacts, err := contactsByRemarkFromDB(db, " webox.test ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Contact{
+		{RoomID: "room-a@chatroom", Remark: "webox.test", Nickname: "测试群 A"},
+		{RoomID: "room-b@chatroom", Remark: "webox.test", Nickname: "测试群 B"},
+	}
+	if !reflect.DeepEqual(contacts, want) {
+		t.Fatalf("contacts=%#v want=%#v", contacts, want)
 	}
 }
 

@@ -109,6 +109,12 @@ type Recipient struct {
 	SearchTerm string
 }
 
+type Contact struct {
+	RoomID   string `json:"roomid"`
+	Remark   string `json:"remark"`
+	Nickname string `json:"nickname,omitempty"`
+}
+
 type AccountInfo struct {
 	AccountID string
 	WeChatID  string
@@ -336,6 +342,42 @@ func (store *Store) ConversationRemark(username string) (string, error) {
 		return "", err
 	}
 	return conversationRemarkFromDB(db, username)
+}
+
+func contactsByRemarkFromDB(db *sql.DB, remark string) ([]Contact, error) {
+	rows, err := db.Query(
+		`SELECT username, remark, nick_name FROM contact
+		 WHERE delete_flag=0 AND remark=? ORDER BY username`,
+		strings.TrimSpace(remark),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	contacts := make([]Contact, 0)
+	for rows.Next() {
+		var contact Contact
+		var storedRemark, nickname sql.NullString
+		if err := rows.Scan(&contact.RoomID, &storedRemark, &nickname); err != nil {
+			return nil, err
+		}
+		contact.RoomID = strings.TrimSpace(contact.RoomID)
+		contact.Remark = strings.TrimSpace(storedRemark.String)
+		contact.Nickname = strings.TrimSpace(nickname.String)
+		contacts = append(contacts, contact)
+	}
+	return contacts, rows.Err()
+}
+
+func (store *Store) ContactsByRemark(remark string) ([]Contact, error) {
+	db, found, err := store.database("contact/contact.db")
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("contact database not found")
+	}
+	return contactsByRemarkFromDB(db, remark)
 }
 
 func (store *Store) AccountInfoFor(username string) (AccountInfo, error) {
