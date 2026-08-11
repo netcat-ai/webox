@@ -107,7 +107,8 @@ POST getupdates(rooms[roomid].seq)
 图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
 到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，`getupdates` 返回该 Room 在它之前的 ready 前缀并保留
 它之后的消息；其他 Room 不受阻塞。消费者只推进实际持久化消息的 `seq`。从微信消息时间起等待满 1 分钟仍
-不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。
+不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。微信发送文件时可能先在同一
+`local_id` 写入只有标题的空链接占位，随后原地更新为文件消息；Webox 同样等待这种近期占位稳定后再推进 `seq`。
 
 V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
 `libvoipCodec.so`，调用 `wxam_dec_wxam2pic_5` 输出 JPEG；加载 codec 前以 `RTLD_GLOBAL` 预载

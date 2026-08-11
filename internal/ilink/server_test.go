@@ -251,6 +251,34 @@ func TestGetUpdatesReturnsReadyPrefixesWithoutBlockingOtherRooms(t *testing.T) {
 	}
 }
 
+func TestGetUpdatesWaitsForFilePlaceholderToStabilize(t *testing.T) {
+	server, messages, _ := testServer(t)
+	server.pollTimeout = time.Millisecond
+	messages.initialized = true
+	messages.sessions = map[string]int64{"room-a": 1}
+	messages.rooms = map[string][]wecom.Message{"room-a": {{
+		MsgID: "placeholder", RoomID: "room-a", MsgType: wecom.MessageTypeLink,
+		MsgTime: time.Now().UnixMilli(), Sequence: 1,
+		Link: &wecom.Link{Title: "report.txt"},
+	}}}
+
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
+		"rooms": map[string]any{"room-a": map[string]any{"seq": 0}},
+	}, true)
+	if rooms := responseJSON(t, response)["rooms"].(map[string]any); len(rooms) != 0 {
+		t.Fatalf("rooms=%#v", rooms)
+	}
+
+	messages.rooms["room-a"][0].MsgTime = time.Now().Add(-inboundMediaWait - time.Second).UnixMilli()
+	response = perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
+		"rooms": map[string]any{"room-a": map[string]any{"seq": 0}},
+	}, true)
+	room := responseJSON(t, response)["rooms"].(map[string]any)["room-a"]
+	if message := messagesForTest(t, room)[0]; message["msgtype"] != wecom.MessageTypeLink {
+		t.Fatalf("message=%#v", message)
+	}
+}
+
 func TestGetUpdatesLocatesFileFromConvertedMessage(t *testing.T) {
 	server, messages, _ := testServer(t)
 	messages.initialized = true

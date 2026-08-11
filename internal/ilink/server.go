@@ -192,6 +192,10 @@ func (server *Server) readyRoomMessages(roomID string, messages []wecom.Message)
 			if err == nil {
 				message.File.FileName = file.Filename
 			}
+		case wecom.MessageTypeLink:
+			if message.Link != nil && message.Link.Title != "" && message.Link.Description == "" && message.Link.LinkURL == "" && message.Link.ImageURL == "" {
+				err = errInboundMediaNotReady
+			}
 		}
 		if err != nil {
 			if !errors.Is(err, errInboundMediaNotReady) {
