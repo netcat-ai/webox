@@ -1,14 +1,16 @@
 # Webox
 
-在 Docker 中运行 Linux 微信，并通过 HTTP 接口连接
-[`aicat`](https://github.com/netcat-ai/aicat)。消息由真实微信客户端收发；Webox 不修改微信，也不代理微信流量。
+在 Docker 中运行 Linux 微信，并把真实客户端投影成供自动化程序调用的 HTTP 接口。
+消息由真实微信客户端收发；Webox 不修改微信，也不代理微信流量。
+
+Webox 是底层微信适配器，不是完整的机器人产品。它不包含 agent runtime、触发规则、prompt、模型调用或自动回复逻辑；HTTP 消费端负责轮询消息、决定是否处理并调用发送接口回复。
 
 ## 工作原理
 
 - 收消息：读取 Linux 微信本地数据库，把文本、链接、图片和文件转换为 Webox 消息。
 - 发消息：根据 `roomid` 定位私聊或群聊，通过微信 UI 依次发送文本、图片和文件。
 - 确认发送：再次读取本地数据库，确认消息已出现在正确会话中。
-- 交换媒体：通过宿主机挂载的 `/webox/state/media` 在 Webox、aicat 和 Codex 之间共享文件。
+- 交换媒体：通过宿主机挂载的 `/webox/state/media` 在 Webox 和 HTTP 消费端之间共享文件。
 
 ## 风险提示
 
@@ -21,7 +23,7 @@ Webox 不是微信官方产品，并使用 UI 自动化操作微信。微信更�
 
 ## 启动与登录
 
-准备 Docker、aicat 和一个专门给 Webox 使用的微信账号。克隆仓库后启动容器：
+准备 Docker 和一个专门给 Webox 使用的微信账号。克隆仓库后启动容器：
 
 ```bash
 cp .env.example .env
@@ -40,31 +42,17 @@ http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale
 curl http://127.0.0.1:38080/healthz
 ```
 
-返回值中的 `ready` 为 `true` 表示微信数据库和主界面已经完成初始化。给需要交给 aicat 处理的联系人或群聊设置以 `webox.` 开头的备注，例如 `webox.test`。
+返回值中的 `ready` 为 `true` 表示微信数据库和主界面已经完成初始化。给需要接收入站消息的联系人或群聊设置以 `webox.` 开头的备注，例如 `webox.test`。
 
-## 接入 aicat
+## 接入 HTTP 消费端
 
-在 `~/.aicat/aicat.yaml` 的 `claw.agents` 中配置 Webox。`tokenFile` 和 `sharedDir` 都必须是宿主机绝对路径：
+Webox token 位于宿主机状态目录的 `weagent/api-token`，默认对应 `./data/state/weagent/api-token`。除 `/healthz` 外，请求都必须携带以下 headers：
 
-```yaml
-version: 1
-
-claw:
-  agents:
-    - id: personal
-      wechatID: jlyfish
-      url: http://127.0.0.1:38080
-      tokenFile: /absolute/path/to/webox/data/state/weagent/api-token
-      sharedDir: /absolute/path/to/webox/data/state/media
-      trigger:
-        regex:
-          enabled: true
-          pattern: '^\\s*虾虾'
-        chat:
-          enabled: false
+```http
+AuthorizationType: ilink_bot_token
+Authorization: Bearer <token>
+X-WECHAT-UIN: <non-empty-client-id>
 ```
-
-`claw.agents` 非空时，`aicat serve` 会自动启用 Claw。`wechatID` 是当前账号可见的微信号；aicat 会在 polling 前通过 Webox 核对账号身份。详细配置见 [aicat README](https://github.com/netcat-ai/aicat#readme)。
 
 Webox 提供以下 HTTP 接口：
 
@@ -76,12 +64,36 @@ Webox 提供以下 HTTP 接口：
 | `POST` | `/ilink/bot/getupdates` | 长轮询接收消息 |
 | `POST` | `/ilink/bot/sendmessage` | 发送文本、图片和文件 |
 
-除 `/healthz` 外，其余接口使用 `state/weagent/api-token` 中的 token 鉴权。
 `contacts` 只做 `remark` 精确匹配，并返回未删除记录；`contacts` 数组保留重复备注，调用方可以据此拒绝不唯一的发送目标。
+
+首次调用 `getupdates` 时传入空游标：
+
+```json
+{"get_updates_buf":""}
+```
+
+响应中的 `get_updates_buf` 是带签名的 opaque 游标，消费端应原样持久化并用于下一次请求。收到的 `msgs` 使用 `msgid` 去重；私聊和群聊都以非空 `roomid` 标识，群聊 ID 以 `@chatroom` 结尾，`tolist` 当前固定为空。
+
+发送文本时，将接收消息或 `contacts` 查询得到的 `roomid` 原样传回：
+
+```json
+{
+  "msgs": [
+    {
+      "msgid": "client-message-1",
+      "roomid": "target-roomid",
+      "tolist": [],
+      "msgtype": "text",
+      "text": {"content": "你好"}
+    }
+  ]
+}
+```
+
+图片和文件通过宿主机状态目录的 `media/inbox`、`media/outbox` 交换，消息中的 `sdkfileid` 使用相对于 `media` 的路径。完整字段语义和可靠性限制见 [架构说明](docs/architecture.md)。
 
 ## 参考与致谢
 
-- [aicat](https://github.com/netcat-ai/aicat)
 - [WechatOnCloud](https://github.com/Gloridust/WechatOnCloud)
 - [wx-cli](https://github.com/jackwener/wx-cli)
 - [SQLCipher](https://github.com/sqlcipher/sqlcipher)

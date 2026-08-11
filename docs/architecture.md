@@ -2,11 +2,11 @@
 
 `webox` 只解决一个问题：
 
-> 在单个容器里运行 Linux WeChat，并把真实客户端投影成供 aicat 使用的 HTTP 接口。
+> 在单个容器里运行 Linux WeChat，并把真实客户端投影成供自动化程序使用的 HTTP 接口。
 
 ## 设计原则
 
-1. 对外只保留 aicat 和验收工具实际使用的 HTTP 接口，不维持通用 iLink 兼容面。
+1. 对外只保留 HTTP 消费端和验收工具实际使用的接口，不维持通用 iLink 兼容面。
 2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
 3. WeChat Linux 客户端是真实终端：收消息读本地 DB，发消息驱动客户端 UI。
 4. WeChat DB 是消息事实源，不复制一套业务消息库。
@@ -16,7 +16,7 @@
 
 ```mermaid
 flowchart LR
-  Aicat["aicat Claw"] -->|"Webox HTTP"| Adapter["Go HTTP adapter"]
+  Consumer["HTTP consumer"] -->|"Webox HTTP"| Adapter["Go HTTP adapter"]
   Adapter --> DBScanner["wechatdb scanner"]
   DBScanner --> WXDB["WeChat local DB"]
   Adapter --> UISender["sender"]
@@ -150,6 +150,7 @@ Webox 只暴露以下接口：
 ## 非目标
 
 - 不实现企业微信 AI Bot、XML/Webhook 或通用消息中台协议。
+- 不提供 agent runtime、触发规则、prompt、模型调用或自动回复策略。
 - 不维护独立用户、会话或消息事实库。
 - 不从 WeChat 网络流量解析登录或聊天消息。
 - 不通过 HTTP 分发登录二维码或管理登录会话。
