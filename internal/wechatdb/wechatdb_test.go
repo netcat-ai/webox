@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/netcat-ai/webox/wecom"
@@ -338,12 +339,35 @@ func TestEnabledRoomSessionsUsesRemarkAndLatestLocalID(t *testing.T) {
 	mustExec(t, session, "CREATE TABLE SessionTable (username TEXT, last_msg_locald_id INTEGER)")
 	mustExec(t, session, "INSERT INTO SessionTable VALUES ('enabled', 123), ('enabled-2', 321), ('spaced', 654), ('disabled', 456), ('deleted', 789), ('missing', 999)")
 
-	sessions, err := enabledRoomSessionsFromDB(contact, session)
+	store := &Store{dbs: map[string]*sql.DB{
+		"contact/contact.db": contact,
+		"session/session.db": session,
+	}}
+	sessions, err := store.EnabledRoomSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(sessions) != 2 || sessions["enabled"] != 123 || sessions["enabled-2"] != 321 {
 		t.Fatalf("sessions=%v", sessions)
+	}
+	mustExec(t, contact, "INSERT INTO contact VALUES ('new', 'webox.new', 0)")
+	mustExec(t, session, "UPDATE SessionTable SET last_msg_locald_id=124 WHERE username='enabled'")
+	mustExec(t, session, "INSERT INTO SessionTable VALUES ('new', 999)")
+
+	sessions, err = store.EnabledRoomSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 || sessions["enabled"] != 124 {
+		t.Fatalf("cached sessions=%v", sessions)
+	}
+	store.enabledRoomsExpires = time.Time{}
+	sessions, err = store.EnabledRoomSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 3 || sessions["new"] != 999 {
+		t.Fatalf("refreshed sessions=%v", sessions)
 	}
 }
 
@@ -353,14 +377,10 @@ func TestEnabledRoomSessionsSkipsSessionQueryWithoutEnabledContacts(t *testing.T
 		t.Fatal(err)
 	}
 	defer func() { _ = contact.Close() }()
-	session, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "session.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = session.Close() }()
 	mustExec(t, contact, "CREATE TABLE contact (username TEXT, remark TEXT, delete_flag INTEGER)")
 
-	sessions, err := enabledRoomSessionsFromDB(contact, session)
+	store := &Store{dbs: map[string]*sql.DB{"contact/contact.db": contact}}
+	sessions, err := store.EnabledRoomSessions()
 	if err != nil {
 		t.Fatal(err)
 	}

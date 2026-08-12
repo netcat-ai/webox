@@ -69,7 +69,8 @@ POST getupdates(rooms[roomid].seq)
 请求中已有 Room 使用消费者提交的 `seq`；新发现的 `webox.` Room 从
 `max(0, SessionTable.last_msg_locald_id-100)` 开始。长轮询最多等待 35 秒，一旦任意 Room 有 ready 消息即返回；
 没有更新的 Room 不出现在响应中。同一个旧 `seq` 可重新读取相同消息，消费者必须在持久化成功后才推进进度。
-数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
+`webox.` Room 的 username 列表缓存 30 秒，`SessionTable` 中的最新 `local_id` 仍在每次轮询时读取。数据库连接由
+SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
 
 主要字段映射：
 

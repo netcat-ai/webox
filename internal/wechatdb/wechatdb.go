@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	hexPatternLength   = 96
-	chunkSize          = 2 * 1024 * 1024
-	pageSize           = 4096
-	saltSize           = 16
-	fileAppMessageType = 6
+	hexPatternLength    = 96
+	chunkSize           = 2 * 1024 * 1024
+	pageSize            = 4096
+	saltSize            = 16
+	fileAppMessageType  = 6
+	enabledRoomCacheTTL = 30 * time.Second
 )
 
 type InitData struct {
@@ -95,11 +96,13 @@ type keyEntry struct {
 }
 
 type Store struct {
-	dbDir   string
-	keys    map[string]string
-	mu      sync.Mutex
-	dbs     map[string]*sql.DB
-	sources map[string]messageShard
+	dbDir               string
+	keys                map[string]string
+	mu                  sync.Mutex
+	dbs                 map[string]*sql.DB
+	sources             map[string]messageShard
+	enabledRooms        []string
+	enabledRoomsExpires time.Time
 }
 
 type messageShard struct {
@@ -232,13 +235,25 @@ func (store *Store) ValidateSessionDB() error {
 }
 
 func (store *Store) EnabledRoomSessions() (map[string]int64, error) {
-	contactDB, found, err := store.database("contact/contact.db")
-	if err != nil {
-		return nil, err
+	now := time.Now()
+	if !now.Before(store.enabledRoomsExpires) {
+		contactDB, found, err := store.database("contact/contact.db")
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, errors.New("contact database not found")
+		}
+		store.enabledRooms, err = loadEnabledRooms(contactDB)
+		if err != nil {
+			return nil, err
+		}
+		store.enabledRoomsExpires = now.Add(enabledRoomCacheTTL)
 	}
-	if !found {
-		return nil, errors.New("contact database not found")
+	if len(store.enabledRooms) == 0 {
+		return map[string]int64{}, nil
 	}
+
 	sessionDB, found, err := store.database("session/session.db")
 	if err != nil {
 		return nil, err
@@ -246,7 +261,7 @@ func (store *Store) EnabledRoomSessions() (map[string]int64, error) {
 	if !found {
 		return nil, errors.New("session database not found")
 	}
-	return enabledRoomSessionsFromDB(contactDB, sessionDB)
+	return loadRoomSessions(sessionDB, store.enabledRooms)
 }
 
 func (store *Store) MessagesForRoom(roomID string, after int64, limit int) ([]wecom.Message, error) {
@@ -283,50 +298,48 @@ func (store *Store) messageSource(roomID string) (messageShard, bool, error) {
 	return shards[0], true, nil
 }
 
-func enabledRoomSessionsFromDB(contactDB, sessionDB *sql.DB) (map[string]int64, error) {
-	contactRows, err := contactDB.Query(
-		"SELECT username FROM contact WHERE delete_flag=0 AND remark LIKE 'webox.%' ORDER BY username",
-	)
+func loadEnabledRooms(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT username FROM contact WHERE delete_flag=0 AND remark LIKE 'webox.%'")
 	if err != nil {
 		return nil, err
 	}
-	defer contactRows.Close()
-	names := make([]any, 0)
-	var placeholders strings.Builder
-	for contactRows.Next() {
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
 		var username string
-		if err := contactRows.Scan(&username); err != nil {
+		if err := rows.Scan(&username); err != nil {
 			return nil, err
 		}
 		names = append(names, username)
+	}
+	return names, rows.Err()
+}
+
+func loadRoomSessions(db *sql.DB, names []string) (map[string]int64, error) {
+	arguments := make([]any, len(names))
+	var placeholders strings.Builder
+	for index, name := range names {
+		arguments[index] = name
 		placeholders.WriteString("?,")
 	}
-	if err := contactRows.Err(); err != nil {
-		return nil, err
-	}
-	if len(names) == 0 {
-		return map[string]int64{}, nil
-	}
-
-	placeholderList := placeholders.String()[:placeholders.Len()-1]
-	sessionRows, err := sessionDB.Query(
-		"SELECT username, last_msg_locald_id FROM SessionTable WHERE last_msg_locald_id > 0 AND username IN ("+placeholderList+")",
-		names...,
+	rows, err := db.Query(
+		"SELECT username, last_msg_locald_id FROM SessionTable WHERE last_msg_locald_id > 0 AND username IN ("+placeholders.String()[:placeholders.Len()-1]+")",
+		arguments...,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer sessionRows.Close()
+	defer rows.Close()
 	sessions := make(map[string]int64, len(names))
-	for sessionRows.Next() {
+	for rows.Next() {
 		var username string
 		var lastMessageLocalID int64
-		if err := sessionRows.Scan(&username, &lastMessageLocalID); err != nil {
+		if err := rows.Scan(&username, &lastMessageLocalID); err != nil {
 			return nil, err
 		}
 		sessions[username] = lastMessageLocalID
 	}
-	return sessions, sessionRows.Err()
+	return sessions, rows.Err()
 }
 
 func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, error) {
