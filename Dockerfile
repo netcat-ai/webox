@@ -10,8 +10,11 @@ COPY internal ./internal
 COPY wecom ./wecom
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    mkdir -p /out && \
-    CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -extldflags=-s" -o /out/weagent ./cmd/weagent
+    mkdir -p /out/lib && \
+    CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -extldflags=-s" -o /out/weagent ./cmd/weagent && \
+    if [ "$(go env GOARCH)" = "amd64" ]; then \
+      find /go/pkg/mod/github.com -name libWeWorkFinanceSdk_C.so -exec cp {} /out/lib/ \; ; \
+    fi
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS novnc-assets
 RUN apt-get update && \
@@ -25,7 +28,8 @@ ARG APT_DEBIAN_SECURITY_MIRROR=
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=zh_CN.UTF-8 \
     LC_ALL=zh_CN.UTF-8 \
-    LIBGL_ALWAYS_SOFTWARE=1
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    LD_LIBRARY_PATH=/webox/weagent/lib
 
 RUN set -eux; \
     if [ -n "$APT_DEBIAN_MIRROR" ] && [ -f /etc/apt/sources.list.d/debian.sources ]; then \
@@ -79,6 +83,7 @@ RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
 FROM runtime-wechat AS runtime
 
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
+COPY --from=build /out/lib/ /webox/weagent/lib/
 COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
 
 RUN chmod 755 /webox/weagent/bin/weagent /webox/weagent/bin/*.sh && \

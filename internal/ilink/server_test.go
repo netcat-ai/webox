@@ -100,6 +100,24 @@ type fakeSender struct {
 	err        error
 }
 
+type fakeUpdates struct {
+	initialized bool
+	userInfo    wechat.UserInfo
+	cursors     map[string]int64
+	limit       int
+	rooms       map[string][]wecom.Message
+}
+
+func (source *fakeUpdates) IsInitialized() bool { return source.initialized }
+func (source *fakeUpdates) UserInfo() (wechat.UserInfo, error) {
+	return source.userInfo, nil
+}
+func (source *fakeUpdates) GetUpdates(_ context.Context, cursors map[string]int64, limit int) (map[string][]wecom.Message, error) {
+	source.cursors = cursors
+	source.limit = limit
+	return source.rooms, nil
+}
+
 func (service *fakeSender) Send(_ context.Context, target string, items []sender.Item) (sender.Receipt, error) {
 	service.calls++
 	service.target = target
@@ -220,6 +238,34 @@ func TestGetUpdatesUsesPerRoomSequencesAndDiscoversNewRooms(t *testing.T) {
 	}
 	if len(messages.queries) != 2 || messages.queries[0] != (roomQuery{roomID: "room-1", after: 7, limit: 100}) || messages.queries[1] != (roomQuery{roomID: "room-3", after: 50, limit: 100}) {
 		t.Fatalf("queries=%+v", messages.queries)
+	}
+}
+
+func TestGetUpdatesKeepsHTTPContractForProjectedSource(t *testing.T) {
+	source := &fakeUpdates{
+		initialized: true,
+		userInfo:    wechat.UserInfo{AccountID: "alice", WeChatID: "archive"},
+		rooms: map[string][]wecom.Message{
+			"wr-group@chatroom": {{
+				MsgID: "message", Action: wecom.ActionSend, From: "bob", ToList: []string{"alice"},
+				RoomID: "wr-group@chatroom", MsgTime: 1, MsgType: wecom.MessageTypeText,
+				Text: &wecom.Text{Content: "hello"}, Sequence: 15,
+			}},
+		},
+	}
+	server := NewWithUpdates("api-token", source, source, &fakeSender{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
+		"rooms": map[string]any{"old-room": map[string]any{"seq": 12}},
+	}, true)
+	body := responseJSON(t, response)
+	rooms := body["rooms"].(map[string]any)
+	message := messagesForTest(t, rooms["wr-group@chatroom"])[0]
+	if response.Code != http.StatusOK || body["ret"] != float64(0) || body["longpolling_timeout_ms"] != float64(35000) ||
+		message["roomid"] != "wr-group@chatroom" || message["seq"] != float64(15) {
+		t.Fatalf("status=%d body=%#v", response.Code, body)
+	}
+	if source.limit != getUpdatesLimit || source.cursors["old-room"] != 12 {
+		t.Fatalf("limit=%d cursors=%v", source.limit, source.cursors)
 	}
 }
 

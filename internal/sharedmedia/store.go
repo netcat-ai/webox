@@ -72,6 +72,14 @@ func (store *Store) CopyInboxFile(roomID, messageID, filename, sourcePath string
 	return store.writeInbox(roomID, filepath.Join(messageIDHash(messageID), filename), source)
 }
 
+func (store *Store) WriteInboxFile(roomID, messageID, filename string, data []byte) (string, error) {
+	filename = safeFilename(filename)
+	if filename == "" {
+		return "", errors.New("incoming file has an invalid filename")
+	}
+	return store.writeInbox(roomID, filepath.Join(messageIDHash(messageID), filename), bytes.NewReader(data))
+}
+
 func (store *Store) writeInbox(roomID, name string, source io.Reader) (string, error) {
 	roomDirectory, err := store.RoomDirectory(roomID)
 	if err != nil {

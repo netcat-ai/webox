@@ -1,11 +1,12 @@
 # Webox
 
 **Room Incremental Update（Room 增量更新）**：
-Webox 根据消费者提交的每个 Room `seq`，从微信事实源返回该 Room 的有序新增消息。进度由消费者持久化，Webox
-不维护全局 cursor 或 Agent Context Log。
+Webox 根据消费者提交的每个 Room `seq`，从 WeChat DB 或企业微信 Finance 实时来源返回该 Room 的有序新增消息；
+两种来源共用 `getupdates`。进度由消费者持久化，Webox 不维护全局 cursor 或 Agent Context Log，Finance 来源也不
+持久化消息。
 _Avoid_：全局消息队列、opaque polling cursor、Webox 消费 checkpoint
 
-**Room Source Location（Room 数据源位置）**：
+**WeChat Room Source Location（WeChat Room 数据源位置）**：
 一个 Room 在微信本地消息存储中的实际物理位置；它是微信数据库布局的一部分，不由 Webox 自行规定。
 _Avoid_：推测的分库位置、Room 消费进度
 

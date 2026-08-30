@@ -26,14 +26,30 @@ const (
 	inboundMediaWait   = time.Minute
 )
 
-type messageSource interface {
+type sessionSource interface {
 	IsInitialized() bool
 	UserInfo() (wechat.UserInfo, error)
+}
+
+type contactSource interface {
 	ContactsByRemark(string) ([]wechatdb.Contact, error)
+}
+
+type roomMessageSource interface {
 	RoomSessions() (map[string]int64, error)
 	RoomMessages(string, int64, int) ([]wecom.Message, error)
 	ReadImage(string, int64, int64, string) (*wechatdb.MediaFile, error)
 	ReadFile(string, int64, int64, string) (*wechatdb.LocalFile, error)
+}
+
+type messageSource interface {
+	sessionSource
+	contactSource
+	roomMessageSource
+}
+
+type updateSource interface {
+	GetUpdates(context.Context, map[string]int64, int) (map[string][]wecom.Message, error)
 }
 
 type messageSender interface {
@@ -43,7 +59,10 @@ type messageSender interface {
 type Server struct {
 	apiToken string
 	media    *sharedmedia.Store
-	messages messageSource
+	session  sessionSource
+	contacts contactSource
+	rooms    roomMessageSource
+	updates  updateSource
 	sender   messageSender
 	logger   *slog.Logger
 
@@ -73,7 +92,21 @@ func New(apiToken string, media *sharedmedia.Store, messages messageSource, send
 	return &Server{
 		apiToken:     apiToken,
 		media:        media,
-		messages:     messages,
+		session:      messages,
+		contacts:     messages,
+		rooms:        messages,
+		sender:       sender,
+		logger:       logger,
+		pollTimeout:  getUpdatesTimeout,
+		pollInterval: getUpdatesInterval,
+	}
+}
+
+func NewWithUpdates(apiToken string, session sessionSource, updates updateSource, sender messageSender, logger *slog.Logger) *Server {
+	return &Server{
+		apiToken:     apiToken,
+		session:      session,
+		updates:      updates,
 		sender:       sender,
 		logger:       logger,
 		pollTimeout:  getUpdatesTimeout,
@@ -110,16 +143,16 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 			return
 		}
 	}
-	if !server.messages.IsInitialized() {
+	if !server.session.IsInitialized() {
 		writeJSON(response, http.StatusOK, sessionUnavailable())
 		return
 	}
 
 	deadline := time.Now().Add(server.pollTimeout)
 	for {
-		updates, err := server.updatedRooms(body.Rooms)
+		updates, err := server.updatedRooms(request.Context(), body.Rooms)
 		if err != nil {
-			server.logger.Warn("WeChat room polling failed", "error", err)
+			server.logger.Warn("message polling failed", "error", err)
 			writeJSON(response, http.StatusOK, sessionUnavailable())
 			return
 		}
@@ -133,15 +166,33 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		if !waitRequest(request.Context(), server.pollInterval) {
 			return
 		}
-		if !server.messages.IsInitialized() {
+		if !server.session.IsInitialized() {
 			writeJSON(response, http.StatusOK, sessionUnavailable())
 			return
 		}
 	}
 }
 
-func (server *Server) updatedRooms(cursors map[string]roomCursor) (map[string]roomUpdates, error) {
-	sessions, err := server.messages.RoomSessions()
+func (server *Server) updatedRooms(ctx context.Context, cursors map[string]roomCursor) (map[string]roomUpdates, error) {
+	if server.updates != nil {
+		sequences := make(map[string]int64, len(cursors))
+		for roomID, cursor := range cursors {
+			sequences[roomID] = cursor.Sequence
+		}
+		messages, err := server.updates.GetUpdates(ctx, sequences, getUpdatesLimit)
+		if err != nil {
+			return nil, err
+		}
+		updates := make(map[string]roomUpdates, len(messages))
+		for roomID, roomMessages := range messages {
+			if len(roomMessages) != 0 {
+				updates[roomID] = roomUpdates{Messages: roomMessages}
+			}
+		}
+		return updates, nil
+	}
+
+	sessions, err := server.rooms.RoomSessions()
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +213,7 @@ func (server *Server) updatedRooms(cursors map[string]roomCursor) (map[string]ro
 		if latest <= after {
 			continue
 		}
-		messages, err := server.messages.RoomMessages(roomID, after, getUpdatesLimit)
+		messages, err := server.rooms.RoomMessages(roomID, after, getUpdatesLimit)
 		if err != nil {
 			server.logger.Warn("could not read WeChat Room messages", "roomid", roomID, "seq", after, "error", err)
 			continue
@@ -213,18 +264,18 @@ func (server *Server) readyRoomMessages(roomID string, messages []wecom.Message)
 }
 
 func (server *Server) health(response http.ResponseWriter, _ *http.Request) {
-	writeJSON(response, http.StatusOK, map[string]any{"ok": true, "ready": server.messages.IsInitialized()})
+	writeJSON(response, http.StatusOK, map[string]any{"ok": true, "ready": server.session.IsInitialized()})
 }
 
 func (server *Server) getUserInfo(response http.ResponseWriter, request *http.Request) {
 	if !server.authenticate(response, request) {
 		return
 	}
-	if !server.messages.IsInitialized() {
+	if !server.session.IsInitialized() {
 		writeJSON(response, http.StatusOK, sessionUnavailable())
 		return
 	}
-	info, err := server.messages.UserInfo()
+	info, err := server.session.UserInfo()
 	if err != nil {
 		server.logger.Warn("could not read current WeChat account", "error", err)
 		writeJSON(response, http.StatusOK, sessionUnavailable())
@@ -260,11 +311,15 @@ func (server *Server) getContacts(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusBadRequest, "remark is required")
 		return
 	}
-	if !server.messages.IsInitialized() {
+	if !server.session.IsInitialized() {
 		writeJSON(response, http.StatusOK, sessionUnavailable())
 		return
 	}
-	contacts, err := server.messages.ContactsByRemark(remark)
+	if server.contacts == nil {
+		writeError(response, http.StatusNotImplemented, "contacts are not supported by this message source")
+		return
+	}
+	contacts, err := server.contacts.ContactsByRemark(remark)
 	if err != nil {
 		server.logger.Error("could not query WeChat contacts", "remark", remark, "error", err)
 		writeError(response, http.StatusInternalServerError, "could not query WeChat contacts")
@@ -282,7 +337,7 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
 	}
-	if !server.messages.IsInitialized() {
+	if !server.session.IsInitialized() {
 		writeJSON(response, http.StatusOK, sessionUnavailable())
 		return
 	}

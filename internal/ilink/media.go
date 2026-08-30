@@ -19,7 +19,7 @@ func (server *Server) materializeInboundImage(roomID string, message wecom.Messa
 	if server.media == nil {
 		return "", errors.New("shared media store is unavailable")
 	}
-	media, err := server.messages.ReadImage(roomID, message.Sequence, time.UnixMilli(message.MsgTime).Unix(), message.Image.MD5Sum)
+	media, err := server.rooms.ReadImage(roomID, message.Sequence, time.UnixMilli(message.MsgTime).Unix(), message.Image.MD5Sum)
 	if err != nil {
 		return "", fmt.Errorf("read WeChat image: %w", err)
 	}
@@ -37,7 +37,7 @@ func (server *Server) materializeInboundFile(roomID string, message wecom.Messag
 	if server.media == nil {
 		return nil, "", errors.New("shared media store is unavailable")
 	}
-	file, err := server.messages.ReadFile(roomID, message.Sequence, time.UnixMilli(message.MsgTime).Unix(), message.File.FileName)
+	file, err := server.rooms.ReadFile(roomID, message.Sequence, time.UnixMilli(message.MsgTime).Unix(), message.File.FileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("read WeChat file: %w", err)
 	}

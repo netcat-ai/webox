@@ -6,14 +6,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
+const (
+	MessageSourceWeChat       = "wechat"
+	MessageSourceWeComArchive = "wecom-archive"
+)
+
+type WeComArchive struct {
+	CorpID         string
+	Secret         string
+	PrivateKeyFile string
+	AccountID      string
+	WeChatID       string
+	Nickname       string
+	InitialSeq     uint64
+}
+
 type Config struct {
-	ListenAddr string
-	APIToken   string
-	StateDir   string
-	SharedDir  string
+	ListenAddr    string
+	APIToken      string
+	StateDir      string
+	SharedDir     string
+	MessageSource string
+	WeComArchive  WeComArchive
 }
 
 func Load() (Config, error) {
@@ -22,12 +40,55 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{
-		ListenAddr: normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
-		APIToken:   apiToken,
-		StateDir:   stateDir,
-		SharedDir:  envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
-	}, nil
+	configuration := Config{
+		ListenAddr:    normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
+		APIToken:      apiToken,
+		StateDir:      stateDir,
+		SharedDir:     envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
+		MessageSource: envOr("WEBOX_MESSAGE_SOURCE", MessageSourceWeChat),
+	}
+	switch configuration.MessageSource {
+	case MessageSourceWeChat:
+	case MessageSourceWeComArchive:
+		archive, err := loadWeComArchive()
+		if err != nil {
+			return Config{}, err
+		}
+		configuration.WeComArchive = archive
+	default:
+		return Config{}, fmt.Errorf("unsupported WEBOX_MESSAGE_SOURCE %q", configuration.MessageSource)
+	}
+	return configuration, nil
+}
+
+func loadWeComArchive() (WeComArchive, error) {
+	archive := WeComArchive{
+		CorpID:         os.Getenv("WEBOX_WECOM_ARCHIVE_CORP_ID"),
+		Secret:         os.Getenv("WEBOX_WECOM_ARCHIVE_SECRET"),
+		PrivateKeyFile: os.Getenv("WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE"),
+		AccountID:      os.Getenv("WEBOX_WECOM_ARCHIVE_ACCOUNT_ID"),
+		WeChatID:       os.Getenv("WEBOX_WECOM_ARCHIVE_WECHAT_ID"),
+		Nickname:       os.Getenv("WEBOX_WECOM_ARCHIVE_NICKNAME"),
+	}
+	for name, value := range map[string]string{
+		"WEBOX_WECOM_ARCHIVE_CORP_ID":          archive.CorpID,
+		"WEBOX_WECOM_ARCHIVE_SECRET":           archive.Secret,
+		"WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE": archive.PrivateKeyFile,
+		"WEBOX_WECOM_ARCHIVE_ACCOUNT_ID":       archive.AccountID,
+		"WEBOX_WECOM_ARCHIVE_WECHAT_ID":        archive.WeChatID,
+	} {
+		if value == "" {
+			return WeComArchive{}, fmt.Errorf("%s is required", name)
+		}
+	}
+	if value := os.Getenv("WEBOX_WECOM_ARCHIVE_INITIAL_SEQ"); value != "" {
+		sequence, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return WeComArchive{}, fmt.Errorf("parse WEBOX_WECOM_ARCHIVE_INITIAL_SEQ: %w", err)
+		}
+		archive.InitialSeq = sequence
+	}
+	return archive, nil
 }
 
 func loadOrCreateID(stateDir, filename, prefix string) (string, error) {

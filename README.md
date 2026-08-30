@@ -101,6 +101,25 @@ Webox 提供以下 HTTP 接口：
 图片和文件通过 `<state>/shared/rooms/<roomid>/` 下的 `inbox/`、`outbox/` 交换，消息中的 `sdkfileid`
 使用相对于 Room 目录的路径。完整字段语义和可靠性限制见 [架构说明](docs/architecture.md)。
 
+## 企业微信会话存档来源
+
+`linux/amd64` 镜像可以把企业微信会话存档实时投影到相同的 `userinfo`、`getupdates` 和
+`sendmessage` interface。设置以下环境变量即可切换来源：
+
+```text
+WEBOX_MESSAGE_SOURCE=wecom-archive
+WEBOX_WECOM_ARCHIVE_CORP_ID=<企业 ID>
+WEBOX_WECOM_ARCHIVE_SECRET=<会话存档 Secret>
+WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE=/webox/state/wecom-archive-private-key.pem
+WEBOX_WECOM_ARCHIVE_ACCOUNT_ID=<当前企业成员 userid>
+WEBOX_WECOM_ARCHIVE_WECHAT_ID=<aicat 校验的稳定身份>
+WEBOX_WECOM_ARCHIVE_INITIAL_SEQ=0
+```
+
+每次 `getupdates` 会取请求中最大的 Room `seq`，实时调用 Finance SDK，再把消息按 Room 返回；Webox
+不保存会话消息或消费 cursor。企业微信群 ID 会统一以 `@chatroom` 结尾，图片和文件仍写入 Shared
+Directory。当前来源只支持读取，`sendmessage` 会返回不支持错误。
+
 ## 参考与致谢
 
 - [WechatOnCloud](https://github.com/Gloridust/WechatOnCloud)

@@ -121,7 +121,11 @@ start_wechat() {
   register_critical wechat "$!"
 }
 
-start_display
-start_agent
-start_wechat
+if [ "${WEBOX_MESSAGE_SOURCE:-wechat}" = "wecom-archive" ]; then
+  start_agent
+else
+  start_display
+  start_agent
+  start_wechat
+fi
 wait_critical

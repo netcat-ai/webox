@@ -102,6 +102,25 @@ func TestCopyInboxAndResolveOutboxFile(t *testing.T) {
 	}
 }
 
+func TestWriteInboxFile(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedPath, err := store.WriteInboxFile("room", "message", "report.txt", []byte("contents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, filename, err := store.ResolveFile("room", sharedPath)
+	if err != nil || filename != "report.txt" {
+		t.Fatalf("resolved=%q filename=%q err=%v", resolved, filename, err)
+	}
+	if contents, err := os.ReadFile(resolved); err != nil || string(contents) != "contents" {
+		t.Fatalf("contents=%q err=%v", contents, err)
+	}
+}
+
 func TestRoomDirectoryRejectsUnsafeRoomID(t *testing.T) {
 	store, err := New(t.TempDir())
 	if err != nil {
