@@ -208,14 +208,14 @@ func dismissPostLoginOverlay() error {
 	return nil
 }
 
-func (state *State) RoomSessions() (map[string]int64, error) {
+func (state *State) RoomSessions(after int64) (map[string]int64, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := database.EnabledRoomSessions()
+	sessions, err := database.EnabledRoomSessions(after)
 	if err != nil {
 		return nil, state.dbError("read enabled WeChat sessions", err)
 	}
@@ -232,6 +232,25 @@ func (state *State) RoomMessages(roomID string, after int64, limit int) ([]wecom
 	messages, err := database.MessagesForRoom(roomID, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read WeChat Room messages: %w", err)
+	}
+	for index := range messages {
+		if messages[index].Outgoing {
+			messages[index].From = wxid
+		}
+	}
+	return messages, nil
+}
+
+func (state *State) RoomMessagesBySort(roomID string, after, before int64) ([]wecom.Message, error) {
+	state.dbMu.Lock()
+	defer state.dbMu.Unlock()
+	database, wxid, err := state.readyDatabase()
+	if err != nil {
+		return nil, err
+	}
+	messages, err := database.MessagesForRoomBySort(roomID, after, before)
+	if err != nil {
+		return nil, fmt.Errorf("read WeChat Room messages by sort_seq: %w", err)
 	}
 	for index := range messages {
 		if messages[index].Outgoing {

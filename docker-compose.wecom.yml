@@ -1,0 +1,36 @@
+services:
+  webox:
+    image: ${WEBOX_WECOM_IMAGE:-webox:wecom}
+    platform: linux/arm64
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - WEBOX_WECOM_ARCHIVE_CORP_ID=${WEBOX_WECOM_ARCHIVE_CORP_ID:?required}
+      - WEBOX_WECOM_ARCHIVE_SECRET=${WEBOX_WECOM_ARCHIVE_SECRET:?required}
+      - WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE=${WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE:?required}
+      - WEBOX_WECOM_ARCHIVE_ACCOUNT_ID=${WEBOX_WECOM_ARCHIVE_ACCOUNT_ID:?required}
+      - WEBOX_WECOM_ARCHIVE_WECHAT_ID=${WEBOX_WECOM_ARCHIVE_WECHAT_ID:?required}
+      - WEBOX_WECOM_ARCHIVE_NICKNAME=${WEBOX_WECOM_ARCHIVE_NICKNAME:-}
+      - WEBOX_WECOM_ARCHIVE_INITIAL_SEQ=${WEBOX_WECOM_ARCHIVE_INITIAL_SEQ:-0}
+    volumes:
+      - ${WEBOX_STATE_DIR:-./data/wecom-state}:/webox/state
+    ports:
+      - "${WEBOX_HTTP_HOST:-127.0.0.1}:${WEBOX_HTTP_PORT:-38080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 &&
+          grep -q '"ok":true' <&3
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"

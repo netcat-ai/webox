@@ -2,13 +2,13 @@
 
 `webox` 只解决一个问题：
 
-> 把 Linux WeChat 或企业微信会话存档投影成供自动化程序使用的同一组 HTTP 接口。
+> 用各自独立的轻量运行时，把 Linux WeChat 或企业微信会话存档投影成供自动化程序使用的同一组 HTTP 接口。
 
 ## 设计原则
 
 1. 对外只保留 HTTP 消费端和验收工具实际使用的接口，不维持通用 iLink 兼容面。
 2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
-3. WeChat 来源以 Linux 客户端为真实终端；企业微信来源实时调用 Finance SDK。
+3. `weagent` 以 Linux 微信客户端为真实终端；`wecomproxy` 独立实时调用 Finance SDK。
 4. WeChat DB 或企业微信会话存档是消息事实源，不复制一套业务消息库。
 5. 对发送结果采用同步、可验证语义，不在 UI 操作完成前返回成功。
 
@@ -19,7 +19,8 @@ flowchart LR
   Consumer["HTTP consumer"] -->|"Webox HTTP"| Adapter["Go HTTP adapter"]
   Adapter --> DBScanner["wechatdb scanner"]
   DBScanner --> WXDB["WeChat local DB"]
-  Adapter --> Archive["WeCom archive adapter"]
+  Consumer -->|"same Webox HTTP"| ArchiveProxy["wecomproxy"]
+  ArchiveProxy --> Archive["WeCom archive adapter"]
   Archive --> Finance["Finance SDK"]
   Adapter --> UISender["sender"]
   UISender --> Display["Xvfb + window manager"]
@@ -59,30 +60,35 @@ HTTP token 单独持久化。Webox 不再生成额外的 provider account ID；�
 ## 收消息
 
 ```text
-POST getupdates(rooms[roomid].seq)
-  -> WeChat: query encrypted DB by each Room seq
-     or WeCom archive: query Finance SDK by the largest submitted seq
-  -> map messages to ordered Webox messages grouped by Room
+POST getupdates(cursor)
+  -> WeChat: select sessions by last_timestamp and query sort_seq ranges
+     or WeCom archive: query Finance SDK by its global seq
+  -> merge messages into one ordered flat array
   -> decode/copy ready media into /webox/state/shared/rooms/<roomid>/inbox
-  -> return a sparse rooms map
+  -> return messages plus the consumed cursor
 ```
 
-两种来源共用同一个 `getupdates` 请求、响应和 `wecom.Message`。企业微信来源在每次请求中实时拉取、解密并按
-Room 分组，直接使用 Finance 全局 `seq`，不在 Webox 持久化消息或 cursor；群 Room ID 统一添加
-`@chatroom` 后缀。
+`weagent` 与 `wecomproxy` 共用同一个 `getupdates` 请求、响应和 `wecom.Message` contract，但运行在独立 binary
+和镜像中。企业微信代理直接使用 Finance 全局 `seq` 作为响应游标，不持久化消息或 cursor；群 Room ID 统一
+添加 `@chatroom` 后缀。响应消息是扁平数组，消费端按 `roomid` 分开处理。
 
-WeChat 来源中，请求已有 Room 使用消费者提交的 `seq`；新发现的 `webox.` Room 从
-`max(0, SessionTable.last_msg_locald_id-100)` 开始。长轮询最多等待 35 秒，一旦任意 Room 有 ready 消息即返回；
-没有更新的 Room 不出现在响应中。同一个旧 `seq` 可重新读取相同消息，消费者必须在持久化成功后才推进进度。
-`webox.` Room 的 username 列表缓存 30 秒，`SessionTable` 中的最新 `local_id` 仍在每次轮询时读取。数据库连接由
-SQLCipher 保持并直接读取微信的 DB/WAL，不再生成明文数据库缓存。
+企业微信明文消息不按 `msgtype` 白名单转换。代理保留未知信封字段、消息类型及对应消息体，只修改路由所需的
+`roomid`。它只在明确的媒体消息类型及 `mixed` 子项中处理 `sdkfileid`，通过 Finance SDK 下载媒体并换成
+Shared Directory 相对路径；
+如何保存、展示、提取文本或触发 Agent 由消费端决定。
+
+WeChat 来源把 `sort_seq` 用作全局合并游标。空游标从最近五天开始；先选择 `SessionTable.last_timestamp >=
+cursor/1000` 的会话，再以全局最大 `last_timestamp` 形成只包含完整秒的上界，查询
+`cursor < sort_seq < upper*1000`。每次响应最多推进一小时，候选消息只按唯一的 `sort_seq` 合并排序；Room
+之间不定义额外次序。数据库连接由 SQLCipher 保持并直接读取微信的 DB/WAL，不生成明文数据库缓存。
 
 WeChat DB 来源的主要字段映射：
 
 | 微信字段 | Webox 消息字段 |
 | --- | --- |
 | `msgid` | `msgid` |
-| `local_id` | `seq`；当前 Room 的增量读取位置 |
+| `sort_seq` | 跨 Room 合并排序与全局 cursor 的基础 |
+| `local_id` | Room 内媒体定位和消息读取所需的本地 ID，不参与合并排序 |
 | 实际发送者 | `from`；当前账号发出的消息使用登录账号 `account_id` |
 | `SessionTable.username` | `roomid`；私聊与群聊都非空 |
 | 暂不解析的 @ 接收者 | `tolist=[]` |
@@ -111,10 +117,10 @@ WeChat DB 来源的主要字段映射：
 本身也是 `reply`，消费者按需继续查找，不在单条消息中递归展开。引用媒体不会因为 `reply` 再次物化或阻塞当前消息。
 
 图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
-到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，`getupdates` 返回该 Room 在它之前的 ready 前缀并保留
-它之后的消息；其他 Room 不受阻塞。消费者只推进实际持久化消息的 `seq`。从微信消息时间起等待满 1 分钟仍
+到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，`getupdates` 可返回全局序列中它之前的 ready 前缀，
+但保持请求 cursor 不变；当前允许消费者重复追加重放消息。从微信消息时间起等待满 1 分钟仍
 不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。微信发送文件时可能先在同一
-`local_id` 写入只有标题的空链接占位，随后原地更新为文件消息；Webox 同样等待这种近期占位稳定后再推进 `seq`。
+`local_id` 写入只有标题的空链接占位，随后原地更新为文件消息；Webox 同样等待这种近期占位稳定后再推进 cursor。
 
 V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
 `libvoipCodec.so`，调用 `wxam_dec_wxam2pic_5` 输出 JPEG；加载 codec 前以 `RTLD_GLOBAL` 预载
@@ -137,7 +143,7 @@ POST sendmessage(msgs[text/image/file...])
 整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次有序 UI 发送批次：每条文本、图片和文件都通过剪贴板粘贴后立即按 Enter，
 不使用附件按钮、文件选择器或坐标点击。该批次不是原子操作，中途失败时前面的消息可能已经发出，调用方不能自动重试整个批次。
 HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
-企业微信 Finance SDK 仅提供读取能力，因此该来源的 `sendmessage` 当前返回明确的不支持错误。
+企业微信 Finance SDK 仅提供读取能力，因此 `wecomproxy` 的 `sendmessage` 当前返回明确的不支持错误。
 
 ## HTTP 接口
 
@@ -154,10 +160,10 @@ Webox 只暴露以下接口：
 ## 可靠性边界
 
 - WeChat DB 是持久事件源；企业微信来源实时读取 Finance，不在 Webox 持久化消息。
-- 消费进度是调用方提交的 `roomid -> seq`；Webox 不保存调用方 checkpoint。
-- WeChat 新 Room 默认只读取接近数据库末尾的 100 个 `local_id` 范围。
+- 消费进度是调用方提交的单一字符串 `cursor`；Webox 不保存调用方 checkpoint。
+- 空 cursor 默认读取最近五天；需要更久历史时，调用方可手动设置 cursor。
 - WeChat UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
-- `client_id` 由调用方标识出站消息；`msgid` 标识消息身份，`seq` 标识 Room 读取位置。
+- `client_id` 由调用方标识出站消息；`msgid` 标识消息身份，cursor 标识整个响应的消费位置。
 - WeChat 会话退出后，业务接口返回 `ret=-14`；使用者通过 noVNC 重新登录。
 
 ## 非目标
@@ -173,11 +179,13 @@ Webox 只暴露以下接口：
 ## Go 模块
 
 ```text
-cmd/weagent       process lifecycle and HTTP server
+cmd/weagent       personal WeChat process lifecycle and HTTP server
+cmd/wecomproxy    lightweight WeCom archive proxy lifecycle
 internal/config   persistent HTTP credentials and environment configuration
-internal/ilink    HTTP routes, authentication and message mapping
+internal/wechatapi personal WeChat HTTP routes, authentication and cursor merge
 internal/wechat   initialization and DB coordination
 internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher
-internal/wecomarchive project Finance archive messages into Room updates
+internal/wecomarchive decrypt and route Finance archive messages without type filtering
+internal/wecomproxy minimal archive HTTP routes and authentication
 internal/sender   serialized xdotool/xclip text sender and DB verification
 ```

@@ -323,7 +323,7 @@ func TestConvertMessagesReturnsName2IDQueryFailure(t *testing.T) {
 	}
 }
 
-func TestEnabledRoomSessionsUsesRemarkAndLatestLocalID(t *testing.T) {
+func TestEnabledRoomSessionsUsesRemarkAndLastTimestamp(t *testing.T) {
 	contact, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "contact.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -336,25 +336,32 @@ func TestEnabledRoomSessionsUsesRemarkAndLatestLocalID(t *testing.T) {
 	defer func() { _ = session.Close() }()
 	mustExec(t, contact, "CREATE TABLE contact (username TEXT, remark TEXT, delete_flag INTEGER)")
 	mustExec(t, contact, "INSERT INTO contact VALUES ('enabled', 'webox.jishu', 0), ('enabled-2', 'webox.test', 0), ('spaced', '  webox.invalid  ', 0), ('disabled', 'friend', 0), ('deleted', 'webox.old', 1)")
-	mustExec(t, session, "CREATE TABLE SessionTable (username TEXT, last_msg_locald_id INTEGER)")
+	mustExec(t, session, "CREATE TABLE SessionTable (username TEXT, last_timestamp INTEGER)")
 	mustExec(t, session, "INSERT INTO SessionTable VALUES ('enabled', 123), ('enabled-2', 321), ('spaced', 654), ('disabled', 456), ('deleted', 789), ('missing', 999)")
 
 	store := &Store{dbs: map[string]*sql.DB{
 		"contact/contact.db": contact,
 		"session/session.db": session,
 	}}
-	sessions, err := store.EnabledRoomSessions()
+	sessions, err := store.EnabledRoomSessions(0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(sessions) != 2 || sessions["enabled"] != 123 || sessions["enabled-2"] != 321 {
 		t.Fatalf("sessions=%v", sessions)
 	}
+	sessions, err = store.EnabledRoomSessions(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions["enabled-2"] != 321 {
+		t.Fatalf("updated sessions=%v", sessions)
+	}
 	mustExec(t, contact, "INSERT INTO contact VALUES ('new', 'webox.new', 0)")
-	mustExec(t, session, "UPDATE SessionTable SET last_msg_locald_id=124 WHERE username='enabled'")
+	mustExec(t, session, "UPDATE SessionTable SET last_timestamp=124 WHERE username='enabled'")
 	mustExec(t, session, "INSERT INTO SessionTable VALUES ('new', 999)")
 
-	sessions, err = store.EnabledRoomSessions()
+	sessions, err = store.EnabledRoomSessions(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +369,7 @@ func TestEnabledRoomSessionsUsesRemarkAndLatestLocalID(t *testing.T) {
 		t.Fatalf("cached sessions=%v", sessions)
 	}
 	store.enabledRoomsExpires = time.Time{}
-	sessions, err = store.EnabledRoomSessions()
+	sessions, err = store.EnabledRoomSessions(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +387,7 @@ func TestEnabledRoomSessionsSkipsSessionQueryWithoutEnabledContacts(t *testing.T
 	mustExec(t, contact, "CREATE TABLE contact (username TEXT, remark TEXT, delete_flag INTEGER)")
 
 	store := &Store{dbs: map[string]*sql.DB{"contact/contact.db": contact}}
-	sessions, err := store.EnabledRoomSessions()
+	sessions, err := store.EnabledRoomSessions(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +424,7 @@ func TestSQLCipherStoreReadsCommittedWALChanges(t *testing.T) {
 	defer func() { _ = writer.Close() }()
 	mustExec(t, writer, "PRAGMA journal_mode=WAL")
 	mustExec(t, writer, "PRAGMA wal_autocheckpoint=0")
-	mustExec(t, writer, "CREATE TABLE SessionTable (username TEXT PRIMARY KEY, last_msg_locald_id INTEGER)")
+	mustExec(t, writer, "CREATE TABLE SessionTable (username TEXT PRIMARY KEY, last_timestamp INTEGER)")
 	mustExec(t, writer, "INSERT INTO SessionTable VALUES ('alice', 100)")
 
 	store, err := Open(dbDir, map[string]string{"contact/contact.db": contactKey, "session/session.db": key})
@@ -425,13 +432,13 @@ func TestSQLCipherStoreReadsCommittedWALChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	state, err := store.EnabledRoomSessions()
+	state, err := store.EnabledRoomSessions(0)
 	if err != nil || state["alice"] != 100 {
 		t.Fatalf("initial sessions=%v err=%v", state, err)
 	}
 
-	mustExec(t, writer, "UPDATE SessionTable SET last_msg_locald_id=200 WHERE username='alice'")
-	state, err = store.EnabledRoomSessions()
+	mustExec(t, writer, "UPDATE SessionTable SET last_timestamp=200 WHERE username='alice'")
+	state, err = store.EnabledRoomSessions(0)
 	if err != nil || state["alice"] != 200 {
 		t.Fatalf("updated sessions=%v err=%v", state, err)
 	}

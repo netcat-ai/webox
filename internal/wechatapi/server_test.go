@@ -1,4 +1,4 @@
-package ilink
+package wechatapi
 
 import (
 	"bytes"
@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -23,7 +22,7 @@ import (
 type roomQuery struct {
 	roomID string
 	after  int64
-	limit  int
+	before int64
 }
 
 type fakeMessages struct {
@@ -34,6 +33,7 @@ type fakeMessages struct {
 	contactsErr  error
 	remark       string
 	sessions     map[string]int64
+	sessionAfter int64
 	rooms        map[string][]wecom.Message
 	queries      []roomQuery
 	media        map[string]*wechatdb.MediaFile
@@ -56,18 +56,25 @@ func (source *fakeMessages) ContactsByRemark(remark string) ([]wechatdb.Contact,
 	source.remark = remark
 	return source.contacts, source.contactsErr
 }
-func (source *fakeMessages) RoomSessions() (map[string]int64, error) {
-	return source.sessions, nil
+func (source *fakeMessages) RoomSessions(after int64) (map[string]int64, error) {
+	source.sessionAfter = after
+	sessions := make(map[string]int64)
+	for roomID, last := range source.sessions {
+		if last >= after {
+			sessions[roomID] = last
+		}
+	}
+	return sessions, nil
 }
 func (source *fakeMessages) RoomMessages(roomID string, after int64, limit int) ([]wecom.Message, error) {
-	source.queries = append(source.queries, roomQuery{roomID: roomID, after: after, limit: limit})
+	return nil, nil
+}
+func (source *fakeMessages) RoomMessagesBySort(roomID string, after, before int64) ([]wecom.Message, error) {
+	source.queries = append(source.queries, roomQuery{roomID: roomID, after: after, before: before})
 	var messages []wecom.Message
 	for _, message := range source.rooms[roomID] {
-		if message.Sequence > after {
+		if message.SortSequence > after && message.SortSequence < before {
 			messages = append(messages, message)
-		}
-		if len(messages) == limit {
-			break
 		}
 	}
 	return messages, nil
@@ -98,24 +105,6 @@ type fakeSender struct {
 	filePath   string
 	items      []sender.Item
 	err        error
-}
-
-type fakeUpdates struct {
-	initialized bool
-	userInfo    wechat.UserInfo
-	cursors     map[string]int64
-	limit       int
-	rooms       map[string][]wecom.Message
-}
-
-func (source *fakeUpdates) IsInitialized() bool { return source.initialized }
-func (source *fakeUpdates) UserInfo() (wechat.UserInfo, error) {
-	return source.userInfo, nil
-}
-func (source *fakeUpdates) GetUpdates(_ context.Context, cursors map[string]int64, limit int) (map[string][]wecom.Message, error) {
-	source.cursors = cursors
-	source.limit = limit
-	return source.rooms, nil
 }
 
 func (service *fakeSender) Send(_ context.Context, target string, items []sender.Item) (sender.Receipt, error) {
@@ -206,188 +195,41 @@ func TestCompatibilityRoutesAreRemoved(t *testing.T) {
 	}
 }
 
-func TestGetUpdatesUsesPerRoomSequencesAndDiscoversNewRooms(t *testing.T) {
+func TestGetUpdatesUsesGlobalSortCursorAndOneHourWindow(t *testing.T) {
 	server, messages, _ := testServer(t)
 	messages.initialized = true
-	messages.sessions = map[string]int64{
-		"room-1": 9,
-		"room-2": 10,
-		"room-3": 150,
-	}
+	server.now = func() time.Time { return time.Unix(20_000, 0) }
+	messages.sessions = map[string]int64{"room-a": 10_000, "room-b": 10_100}
 	messages.rooms = map[string][]wecom.Message{
-		"room-1": {{MsgID: "m8", RoomID: "room-1", MsgType: wecom.MessageTypeText, Text: &wecom.Text{Content: "one"}, Sequence: 8}},
-		"room-3": {{MsgID: "m51", RoomID: "room-3", MsgType: wecom.MessageTypeText, Text: &wecom.Text{Content: "new"}, Sequence: 51}},
+		"room-a": {{MsgID: "a", RoomID: "room-a", MsgType: "text", SortSequence: 10_001_000, Sequence: 2, Text: &wecom.Text{Content: "a"}}},
+		"room-b": {{MsgID: "b", RoomID: "room-b", MsgType: "text", SortSequence: 10_000_500, Sequence: 1, Text: &wecom.Text{Content: "b"}}},
 	}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{
-			"room-1": map[string]any{"seq": 7},
-			"room-2": map[string]any{"seq": 10},
-		},
-	}, true)
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"cursor": "9999999"}, true)
 	body := responseJSON(t, response)
-	rooms := body["rooms"].(map[string]any)
-	if response.Code != http.StatusOK || body["ret"] != float64(0) || len(rooms) != 2 {
-		t.Fatalf("status=%d body=%#v", response.Code, body)
+	items := body["messages"].([]any)
+	if len(items) != 2 || items[0].(map[string]any)["msgid"] != "b" || items[1].(map[string]any)["msgid"] != "a" {
+		t.Fatalf("body=%#v", body)
 	}
-	if _, exists := rooms["room-2"]; exists {
-		t.Fatalf("unchanged room was returned: %#v", rooms)
+	if body["cursor"] != "10100999" {
+		t.Fatalf("cursor=%v", body["cursor"])
 	}
-	if messagesForTest(t, rooms["room-1"])[0]["seq"] != float64(8) || messagesForTest(t, rooms["room-3"])[0]["seq"] != float64(51) {
-		t.Fatalf("rooms=%#v", rooms)
-	}
-	if len(messages.queries) != 2 || messages.queries[0] != (roomQuery{roomID: "room-1", after: 7, limit: 100}) || messages.queries[1] != (roomQuery{roomID: "room-3", after: 50, limit: 100}) {
-		t.Fatalf("queries=%+v", messages.queries)
+	if messages.sessionAfter != 9_999 {
+		t.Fatalf("session after=%d", messages.sessionAfter)
 	}
 }
 
-func TestGetUpdatesKeepsHTTPContractForProjectedSource(t *testing.T) {
-	source := &fakeUpdates{
-		initialized: true,
-		userInfo:    wechat.UserInfo{AccountID: "alice", WeChatID: "archive"},
-		rooms: map[string][]wecom.Message{
-			"wr-group@chatroom": {{
-				MsgID: "message", Action: wecom.ActionSend, From: "bob", ToList: []string{"alice"},
-				RoomID: "wr-group@chatroom", MsgTime: 1, MsgType: wecom.MessageTypeText,
-				Text: &wecom.Text{Content: "hello"}, Sequence: 15,
-			}},
-		},
-	}
-	server := NewWithUpdates("api-token", source, source, &fakeSender{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"old-room": map[string]any{"seq": 12}},
-	}, true)
-	body := responseJSON(t, response)
-	rooms := body["rooms"].(map[string]any)
-	message := messagesForTest(t, rooms["wr-group@chatroom"])[0]
-	if response.Code != http.StatusOK || body["ret"] != float64(0) || body["longpolling_timeout_ms"] != float64(35000) ||
-		message["roomid"] != "wr-group@chatroom" || message["seq"] != float64(15) {
-		t.Fatalf("status=%d body=%#v", response.Code, body)
-	}
-	if source.limit != getUpdatesLimit || source.cursors["old-room"] != 12 {
-		t.Fatalf("limit=%d cursors=%v", source.limit, source.cursors)
+func TestEmptyCursorStartsFiveDaysAgo(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	cursor, err := parseCursor("", now)
+	if err != nil || cursor != now.Add(-5*24*time.Hour).Unix()*1000-1 {
+		t.Fatalf("cursor=%d err=%v", cursor, err)
 	}
 }
 
-func TestGetUpdatesReturnsReadyPrefixesWithoutBlockingOtherRooms(t *testing.T) {
+func TestGetUpdatesRejectsInvalidCursor(t *testing.T) {
 	server, messages, _ := testServer(t)
 	messages.initialized = true
-	now := time.Now().UnixMilli()
-	messages.sessions = map[string]int64{"room-a": 3, "room-b": 1}
-	messages.rooms = map[string][]wecom.Message{
-		"room-a": {
-			{MsgID: "a1", RoomID: "room-a", MsgType: wecom.MessageTypeText, Text: &wecom.Text{Content: "ready"}, MsgTime: now, Sequence: 1},
-			{MsgID: "a2", RoomID: "room-a", MsgType: wecom.MessageTypeImage, Image: &wecom.Image{}, MsgTime: now, Sequence: 2},
-			{MsgID: "a3", RoomID: "room-a", MsgType: wecom.MessageTypeText, Text: &wecom.Text{Content: "blocked"}, MsgTime: now, Sequence: 3},
-		},
-		"room-b": {{MsgID: "b1", RoomID: "room-b", MsgType: wecom.MessageTypeText, Text: &wecom.Text{Content: "independent"}, MsgTime: now, Sequence: 1}},
-	}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{
-			"room-a": map[string]any{"seq": 0},
-			"room-b": map[string]any{"seq": 0},
-		},
-	}, true)
-	rooms := responseJSON(t, response)["rooms"].(map[string]any)
-	roomA := messagesForTest(t, rooms["room-a"])
-	roomB := messagesForTest(t, rooms["room-b"])
-	if len(roomA) != 1 || roomA[0]["msgid"] != "a1" || len(roomB) != 1 || roomB[0]["msgid"] != "b1" {
-		t.Fatalf("rooms=%#v", rooms)
-	}
-}
-
-func TestGetUpdatesWaitsForFilePlaceholderToStabilize(t *testing.T) {
-	server, messages, _ := testServer(t)
-	server.pollTimeout = time.Millisecond
-	messages.initialized = true
-	messages.sessions = map[string]int64{"room-a": 1}
-	messages.rooms = map[string][]wecom.Message{"room-a": {{
-		MsgID: "placeholder", RoomID: "room-a", MsgType: wecom.MessageTypeLink,
-		MsgTime: time.Now().UnixMilli(), Sequence: 1,
-		Link: &wecom.Link{Title: "report.txt"},
-	}}}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"room-a": map[string]any{"seq": 0}},
-	}, true)
-	if rooms := responseJSON(t, response)["rooms"].(map[string]any); len(rooms) != 0 {
-		t.Fatalf("rooms=%#v", rooms)
-	}
-
-	messages.rooms["room-a"][0].MsgTime = time.Now().Add(-inboundMediaWait - time.Second).UnixMilli()
-	response = perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"room-a": map[string]any{"seq": 0}},
-	}, true)
-	room := responseJSON(t, response)["rooms"].(map[string]any)["room-a"]
-	if message := messagesForTest(t, room)[0]; message["msgtype"] != wecom.MessageTypeLink {
-		t.Fatalf("message=%#v", message)
-	}
-}
-
-func TestGetUpdatesLocatesFileFromConvertedMessage(t *testing.T) {
-	server, messages, _ := testServer(t)
-	messages.initialized = true
-	createdAt := time.Now().UnixMilli()
-	path := filepath.Join(t.TempDir(), "stored-report.pdf")
-	if err := os.WriteFile(path, []byte("report"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	messages.sessions = map[string]int64{"room-a": 7}
-	messages.rooms = map[string][]wecom.Message{"room-a": {{
-		MsgID: "file-1", RoomID: "room-a", MsgType: wecom.MessageTypeFile,
-		MsgTime: createdAt, Sequence: 7, File: &wecom.File{FileName: "report.pdf"},
-	}}}
-	messages.files = map[string]*wechatdb.LocalFile{
-		"room-a/report.pdf": {Path: path, Filename: "report.pdf"},
-	}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"room-a": map[string]any{"seq": 6}},
-	}, true)
-	room := responseJSON(t, response)["rooms"].(map[string]any)["room-a"]
-	file := messagesForTest(t, room)[0]["file"].(map[string]any)
-	if response.Code != http.StatusOK || file["filename"] != "report.pdf" || file["sdkfileid"] == "" {
-		t.Fatalf("status=%d file=%#v", response.Code, file)
-	}
-	if messages.fileRoomID != "room-a" || messages.fileLocalID != 7 || messages.fileTime != time.UnixMilli(createdAt).Unix() || messages.fileName != "report.pdf" {
-		t.Fatalf("file query room=%q localID=%d time=%d name=%q", messages.fileRoomID, messages.fileLocalID, messages.fileTime, messages.fileName)
-	}
-}
-
-func TestGetUpdatesLocatesImageFromConvertedMessage(t *testing.T) {
-	server, messages, _ := testServer(t)
-	messages.initialized = true
-	createdAt := time.Now().UnixMilli()
-	md5sum := "0123456789abcdef0123456789abcdef"
-	messages.sessions = map[string]int64{"room-a": 8}
-	messages.rooms = map[string][]wecom.Message{"room-a": {{
-		MsgID: "image-1", RoomID: "room-a", MsgType: wecom.MessageTypeImage,
-		MsgTime: createdAt, Sequence: 8, Image: &wecom.Image{MD5Sum: md5sum},
-	}}}
-	messages.media = map[string]*wechatdb.MediaFile{
-		"room-a/" + md5sum: {Data: []byte("image"), ContentType: "image/png"},
-	}
-
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"room-a": map[string]any{"seq": 7}},
-	}, true)
-	room := responseJSON(t, response)["rooms"].(map[string]any)["room-a"]
-	image := messagesForTest(t, room)[0]["image"].(map[string]any)
-	if response.Code != http.StatusOK || image["sdkfileid"] == "" {
-		t.Fatalf("status=%d image=%#v", response.Code, image)
-	}
-	if messages.imageRoomID != "room-a" || messages.imageLocalID != 8 || messages.imageTime != time.UnixMilli(createdAt).Unix() || messages.imageMD5 != md5sum {
-		t.Fatalf("image query room=%q localID=%d time=%d md5=%q", messages.imageRoomID, messages.imageLocalID, messages.imageTime, messages.imageMD5)
-	}
-}
-
-func TestGetUpdatesRejectsNegativeSequence(t *testing.T) {
-	server, messages, _ := testServer(t)
-	messages.initialized = true
-	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{
-		"rooms": map[string]any{"room-a": map[string]any{"seq": -1}},
-	}, true)
+	response := perform(server, http.MethodPost, "/ilink/bot/getupdates", map[string]any{"cursor": "bad"}, true)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}

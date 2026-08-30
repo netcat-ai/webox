@@ -8,13 +8,22 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY wecom ./wecom
+COPY docker/wecom/sdk_arm_v3_20250205.tgz /tmp/sdk_arm_v3_20250205.tgz
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    echo 'f8f29e52737740aacc34f64a52be8f2cc48a4bbcb3482880297d9eaac6c54671  /tmp/sdk_arm_v3_20250205.tgz' | sha256sum -c - && \
+    sdk_dir="$(go list -m -f '{{.Dir}}' github.com/NICEXAI/WeWorkFinanceSDK)" && \
+    if [ "$(go env GOARCH)" = "arm64" ]; then \
+      mkdir -p /tmp/wecom-sdk && \
+      tar -xzf /tmp/sdk_arm_v3_20250205.tgz -C /tmp/wecom-sdk && \
+      test "$(cat /tmp/wecom-sdk/C_sdk/version.txt)" = "20250205" && \
+      cp /tmp/wecom-sdk/C_sdk/libWeWorkFinanceSdk_C.so "$sdk_dir/lib/" && \
+      cp /tmp/wecom-sdk/C_sdk/WeWorkFinanceSdk_C.h "$sdk_dir/lib/"; \
+    fi && \
     mkdir -p /out/lib && \
     CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -extldflags=-s" -o /out/weagent ./cmd/weagent && \
-    if [ "$(go env GOARCH)" = "amd64" ]; then \
-      find /go/pkg/mod/github.com -name libWeWorkFinanceSdk_C.so -exec cp {} /out/lib/ \; ; \
-    fi
+    CGO_ENABLED=1 go build -trimpath -ldflags="-s -w -extldflags=-s" -o /out/wecomproxy ./cmd/wecomproxy && \
+    cp "$sdk_dir/lib/libWeWorkFinanceSdk_C.so" /out/lib/
 
 FROM ${DEBIAN_RUNTIME_IMAGE} AS novnc-assets
 RUN apt-get update && \
@@ -93,3 +102,29 @@ VOLUME ["/webox/state"]
 EXPOSE 8080 6080
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/webox/weagent/bin/entrypoint.sh"]
+
+# The archive proxy has no desktop WeChat, SQLCipher, X11, noVNC, clipboard or
+# UI sender dependency. It intentionally starts from the plain Debian image.
+FROM ${DEBIAN_RUNTIME_IMAGE} AS runtime-wecom
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LD_LIBRARY_PATH=/webox/wecomproxy/lib
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates gosu tini tzdata zlib1g && \
+    useradd -M -d /webox/state/home -u 1000 -s /usr/sbin/nologin webox && \
+    mkdir -p /webox/wecomproxy/bin /webox/wecomproxy/lib /webox/state && \
+    chown -R webox:webox /webox && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/*
+
+COPY --from=build /out/wecomproxy /webox/wecomproxy/bin/wecomproxy
+COPY --from=build /out/lib/ /webox/wecomproxy/lib/
+COPY docker/scripts/wecomproxy-entrypoint.sh /webox/wecomproxy/bin/
+
+RUN chmod 755 /webox/wecomproxy/bin/wecomproxy /webox/wecomproxy/bin/wecomproxy-entrypoint.sh
+
+VOLUME ["/webox/state"]
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/webox/wecomproxy/bin/wecomproxy-entrypoint.sh"]

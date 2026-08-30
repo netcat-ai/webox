@@ -114,6 +114,7 @@ type messageShard struct {
 type messageRecord struct {
 	localID      int64
 	serverID     int64
+	sortSequence int64
 	localType    int64
 	createdAt    int64
 	realSenderID int64
@@ -234,7 +235,7 @@ func (store *Store) ValidateSessionDB() error {
 	return nil
 }
 
-func (store *Store) EnabledRoomSessions() (map[string]int64, error) {
+func (store *Store) EnabledRoomSessions(after int64) (map[string]int64, error) {
 	now := time.Now()
 	if !now.Before(store.enabledRoomsExpires) {
 		contactDB, found, err := store.database("contact/contact.db")
@@ -261,7 +262,7 @@ func (store *Store) EnabledRoomSessions() (map[string]int64, error) {
 	if !found {
 		return nil, errors.New("session database not found")
 	}
-	return loadRoomSessions(sessionDB, store.enabledRooms)
+	return loadRoomSessions(sessionDB, store.enabledRooms, after)
 }
 
 func (store *Store) MessagesForRoom(roomID string, after int64, limit int) ([]wecom.Message, error) {
@@ -270,6 +271,18 @@ func (store *Store) MessagesForRoom(roomID string, after int64, limit int) ([]we
 		return nil, err
 	}
 	records, err := queryMessageRecords(shard, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertMessages(shard, roomID, records)
+}
+
+func (store *Store) MessagesForRoomBySort(roomID string, after, before int64) ([]wecom.Message, error) {
+	shard, found, err := store.messageSource(roomID)
+	if err != nil || !found {
+		return nil, err
+	}
+	records, err := queryMessageRecordsBySort(shard, after, before)
 	if err != nil {
 		return nil, err
 	}
@@ -315,15 +328,19 @@ func loadEnabledRooms(db *sql.DB) ([]string, error) {
 	return names, rows.Err()
 }
 
-func loadRoomSessions(db *sql.DB, names []string) (map[string]int64, error) {
-	arguments := make([]any, len(names))
+func loadRoomSessions(db *sql.DB, names []string, after int64) (map[string]int64, error) {
+	arguments := make([]any, len(names)+1)
+	arguments[0] = after
 	var placeholders strings.Builder
 	for index, name := range names {
-		arguments[index] = name
+		arguments[index+1] = name
 		placeholders.WriteString("?,")
 	}
+	// TODO: Benchmark selecting updated SessionTable rows first and filtering enabled
+	// usernames in Go. contact.db and session.db use separate encrypted connections,
+	// so a direct JOIN would first require safely ATTACHing the contact database.
 	rows, err := db.Query(
-		"SELECT username, last_msg_locald_id FROM SessionTable WHERE last_msg_locald_id > 0 AND username IN ("+placeholders.String()[:placeholders.Len()-1]+")",
+		"SELECT username, last_timestamp FROM SessionTable WHERE last_timestamp >= ? AND username IN ("+placeholders.String()[:placeholders.Len()-1]+")",
 		arguments...,
 	)
 	if err != nil {
@@ -871,6 +888,33 @@ func queryMessageRecords(shard messageShard, after int64, limit int) ([]messageR
 	return records, rows.Err()
 }
 
+func queryMessageRecordsBySort(shard messageShard, after, before int64) ([]messageRecord, error) {
+	query := fmt.Sprintf(`SELECT local_id, server_id, sort_seq, local_type, create_time, real_sender_id,
+			message_content, WCDB_CT_message_content, origin_source
+		 FROM [%s] WHERE sort_seq > ? AND sort_seq < ? AND server_id > 0
+		 ORDER BY sort_seq ASC`, shard.table)
+	rows, err := shard.db.Query(query, after, before)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var records []messageRecord
+	for rows.Next() {
+		var record messageRecord
+		var contentType sql.NullInt64
+		var content []byte
+		if err := rows.Scan(
+			&record.localID, &record.serverID, &record.sortSequence, &record.localType, &record.createdAt,
+			&record.realSenderID, &content, &contentType, &record.originSource,
+		); err != nil {
+			return nil, err
+		}
+		record.content = decompressMessage(content, contentType.Int64)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func convertMessages(shard messageShard, roomID string, records []messageRecord) ([]wecom.Message, error) {
 	ids := make(map[int64]struct{}, len(records))
 	for _, record := range records {
@@ -894,7 +938,7 @@ func convertMessages(shard messageShard, roomID string, records []messageRecord)
 			ToList:   []string{},
 			RoomID:   roomID,
 			MsgTime:  saturatingMilliseconds(record.createdAt),
-			Sequence: record.localID,
+			Sequence: record.localID, SortSequence: record.sortSequence,
 			Outgoing: record.originSource == 1,
 		}
 		normalizeMessage(&message, record.localType, record.content, group)

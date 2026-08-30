@@ -26,12 +26,18 @@ type WeComArchive struct {
 }
 
 type Config struct {
-	ListenAddr    string
-	APIToken      string
-	StateDir      string
-	SharedDir     string
-	MessageSource string
-	WeComArchive  WeComArchive
+	ListenAddr string
+	APIToken   string
+	StateDir   string
+	SharedDir  string
+}
+
+type WeComProxyConfig struct {
+	ListenAddr string
+	APIToken   string
+	StateDir   string
+	SharedDir  string
+	Archive    WeComArchive
 }
 
 func Load() (Config, error) {
@@ -40,25 +46,34 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	configuration := Config{
-		ListenAddr:    normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
-		APIToken:      apiToken,
-		StateDir:      stateDir,
-		SharedDir:     envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
-		MessageSource: envOr("WEBOX_MESSAGE_SOURCE", MessageSourceWeChat),
+	if source := envOr("WEBOX_MESSAGE_SOURCE", MessageSourceWeChat); source != MessageSourceWeChat {
+		return Config{}, fmt.Errorf("WEBOX_MESSAGE_SOURCE %q requires the wecomproxy binary", source)
 	}
-	switch configuration.MessageSource {
-	case MessageSourceWeChat:
-	case MessageSourceWeComArchive:
-		archive, err := loadWeComArchive()
-		if err != nil {
-			return Config{}, err
-		}
-		configuration.WeComArchive = archive
-	default:
-		return Config{}, fmt.Errorf("unsupported WEBOX_MESSAGE_SOURCE %q", configuration.MessageSource)
+	return Config{
+		ListenAddr: normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
+		APIToken:   apiToken,
+		StateDir:   stateDir,
+		SharedDir:  envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
+	}, nil
+}
+
+func LoadWeComProxy() (WeComProxyConfig, error) {
+	stateDir := envOr("WEBOX_WEAGENT_STATE_DIR", "/webox/state/weagent")
+	apiToken, err := loadOrCreateID(stateDir, "api-token", "")
+	if err != nil {
+		return WeComProxyConfig{}, err
 	}
-	return configuration, nil
+	archive, err := loadWeComArchive()
+	if err != nil {
+		return WeComProxyConfig{}, err
+	}
+	return WeComProxyConfig{
+		ListenAddr: normalizeListenAddr(envOr("WEBOX_LISTEN_ADDR", "0.0.0.0:8080")),
+		APIToken:   apiToken,
+		StateDir:   stateDir,
+		SharedDir:  envOr("WEBOX_SHARED_DIR", filepath.Join(filepath.Dir(stateDir), "shared")),
+		Archive:    archive,
+	}, nil
 }
 
 func loadWeComArchive() (WeComArchive, error) {

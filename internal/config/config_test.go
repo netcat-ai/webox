@@ -72,12 +72,19 @@ func TestLoadWeComArchive(t *testing.T) {
 	t.Setenv("WEBOX_WECOM_ARCHIVE_WECHAT_ID", "archive-agent")
 	t.Setenv("WEBOX_WECOM_ARCHIVE_INITIAL_SEQ", "42")
 
-	configuration, err := Load()
+	configuration, err := LoadWeComProxy()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configuration.MessageSource != MessageSourceWeComArchive || configuration.WeComArchive.CorpID != "corp" ||
-		configuration.WeComArchive.AccountID != "alice" || configuration.WeComArchive.InitialSeq != 42 {
+	if configuration.Archive.CorpID != "corp" || configuration.Archive.AccountID != "alice" || configuration.Archive.InitialSeq != 42 {
 		t.Fatalf("configuration=%+v", configuration)
+	}
+}
+
+func TestWeAgentRejectsWeComSource(t *testing.T) {
+	t.Setenv("WEBOX_WEAGENT_STATE_DIR", t.TempDir())
+	t.Setenv("WEBOX_MESSAGE_SOURCE", MessageSourceWeComArchive)
+	if _, err := Load(); err == nil {
+		t.Fatal("weagent accepted the WeCom archive source")
 	}
 }

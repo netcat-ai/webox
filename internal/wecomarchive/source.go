@@ -8,13 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"io"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/netcat-ai/webox/internal/sharedmedia"
-	"github.com/netcat-ai/webox/internal/wechat"
-	"github.com/netcat-ai/webox/wecom"
 )
 
 type ChatData struct {
@@ -42,6 +42,7 @@ type Config struct {
 	WeChatID        string
 	Nickname        string
 	InitialSequence uint64
+	Logger          *slog.Logger
 }
 
 type Source struct {
@@ -51,7 +52,10 @@ type Source struct {
 	wechatID        string
 	nickname        string
 	initialSequence uint64
+	logger          *slog.Logger
 }
+
+var errMessageNotForAccount = errors.New("message cannot be projected for the configured account")
 
 func New(client Client, media *sharedmedia.Store, config Config) (*Source, error) {
 	if client == nil {
@@ -63,6 +67,10 @@ func New(client Client, media *sharedmedia.Store, config Config) (*Source, error
 	if config.AccountID == "" || config.WeChatID == "" {
 		return nil, errors.New("WeCom archive account_id and wechat_id are required")
 	}
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &Source{
 		client:          client,
 		media:           media,
@@ -70,149 +78,139 @@ func New(client Client, media *sharedmedia.Store, config Config) (*Source, error
 		wechatID:        config.WeChatID,
 		nickname:        config.Nickname,
 		initialSequence: config.InitialSequence,
+		logger:          logger,
 	}, nil
 }
 
-func (source *Source) IsInitialized() bool {
-	return true
+type Identity struct {
+	AccountID string
+	WeChatID  string
+	Nickname  string
 }
 
-func (source *Source) UserInfo() (wechat.UserInfo, error) {
-	return wechat.UserInfo{
+func (source *Source) Identity() Identity {
+	return Identity{
 		AccountID: source.accountID,
 		WeChatID:  source.wechatID,
 		Nickname:  source.nickname,
-	}, nil
+	}
 }
 
-func (source *Source) GetUpdates(ctx context.Context, cursors map[string]int64, limit int) (map[string][]wecom.Message, error) {
-	after := source.initialSequence
-	for _, sequence := range cursors {
-		if uint64(sequence) > after {
-			after = uint64(sequence)
-		}
+func (source *Source) GetUpdates(ctx context.Context, after uint64, limit int) ([]json.RawMessage, uint64, error) {
+	if after < source.initialSequence {
+		after = source.initialSequence
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, after, err
 	}
 	data, err := source.client.GetChatData(after, uint64(limit))
 	if err != nil {
-		return nil, fmt.Errorf("get WeCom archive data after seq %d: %w", after, err)
+		return nil, after, fmt.Errorf("get WeCom archive data after seq %d: %w", after, err)
 	}
 
-	updates := make(map[string][]wecom.Message)
+	updates := make([]json.RawMessage, 0, len(data))
+	next := after
 	for _, encrypted := range data {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, after, err
 		}
-		if encrypted.Sequence > math.MaxInt64 {
-			return nil, fmt.Errorf("WeCom archive seq %d exceeds the public message range", encrypted.Sequence)
+		if encrypted.Sequence > next {
+			next = encrypted.Sequence
 		}
 		plain, err := source.client.DecryptData(encrypted)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt WeCom archive message %s: %w", encrypted.MessageID, err)
+			return nil, after, fmt.Errorf("decrypt WeCom archive message %s: %w", encrypted.MessageID, err)
 		}
-		message, err := source.convertMessage(plain, int64(encrypted.Sequence))
+		message, err := source.convertMessage(plain)
 		if err != nil {
-			return nil, fmt.Errorf("convert WeCom archive message %s: %w", encrypted.MessageID, err)
+			if errors.Is(err, errMessageNotForAccount) {
+				source.logger.Warn("skipping WeCom archive message", "message_id", encrypted.MessageID, "error", err)
+				continue
+			}
+			return nil, after, fmt.Errorf("convert WeCom archive message %s: %w", encrypted.MessageID, err)
 		}
-		if cursor, known := cursors[message.RoomID]; known && message.Sequence <= cursor {
-			continue
+		if err := source.materializeMedia(ctx, message); err != nil {
+			return nil, after, fmt.Errorf("materialize WeCom archive message %s: %w", encrypted.MessageID, err)
 		}
-		if err := source.materializeMedia(ctx, &message); err != nil {
-			return nil, fmt.Errorf("materialize WeCom archive message %s: %w", message.MsgID, err)
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			return nil, after, err
 		}
-		updates[message.RoomID] = append(updates[message.RoomID], message)
+		updates = append(updates, encoded)
 	}
-	return updates, nil
+	return updates, next, nil
 }
 
-type archiveMessage struct {
-	MsgID   string   `json:"msgid"`
-	Action  string   `json:"action"`
-	From    string   `json:"from"`
-	ToList  []string `json:"tolist"`
-	RoomID  string   `json:"roomid"`
-	MsgTime int64    `json:"msgtime"`
-	MsgType string   `json:"msgtype"`
-
-	Text  *wecom.Text  `json:"text"`
-	Image *wecom.Image `json:"image"`
-	File  *wecom.File  `json:"file"`
-	Link  *wecom.Link  `json:"link"`
-}
-
-func (source *Source) convertMessage(data []byte, sequence int64) (wecom.Message, error) {
-	var archived archiveMessage
-	if err := json.Unmarshal(data, &archived); err != nil {
-		return wecom.Message{}, err
+func (source *Source) convertMessage(data []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var message map[string]any
+	if err := decoder.Decode(&message); err != nil {
+		return nil, err
 	}
-	roomID, err := source.roomID(archived)
+	roomID, err := source.roomID(message)
 	if err != nil {
-		return wecom.Message{}, err
+		return nil, err
 	}
-	message := wecom.Message{
-		MsgID: archived.MsgID, Action: archived.Action, From: archived.From,
-		ToList: archived.ToList, RoomID: roomID, MsgTime: archived.MsgTime,
-		MsgType: archived.MsgType, Sequence: sequence,
+	if stringField(message, "msgid") == "" {
+		return nil, errors.New("msgid is required")
 	}
-	if message.MsgID == "" {
-		return wecom.Message{}, errors.New("msgid is required")
+	if stringField(message, "msgtype") == "" {
+		return nil, errors.New("msgtype is required")
 	}
-	switch message.MsgType {
-	case wecom.MessageTypeText:
-		if archived.Text == nil {
-			return wecom.Message{}, errors.New("text body is required")
-		}
-		message.Text = archived.Text
-	case wecom.MessageTypeLink:
-		if archived.Link == nil {
-			return wecom.Message{}, errors.New("link body is required")
-		}
-		message.Link = archived.Link
-	case wecom.MessageTypeImage:
-		if archived.Image == nil {
-			return wecom.Message{}, errors.New("image body is required")
-		}
-		message.Image = archived.Image
-	case wecom.MessageTypeFile:
-		if archived.File == nil {
-			return wecom.Message{}, errors.New("file body is required")
-		}
-		message.File = archived.File
-	default:
-		return wecom.Message{}, fmt.Errorf("unsupported msgtype %q", message.MsgType)
-	}
+	message["roomid"] = roomID
 	return message, nil
 }
 
-func (source *Source) roomID(message archiveMessage) (string, error) {
-	if message.RoomID != "" {
-		roomID := message.RoomID
+func (source *Source) roomID(message map[string]any) (string, error) {
+	if value := stringField(message, "roomid"); value != "" {
+		roomID := value
 		if !strings.HasSuffix(roomID, "@chatroom") {
 			roomID += "@chatroom"
 		}
 		return validRoomID(roomID)
 	}
-	if message.From == source.accountID {
+	from := stringField(message, "from")
+	recipients := stringSliceField(message, "tolist")
+	if from == source.accountID {
 		var peer string
-		for _, recipient := range message.ToList {
+		for _, recipient := range recipients {
 			if recipient == source.accountID {
 				continue
 			}
 			if peer != "" {
-				return "", errors.New("direct message has multiple recipients")
+				return "", fmt.Errorf("%w: direct message has multiple recipients", errMessageNotForAccount)
 			}
 			peer = recipient
 		}
-		return validRoomID(peer)
+		roomID, err := validRoomID(peer)
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", errMessageNotForAccount, err)
+		}
+		return roomID, nil
 	}
-	for _, recipient := range message.ToList {
+	for _, recipient := range recipients {
 		if recipient == source.accountID {
-			return validRoomID(message.From)
+			return validRoomID(from)
 		}
 	}
-	return "", errors.New("direct message does not involve the configured account")
+	return "", fmt.Errorf("%w: direct message does not involve the configured account", errMessageNotForAccount)
+}
+
+func stringField(message map[string]any, name string) string {
+	value, _ := message[name].(string)
+	return value
+}
+
+func stringSliceField(message map[string]any, name string) []string {
+	values, _ := message[name].([]any)
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
 }
 
 func validRoomID(roomID string) (string, error) {
@@ -222,36 +220,114 @@ func validRoomID(roomID string) (string, error) {
 	return roomID, nil
 }
 
-func (source *Source) materializeMedia(ctx context.Context, message *wecom.Message) error {
-	switch message.MsgType {
-	case wecom.MessageTypeImage:
-		data, err := source.downloadMedia(ctx, message.Image.SDKFileID)
-		if err != nil {
-			return err
+func (source *Source) materializeMedia(ctx context.Context, message map[string]any) error {
+	msgType := stringField(message, "msgtype")
+	roomID := stringField(message, "roomid")
+	messageID := stringField(message, "msgid")
+	mediaIndex := 0
+	for _, field := range mediaFields(msgType) {
+		body, ok := message[field]
+		if !ok {
+			continue
 		}
-		if err := verifyMedia(data, message.Image.FileSize, message.Image.MD5Sum); err != nil {
-			return err
+		if field == "mixed" {
+			if err := source.materializeValue(ctx, roomID, messageID, body, &mediaIndex); err != nil {
+				return err
+			}
+			continue
 		}
-		path, err := source.media.WriteInbox(message.RoomID, message.MsgID, data, http.DetectContentType(data))
-		if err != nil {
-			return err
+		if bodyMap, ok := body.(map[string]any); ok {
+			if err := source.materializeBody(ctx, roomID, messageID, bodyMap, &mediaIndex); err != nil {
+				return err
+			}
 		}
-		message.Image.SDKFileID = path
-	case wecom.MessageTypeFile:
-		data, err := source.downloadMedia(ctx, message.File.SDKFileID)
-		if err != nil {
-			return err
-		}
-		if err := verifyMedia(data, message.File.FileSize, message.File.MD5Sum); err != nil {
-			return err
-		}
-		path, err := source.media.WriteInboxFile(message.RoomID, message.MsgID, message.File.FileName, data)
-		if err != nil {
-			return err
-		}
-		message.File.SDKFileID = path
 	}
 	return nil
+}
+
+func mediaFields(msgType string) []string {
+	switch msgType {
+	case "image", "voice", "video", "file", "emotion":
+		return []string{msgType}
+	case "mixed":
+		return []string{"mixed"}
+	default:
+		return nil
+	}
+}
+
+func (source *Source) materializeBody(ctx context.Context, roomID, messageID string, body map[string]any, mediaIndex *int) error {
+	remote, _ := body["sdkfileid"].(string)
+	if remote == "" {
+		return nil
+	}
+	*mediaIndex++
+	data, err := source.downloadMedia(ctx, remote)
+	if err != nil {
+		return err
+	}
+	if err := verifyMedia(data, archivedMediaSize(body), archivedMediaMD5(body)); err != nil {
+		return err
+	}
+	path, err := source.writeArchivedMedia(roomID, messageID+"-"+strconv.Itoa(*mediaIndex), body, data)
+	if err != nil {
+		return err
+	}
+	body["sdkfileid"] = path
+	return nil
+}
+
+func (source *Source) materializeValue(ctx context.Context, roomID, messageID string, value any, mediaIndex *int) error {
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			if err := source.materializeValue(ctx, roomID, messageID, item, mediaIndex); err != nil {
+				return err
+			}
+		}
+	case map[string]any:
+		if err := source.materializeBody(ctx, roomID, messageID, current, mediaIndex); err != nil {
+			return err
+		}
+		for key, value := range current {
+			if key != "sdkfileid" {
+				if err := source.materializeValue(ctx, roomID, messageID, value, mediaIndex); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (source *Source) writeArchivedMedia(roomID, messageID string, body map[string]any, data []byte) (string, error) {
+	if filename, ok := body["filename"].(string); ok && filename != "" {
+		return source.media.WriteInboxFile(roomID, messageID, filename, data)
+	}
+	contentType := http.DetectContentType(data)
+	if strings.HasPrefix(contentType, "image/") {
+		if path, err := source.media.WriteInbox(roomID, messageID, data, contentType); err == nil {
+			return path, nil
+		}
+	}
+	return source.media.WriteInboxFile(roomID, messageID, "media.bin", data)
+}
+
+func archivedMediaMD5(body map[string]any) string {
+	checksum, _ := body["md5sum"].(string)
+	return checksum
+}
+
+func archivedMediaSize(body map[string]any) int64 {
+	for _, field := range []string{"filesize", "imagesize", "voice_size", "videosize"} {
+		if number, ok := body[field].(json.Number); ok {
+			size, err := number.Int64()
+			if err == nil {
+				return size
+			}
+		}
+	}
+	return 0
 }
 
 func (source *Source) downloadMedia(ctx context.Context, sdkFileID string) ([]byte, error) {

@@ -1,9 +1,11 @@
 package wecomarchive
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -61,28 +63,23 @@ func TestGetUpdatesUsesLargestSequenceAndProjectsRooms(t *testing.T) {
 		mediaCalls: map[string]int{},
 	}
 	source := newTestSource(t, client, 5)
-	updates, err := source.GetUpdates(context.Background(), map[string]int64{"old-a": 12, "old-b": 27}, 100)
+	updates, next, err := source.GetUpdates(context.Background(), 27, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if client.after != 27 || client.limit != 100 {
 		t.Fatalf("after=%d limit=%d", client.after, client.limit)
 	}
-	if got := updates["wr-group@chatroom"]; len(got) != 1 || got[0].RoomID != "wr-group@chatroom" || got[0].Sequence != 30 {
-		t.Fatalf("group=%+v", got)
-	}
-	if got := updates["bob"]; len(got) != 1 || got[0].MsgID != "incoming" {
-		t.Fatalf("incoming=%+v", got)
-	}
-	if got := updates["carol"]; len(got) != 1 || got[0].MsgID != "outgoing" {
-		t.Fatalf("outgoing=%+v", got)
+	decoded := decodeUpdates(t, updates)
+	if next != 35 || len(decoded) != 3 || decoded[0]["roomid"] != "wr-group@chatroom" || decoded[1]["roomid"] != "bob" || decoded[2]["roomid"] != "carol" {
+		t.Fatalf("next=%d updates=%+v", next, decoded)
 	}
 }
 
 func TestGetUpdatesUsesInitialSequenceWithoutRooms(t *testing.T) {
 	client := &fakeClient{plain: map[string][]byte{}, mediaCalls: map[string]int{}}
 	source := newTestSource(t, client, 42)
-	if _, err := source.GetUpdates(context.Background(), nil, 100); err != nil {
+	if _, _, err := source.GetUpdates(context.Background(), 0, 100); err != nil {
 		t.Fatal(err)
 	}
 	if client.after != 42 {
@@ -116,15 +113,16 @@ func TestGetUpdatesDownloadsImageAndFileToSharedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updates, err := source.GetUpdates(context.Background(), nil, 100)
+	updates, _, err := source.GetUpdates(context.Background(), 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if calls := client.mediaCalls; !reflect.DeepEqual(calls, map[string]int{"remote-image": 2, "remote-file": 1}) {
 		t.Fatalf("media calls=%v", calls)
 	}
-	imagePath := updates["bob"][0].Image.SDKFileID
-	filePath := updates["bob"][1].File.SDKFileID
+	decoded := decodeUpdates(t, updates)
+	imagePath := decoded[0]["image"].(map[string]any)["sdkfileid"].(string)
+	filePath := decoded[1]["file"].(map[string]any)["sdkfileid"].(string)
 	for path, expected := range map[string][]byte{imagePath: png, filePath: fileData} {
 		contents, err := os.ReadFile(filepath.Join(root, "rooms", "bob", filepath.FromSlash(path)))
 		if err != nil || !reflect.DeepEqual(contents, expected) {
@@ -139,22 +137,85 @@ func TestGetUpdatesDownloadsImageAndFileToSharedDirectory(t *testing.T) {
 func TestGetUpdatesReturnsActualErrors(t *testing.T) {
 	client := &fakeClient{chatErr: errors.New("sdk failed"), mediaCalls: map[string]int{}}
 	source := newTestSource(t, client, 0)
-	if _, err := source.GetUpdates(context.Background(), nil, 100); !errors.Is(err, client.chatErr) {
+	if _, _, err := source.GetUpdates(context.Background(), 0, 100); !errors.Is(err, client.chatErr) {
 		t.Fatalf("error=%v", err)
 	}
 }
 
-func TestGetUpdatesReturnsConversionErrors(t *testing.T) {
+func TestGetUpdatesPreservesUnknownMessageBodies(t *testing.T) {
 	client := &fakeClient{
-		chatData: []ChatData{{Sequence: 1, MessageID: "voice"}},
+		chatData: []ChatData{{Sequence: 1, MessageID: "emotion"}, {Sequence: 2, MessageID: "text"}},
 		plain: map[string][]byte{
-			"voice": []byte(`{"msgid":"voice","action":"send","from":"bob","tolist":["alice"],"msgtime":1,"msgtype":"voice","voice":{}}`),
+			"emotion": []byte(`{"msgid":"emotion","action":"send","from":"bob","tolist":["alice"],"msgtime":1,"msgtype":"emotion","emotion":{"type":1,"width":120}}`),
+			"text":    []byte(`{"msgid":"text","action":"send","from":"bob","tolist":["alice"],"msgtime":2,"msgtype":"text","text":{"content":"keep"}}`),
 		},
 		mediaCalls: map[string]int{},
 	}
 	source := newTestSource(t, client, 0)
-	if _, err := source.GetUpdates(context.Background(), nil, 100); err == nil {
-		t.Fatal("unsupported message was silently skipped")
+	updates, _, err := source.GetUpdates(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 2 || !bytes.Contains(updates[0], []byte(`"emotion":{"type":1,"width":120}`)) {
+		t.Fatalf("updates=%s", updates)
+	}
+}
+
+func TestGetUpdatesMaterializesMediaInsideUnknownMessageBody(t *testing.T) {
+	gif := []byte("GIF89aunknown-emotion")
+	digest := md5.Sum(gif)
+	client := &fakeClient{
+		chatData: []ChatData{{Sequence: 1, MessageID: "emotion"}},
+		plain: map[string][]byte{
+			"emotion": []byte(`{"msgid":"emotion","action":"send","from":"bob","tolist":["alice"],"msgtime":1,"msgtype":"emotion","emotion":{"type":1,"sdkfileid":"remote-emotion","md5sum":"` + hex.EncodeToString(digest[:]) + `","imagesize":` + strconv.Itoa(len(gif)) + `}}`),
+		},
+		media:      map[string][]*MediaData{"remote-emotion": {{Finished: true, Data: gif}}},
+		mediaCalls: map[string]int{},
+	}
+	root := t.TempDir()
+	store, err := sharedmedia.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := New(client, store, Config{AccountID: "alice", WeChatID: "archive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, _, err := source.GetUpdates(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := decodeUpdates(t, updates)
+	sdkFileID := decoded[0]["emotion"].(map[string]any)["sdkfileid"].(string)
+	if sdkFileID == "" || sdkFileID == "remote-emotion" {
+		t.Fatalf("sdkfileid=%q", sdkFileID)
+	}
+	contents, err := os.ReadFile(filepath.Join(root, "rooms", "bob", filepath.FromSlash(sdkFileID)))
+	if err != nil || !bytes.Equal(contents, gif) {
+		t.Fatalf("contents=%q err=%v", contents, err)
+	}
+}
+
+func TestGetUpdatesSkipsDirectMessagesForOtherAccounts(t *testing.T) {
+	client := &fakeClient{
+		chatData: []ChatData{
+			{Sequence: 1, MessageID: "unrelated"},
+			{Sequence: 2, MessageID: "incoming"},
+		},
+		plain: map[string][]byte{
+			"unrelated": []byte(`{"msgid":"unrelated","action":"send","from":"bob","tolist":["carol"],"msgtime":1,"msgtype":"text","text":{"content":"skip"}}`),
+			"incoming":  []byte(`{"msgid":"incoming","action":"send","from":"bob","tolist":["alice"],"msgtime":2,"msgtype":"text","text":{"content":"keep"}}`),
+		},
+		mediaCalls: map[string]int{},
+	}
+	source := newTestSource(t, client, 0)
+	updates, next, err := source.GetUpdates(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := decodeUpdates(t, updates)
+	if next != 2 || len(decoded) != 1 || decoded[0]["msgid"] != "incoming" {
+		t.Fatalf("next=%d updates=%+v", next, decoded)
 	}
 }
 
@@ -163,7 +224,7 @@ func TestGetUpdatesHonorsCancelledContextBeforeCallingSDK(t *testing.T) {
 	source := newTestSource(t, client, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := source.GetUpdates(ctx, nil, 100); !errors.Is(err, context.Canceled) {
+	if _, _, err := source.GetUpdates(ctx, 0, 100); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v", err)
 	}
 	if client.limit != 0 {
@@ -182,4 +243,15 @@ func newTestSource(t *testing.T, client Client, initialSequence uint64) *Source 
 		t.Fatal(err)
 	}
 	return source
+}
+
+func decodeUpdates(t *testing.T, updates []json.RawMessage) []map[string]any {
+	t.Helper()
+	result := make([]map[string]any, len(updates))
+	for index := range updates {
+		if err := json.Unmarshal(updates[index], &result[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return result
 }

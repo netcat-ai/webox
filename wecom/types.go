@@ -112,6 +112,7 @@ type Message struct {
 	Mixed   *Mixed   `json:"mixed,omitempty"`
 	Reply   *Reply   `json:"reply,omitempty"`
 
-	Sequence int64 `json:"seq"`
-	Outgoing bool  `json:"-"`
+	Sequence     int64 `json:"-"`
+	SortSequence int64 `json:"-"`
+	Outgoing     bool  `json:"-"`
 }

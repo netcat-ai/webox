@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,11 +13,10 @@ import (
 	"time"
 
 	"github.com/netcat-ai/webox/internal/config"
-	"github.com/netcat-ai/webox/internal/ilink"
 	"github.com/netcat-ai/webox/internal/sender"
 	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
-	"github.com/netcat-ai/webox/internal/wecomarchive"
+	"github.com/netcat-ai/webox/internal/wechatapi"
 )
 
 func main() {
@@ -41,40 +39,17 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var workers sync.WaitGroup
-	var protocol *ilink.Server
-	switch configuration.MessageSource {
-	case config.MessageSourceWeChat:
-		wechatState := wechat.New(configuration.StateDir)
-		if err := wechatState.EnsureStateDir(); err != nil {
-			return err
-		}
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			runInitializer(ctx, wechatState, logger)
-		}()
-		protocol = ilink.New(configuration.APIToken, media, wechatState, sender.New(wechatState, media), logger)
-	case config.MessageSourceWeComArchive:
-		archiveConfig := configuration.WeComArchive
-		privateKey, err := os.ReadFile(archiveConfig.PrivateKeyFile)
-		if err != nil {
-			return fmt.Errorf("read WeCom archive private key: %w", err)
-		}
-		client, err := wecomarchive.OpenClient(archiveConfig.CorpID, archiveConfig.Secret, string(privateKey))
-		if err != nil {
-			return fmt.Errorf("open WeCom archive client: %w", err)
-		}
-		defer client.Free()
-		archiveSource, err := wecomarchive.New(client, media, wecomarchive.Config{
-			AccountID: archiveConfig.AccountID, WeChatID: archiveConfig.WeChatID,
-			Nickname: archiveConfig.Nickname, InitialSequence: archiveConfig.InitialSeq,
-		})
-		if err != nil {
-			return err
-		}
-		protocol = ilink.NewWithUpdates(configuration.APIToken, archiveSource, archiveSource, unsupportedSender{}, logger)
+	wechatState := wechat.New(configuration.StateDir)
+	if err := wechatState.EnsureStateDir(); err != nil {
+		return err
 	}
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		runInitializer(ctx, wechatState, logger)
+	}()
+	protocol := wechatapi.New(configuration.APIToken, media, wechatState, sender.New(wechatState, media), logger)
 	server := &http.Server{Handler: requestLogger(protocol.Handler(), logger), ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", configuration.ListenAddr)
 	if err != nil {
@@ -103,12 +78,6 @@ func run(logger *slog.Logger) error {
 	stop()
 	workers.Wait()
 	return nil
-}
-
-type unsupportedSender struct{}
-
-func (unsupportedSender) Send(context.Context, string, []sender.Item) (sender.Receipt, error) {
-	return sender.Receipt{}, errors.New("WeCom archive source does not support sending messages")
 }
 
 func runInitializer(ctx context.Context, state *wechat.State, logger *slog.Logger) {

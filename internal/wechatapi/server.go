@@ -1,4 +1,4 @@
-package ilink
+package wechatapi
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +23,9 @@ import (
 const (
 	getUpdatesTimeout  = 35 * time.Second
 	getUpdatesInterval = time.Second
-	getUpdatesLimit    = 100
 	inboundMediaWait   = time.Minute
+	defaultHistory     = 5 * 24 * time.Hour
+	catchUpWindow      = time.Hour
 )
 
 type sessionSource interface {
@@ -36,8 +38,8 @@ type contactSource interface {
 }
 
 type roomMessageSource interface {
-	RoomSessions() (map[string]int64, error)
-	RoomMessages(string, int64, int) ([]wecom.Message, error)
+	RoomSessions(int64) (map[string]int64, error)
+	RoomMessagesBySort(string, int64, int64) ([]wecom.Message, error)
 	ReadImage(string, int64, int64, string) (*wechatdb.MediaFile, error)
 	ReadFile(string, int64, int64, string) (*wechatdb.LocalFile, error)
 }
@@ -46,10 +48,6 @@ type messageSource interface {
 	sessionSource
 	contactSource
 	roomMessageSource
-}
-
-type updateSource interface {
-	GetUpdates(context.Context, map[string]int64, int) (map[string][]wecom.Message, error)
 }
 
 type messageSender interface {
@@ -62,7 +60,6 @@ type Server struct {
 	session  sessionSource
 	contacts contactSource
 	rooms    roomMessageSource
-	updates  updateSource
 	sender   messageSender
 	logger   *slog.Logger
 
@@ -70,18 +67,11 @@ type Server struct {
 
 	pollTimeout  time.Duration
 	pollInterval time.Duration
-}
-
-type roomCursor struct {
-	Sequence int64 `json:"seq"`
+	now          func() time.Time
 }
 
 type getUpdatesRequest struct {
-	Rooms map[string]roomCursor `json:"rooms"`
-}
-
-type roomUpdates struct {
-	Messages []wecom.Message `json:"messages"`
+	Cursor string `json:"cursor"`
 }
 
 type sendMessageRequest struct {
@@ -99,18 +89,7 @@ func New(apiToken string, media *sharedmedia.Store, messages messageSource, send
 		logger:       logger,
 		pollTimeout:  getUpdatesTimeout,
 		pollInterval: getUpdatesInterval,
-	}
-}
-
-func NewWithUpdates(apiToken string, session sessionSource, updates updateSource, sender messageSender, logger *slog.Logger) *Server {
-	return &Server{
-		apiToken:     apiToken,
-		session:      session,
-		updates:      updates,
-		sender:       sender,
-		logger:       logger,
-		pollTimeout:  getUpdatesTimeout,
-		pollInterval: getUpdatesInterval,
+		now:          time.Now,
 	}
 }
 
@@ -133,15 +112,9 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 		writeError(response, http.StatusBadRequest, err.Error())
 		return
 	}
-	for roomID, cursor := range body.Rooms {
-		if roomID == "" {
-			writeError(response, http.StatusBadRequest, "roomid must not be empty")
-			return
-		}
-		if cursor.Sequence < 0 {
-			writeError(response, http.StatusBadRequest, "room seq must not be negative")
-			return
-		}
+	if _, err := parseCursor(body.Cursor, server.now()); err != nil {
+		writeError(response, http.StatusBadRequest, err.Error())
+		return
 	}
 	if !server.session.IsInitialized() {
 		writeJSON(response, http.StatusOK, sessionUnavailable())
@@ -150,15 +123,15 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 
 	deadline := time.Now().Add(server.pollTimeout)
 	for {
-		updates, err := server.updatedRooms(request.Context(), body.Rooms)
+		messages, cursor, err := server.updatedMessages(request.Context(), body.Cursor)
 		if err != nil {
 			server.logger.Warn("message polling failed", "error", err)
 			writeJSON(response, http.StatusOK, sessionUnavailable())
 			return
 		}
-		if len(updates) != 0 || !time.Now().Before(deadline) {
+		if len(messages) != 0 || cursor != body.Cursor || !time.Now().Before(deadline) {
 			writeJSON(response, http.StatusOK, map[string]any{
-				"ret": 0, "rooms": updates,
+				"ret": 0, "messages": messages, "cursor": cursor,
 				"longpolling_timeout_ms": server.pollTimeout.Milliseconds(),
 			})
 			return
@@ -173,66 +146,76 @@ func (server *Server) getUpdates(response http.ResponseWriter, request *http.Req
 	}
 }
 
-func (server *Server) updatedRooms(ctx context.Context, cursors map[string]roomCursor) (map[string]roomUpdates, error) {
-	if server.updates != nil {
-		sequences := make(map[string]int64, len(cursors))
-		for roomID, cursor := range cursors {
-			sequences[roomID] = cursor.Sequence
-		}
-		messages, err := server.updates.GetUpdates(ctx, sequences, getUpdatesLimit)
-		if err != nil {
-			return nil, err
-		}
-		updates := make(map[string]roomUpdates, len(messages))
-		for roomID, roomMessages := range messages {
-			if len(roomMessages) != 0 {
-				updates[roomID] = roomUpdates{Messages: roomMessages}
-			}
-		}
-		return updates, nil
-	}
-
-	sessions, err := server.rooms.RoomSessions()
+func (server *Server) updatedMessages(ctx context.Context, rawCursor string) ([]wecom.Message, string, error) {
+	now := server.now()
+	cursor, err := parseCursor(rawCursor, now)
 	if err != nil {
-		return nil, err
+		return nil, rawCursor, err
+	}
+	sessions, err := server.rooms.RoomSessions(cursor / 1000)
+	if err != nil {
+		return nil, rawCursor, err
 	}
 	roomIDs := make([]string, 0, len(sessions))
-	for roomID := range sessions {
+	var maxLast int64
+	for roomID, last := range sessions {
 		roomIDs = append(roomIDs, roomID)
+		if last > maxLast {
+			maxLast = last
+		}
 	}
 	sort.Strings(roomIDs)
-
-	updates := make(map[string]roomUpdates)
-	for _, roomID := range roomIDs {
-		latest := sessions[roomID]
-		cursor, known := cursors[roomID]
-		after := cursor.Sequence
-		if !known {
-			after = max(0, latest-getUpdatesLimit)
-		}
-		if latest <= after {
-			continue
-		}
-		messages, err := server.rooms.RoomMessages(roomID, after, getUpdatesLimit)
-		if err != nil {
-			server.logger.Warn("could not read WeChat Room messages", "roomid", roomID, "seq", after, "error", err)
-			continue
-		}
-		ready, err := server.readyRoomMessages(roomID, messages)
-		if err != nil {
-			server.logger.Warn("could not materialize WeChat Room message", "roomid", roomID, "error", err)
-		}
-		if len(ready) != 0 {
-			updates[roomID] = roomUpdates{Messages: ready}
-		}
+	if len(roomIDs) == 0 {
+		return nil, strconv.FormatInt(cursor, 10), nil
 	}
-	return updates, nil
+	upper := maxLast
+	if upper < now.Unix()-1 {
+		upper++
+	}
+	startSecond := (cursor + 1) / 1000
+	windowUpper := min(upper, startSecond+int64(catchUpWindow/time.Second))
+	before := windowUpper * 1000
+	if before <= cursor+1 {
+		return nil, strconv.FormatInt(cursor, 10), nil
+	}
+
+	messages := make([]wecom.Message, 0)
+	for _, roomID := range roomIDs {
+		roomMessages, err := server.rooms.RoomMessagesBySort(roomID, cursor, before)
+		if err != nil {
+			return nil, rawCursor, fmt.Errorf("read WeChat Room %s messages: %w", roomID, err)
+		}
+		messages = append(messages, roomMessages...)
+	}
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].SortSequence < messages[j].SortSequence
+	})
+	ready, blocked, err := server.readyMessages(messages)
+	if err != nil {
+		return nil, rawCursor, err
+	}
+	if blocked {
+		return ready, strconv.FormatInt(cursor, 10), nil
+	}
+	return ready, strconv.FormatInt(before-1, 10), nil
 }
 
-func (server *Server) readyRoomMessages(roomID string, messages []wecom.Message) ([]wecom.Message, error) {
+func parseCursor(raw string, now time.Time) (int64, error) {
+	if raw == "" {
+		return now.Add(-defaultHistory).Unix()*1000 - 1, nil
+	}
+	cursor, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || cursor < 0 {
+		return 0, errors.New("cursor must be an empty or non-negative decimal sort_seq")
+	}
+	return cursor, nil
+}
+
+func (server *Server) readyMessages(messages []wecom.Message) ([]wecom.Message, bool, error) {
 	ready := make([]wecom.Message, 0, len(messages))
-	now := time.Now()
+	now := server.now()
 	for _, message := range messages {
+		roomID := message.RoomID
 		var err error
 		switch message.MsgType {
 		case wecom.MessageTypeImage:
@@ -250,17 +233,17 @@ func (server *Server) readyRoomMessages(roomID string, messages []wecom.Message)
 		}
 		if err != nil {
 			if !errors.Is(err, errInboundMediaNotReady) {
-				return ready, fmt.Errorf("materialize WeChat message %s: %w", message.MsgID, err)
+				return ready, false, fmt.Errorf("materialize WeChat message %s: %w", message.MsgID, err)
 			}
 			if !inboundMediaWaitExpired(message, now) {
 				server.logger.Debug("waiting for WeChat media", "roomid", roomID, "msgid", message.MsgID, "type", message.MsgType)
-				break
+				return ready, true, nil
 			}
 			server.logger.Warn("delivering WeChat media without sdkfileid after waiting one minute", "roomid", roomID, "msgid", message.MsgID, "type", message.MsgType)
 		}
 		ready = append(ready, message)
 	}
-	return ready, nil
+	return ready, false, nil
 }
 
 func (server *Server) health(response http.ResponseWriter, _ *http.Request) {
@@ -401,7 +384,7 @@ func writeError(response http.ResponseWriter, status int, detail string) {
 }
 
 func sessionUnavailable() map[string]any {
-	return map[string]any{"ret": -14, "errcode": -14, "errmsg": "wechat session is unavailable", "rooms": map[string]any{}}
+	return map[string]any{"ret": -14, "errcode": -14, "errmsg": "wechat session is unavailable", "messages": []any{}, "cursor": ""}
 }
 
 func sendSuccess(clientMessageID string) map[string]any {
