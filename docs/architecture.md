@@ -2,14 +2,14 @@
 
 `webox` 只解决一个问题：
 
-> 用各自独立的轻量运行时，把 Linux WeChat 或企业微信会话存档投影成供自动化程序使用的同一组 HTTP 接口。
+> 把 Linux WeChat 投影成供自动化程序使用的一组 HTTP 接口。
 
 ## 设计原则
 
 1. 对外只保留 HTTP 消费端和验收工具实际使用的接口，不维持通用 iLink 兼容面。
 2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
-3. `weagent` 以 Linux 微信客户端为真实终端；`wecomproxy` 独立实时调用 Finance SDK。
-4. WeChat DB 或企业微信会话存档是消息事实源，不复制一套业务消息库。
+3. `weagent` 以 Linux 微信客户端为真实终端。
+4. WeChat DB 是消息事实源，不复制一套业务消息库。
 5. 对发送结果采用同步、可验证语义，不在 UI 操作完成前返回成功。
 
 ## 组件
@@ -19,9 +19,6 @@ flowchart LR
   Consumer["HTTP consumer"] -->|"Webox HTTP"| Adapter["Go HTTP adapter"]
   Adapter --> DBScanner["wechatdb scanner"]
   DBScanner --> WXDB["WeChat local DB"]
-  Consumer -->|"same Webox HTTP"| ArchiveProxy["wecomproxy"]
-  ArchiveProxy --> Archive["WeCom archive adapter"]
-  Archive --> Finance["Finance SDK"]
   Adapter --> UISender["sender"]
   UISender --> Display["Xvfb + window manager"]
   Display --> WeChat["Linux WeChat"]
@@ -61,21 +58,11 @@ HTTP token 单独持久化。Webox 不再生成额外的 provider account ID；�
 
 ```text
 POST getupdates(cursor)
-  -> WeChat: select sessions by last_timestamp and query sort_seq ranges
-     or WeCom archive: query Finance SDK by its global seq
+  -> select sessions by last_timestamp and query sort_seq ranges
   -> merge messages into one ordered flat array
   -> decode/copy ready media into /webox/state/shared/rooms/<roomid>/inbox
   -> return messages plus the consumed cursor
 ```
-
-`weagent` 与 `wecomproxy` 共用同一个 `getupdates` 请求、响应和 `wecom.Message` contract，但运行在独立 binary
-和镜像中。企业微信代理直接使用 Finance 全局 `seq` 作为响应游标，不持久化消息或 cursor；群 Room ID 统一
-添加 `@chatroom` 后缀。响应消息是扁平数组，消费端按 `roomid` 分开处理。
-
-企业微信明文消息不按 `msgtype` 白名单转换。代理保留未知信封字段、消息类型及对应消息体，只修改路由所需的
-`roomid`。它只在明确的媒体消息类型及 `mixed` 子项中处理 `sdkfileid`，通过 Finance SDK 下载媒体并换成
-Shared Directory 相对路径；
-如何保存、展示、提取文本或触发 Agent 由消费端决定。
 
 WeChat 来源把 `sort_seq` 用作全局合并游标。空游标从最近五天开始；先选择 `SessionTable.last_timestamp >=
 cursor/1000` 的会话，再以全局最大 `last_timestamp` 形成只包含完整秒的上界，查询
@@ -143,8 +130,6 @@ POST sendmessage(msgs[text/image/file...])
 整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次有序 UI 发送批次：每条文本、图片和文件都通过剪贴板粘贴后立即按 Enter，
 不使用附件按钮、文件选择器或坐标点击。该批次不是原子操作，中途失败时前面的消息可能已经发出，调用方不能自动重试整个批次。
 HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
-企业微信 Finance SDK 仅提供读取能力，因此 `wecomproxy` 的 `sendmessage` 当前返回明确的不支持错误。
-
 ## HTTP 接口
 
 Webox 只暴露以下接口：
@@ -159,7 +144,7 @@ Webox 只暴露以下接口：
 
 ## 可靠性边界
 
-- WeChat DB 是持久事件源；企业微信来源实时读取 Finance，不在 Webox 持久化消息。
+- WeChat DB 是持久事件源。
 - 消费进度是调用方提交的单一字符串 `cursor`；Webox 不保存调用方 checkpoint。
 - 空 cursor 默认读取最近五天；需要更久历史时，调用方可手动设置 cursor。
 - WeChat UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
@@ -168,7 +153,7 @@ Webox 只暴露以下接口：
 
 ## 非目标
 
-- 不实现企业微信 AI Bot、XML/Webhook 或通用消息中台协议。
+- 不实现企业微信归档、通讯录、发送或机器人能力；会话存档由 `netcat-api` 提供，消费与自动化由 aicat 等上层应用负责。
 - 不提供 agent runtime、触发规则、prompt、模型调用或自动回复策略。
 - 不维护独立用户、会话或消息事实库。
 - 不从 WeChat 网络流量解析登录或聊天消息。
@@ -180,12 +165,9 @@ Webox 只暴露以下接口：
 
 ```text
 cmd/weagent       personal WeChat process lifecycle and HTTP server
-cmd/wecomproxy    lightweight WeCom archive proxy lifecycle
 internal/config   persistent HTTP credentials and environment configuration
 internal/wechatapi personal WeChat HTTP routes, authentication and cursor merge
 internal/wechat   initialization and DB coordination
 internal/wechatdb query encrypted WeChat DB and WAL through SQLCipher
-internal/wecomarchive decrypt and route Finance archive messages without type filtering
-internal/wecomproxy minimal archive HTTP routes and authentication
 internal/sender   serialized xdotool/xclip text sender and DB verification
 ```

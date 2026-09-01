@@ -60,31 +60,3 @@ func TestLoadCreatesStableILinkCredentials(t *testing.T) {
 		t.Fatalf("shared directory=%q", first.SharedDir)
 	}
 }
-
-func TestLoadWeComArchive(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("WEBOX_WEAGENT_STATE_DIR", dir)
-	t.Setenv("WEBOX_MESSAGE_SOURCE", MessageSourceWeComArchive)
-	t.Setenv("WEBOX_WECOM_ARCHIVE_CORP_ID", "corp")
-	t.Setenv("WEBOX_WECOM_ARCHIVE_SECRET", "secret")
-	t.Setenv("WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE", "/run/secrets/private-key.pem")
-	t.Setenv("WEBOX_WECOM_ARCHIVE_ACCOUNT_ID", "alice")
-	t.Setenv("WEBOX_WECOM_ARCHIVE_WECHAT_ID", "archive-agent")
-	t.Setenv("WEBOX_WECOM_ARCHIVE_INITIAL_SEQ", "42")
-
-	configuration, err := LoadWeComProxy()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if configuration.Archive.CorpID != "corp" || configuration.Archive.AccountID != "alice" || configuration.Archive.InitialSeq != 42 {
-		t.Fatalf("configuration=%+v", configuration)
-	}
-}
-
-func TestWeAgentRejectsWeComSource(t *testing.T) {
-	t.Setenv("WEBOX_WEAGENT_STATE_DIR", t.TempDir())
-	t.Setenv("WEBOX_MESSAGE_SOURCE", MessageSourceWeComArchive)
-	if _, err := Load(); err == nil {
-		t.Fatal("weagent accepted the WeCom archive source")
-	}
-}

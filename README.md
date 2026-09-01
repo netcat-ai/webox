@@ -1,6 +1,6 @@
 # Webox
 
-在 Docker 中运行 Linux 微信或企业微信会话存档代理，并把消息投影成供本地自动化程序使用的统一游标接口。
+在 Docker 中运行 Linux 微信，并把消息投影成供本地自动化程序使用的统一游标接口。
 消息由真实微信客户端收发；Webox 不修改微信，也不代理微信流量。
 
 Webox 是底层微信适配器，不是完整的机器人产品。它不包含 agent runtime、触发规则、prompt、模型调用或自动回复逻辑；本地消费端按 Room 保存消费进度、决定是否处理并调用 HTTP 接口回复。
@@ -98,37 +98,6 @@ Webox 提供以下 HTTP 接口：
 
 图片和文件通过 `<state>/shared/rooms/<roomid>/` 下的 `inbox/`、`outbox/` 交换，消息中的 `sdkfileid`
 使用相对于 Room 目录的路径。完整字段语义和可靠性限制见 [架构说明](docs/architecture.md)。
-
-## 企业微信会话存档来源
-
-独立的 `wecomproxy` 服务可以把企业微信会话存档实时代理到相同的 `userinfo`、`getupdates` 和
-`sendmessage` interface。它与个人微信 `weagent` 共用 HTTP contract，但不是 `weagent` 的可切换消息来源。
-设置以下环境变量：
-
-```text
-WEBOX_WECOM_ARCHIVE_CORP_ID=<企业 ID>
-WEBOX_WECOM_ARCHIVE_SECRET=<会话存档 Secret>
-WEBOX_WECOM_ARCHIVE_PRIVATE_KEY_FILE=/webox/state/wecom-archive-private-key.pem
-WEBOX_WECOM_ARCHIVE_ACCOUNT_ID=<当前企业成员 userid>
-WEBOX_WECOM_ARCHIVE_WECHAT_ID=<aicat 校验的稳定身份>
-WEBOX_WECOM_ARCHIVE_INITIAL_SEQ=0
-```
-
-每次 `getupdates` 以请求 `cursor` 作为 Finance 全局 `seq` 实时拉取。代理不保存会话消息或消费 cursor；它保留
-解密后的原始消息 JSON，只规范化 `roomid`，并仅对明确的媒体消息类型下载 `sdkfileid`、替换为 Shared Directory
-相对路径。未知消息类型原样通过，由消费端决定如何解释。
-Finance SDK 当前只支持读取，`sendmessage` 会返回不支持错误。
-
-企业微信归档不需要桌面微信客户端。仓库包含用户提供的官方 `20250205` Linux ARM SDK，可直接在 Apple
-Silicon Mac 上构建和运行 headless `linux/arm64` 容器：
-
-```bash
-docker build --platform linux/arm64 --target runtime-wecom -t webox:wecom .
-docker compose -f docker-compose.wecom.yml up -d
-```
-
-该构建目标只包含 `wecomproxy`、Finance SDK 及其基础运行库，不包含 SQLCipher、X11、noVNC、GTK、桌面
-微信或 UI sender，也不会读取 `docker/wechat/` 下的安装包。默认 `runtime` 构建目标和个人微信容器行为保持不变。
 
 ## 参考与致谢
 

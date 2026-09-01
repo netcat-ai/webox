@@ -126,7 +126,7 @@ func (service *fakeSender) Send(_ context.Context, target string, items []sender
 	return sender.Receipt{ClientMessageID: "ui-message"}, service.err
 }
 
-func TestWeComRouteIsRemoved(t *testing.T) {
+func TestLegacyWeComRouteIsAbsent(t *testing.T) {
 	server, _, _ := testServer(t)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/wecom", nil))
@@ -235,7 +235,7 @@ func TestGetUpdatesRejectsInvalidCursor(t *testing.T) {
 	}
 }
 
-func TestSendMessageUsesWeComRoutingAndReturnsMessageID(t *testing.T) {
+func TestSendMessageUsesRoomRoutingAndReturnsMessageID(t *testing.T) {
 	server, messages, outbound := testServer(t)
 	messages.initialized = true
 	body := map[string]any{"msgs": []any{map[string]any{

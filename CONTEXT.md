@@ -1,18 +1,13 @@
 # Webox
 
-**WeCom Archive Proxy（企业微信归档代理）**：
-一个无状态的企业微信会话存档传输边界；它保留 Finance 解密后的原始消息，仅规范化 `roomid`，并对明确的媒体
-类型将远程引用换成 Shared Directory 路径。消息的保存、解释和触发由消费端负责。
-_Avoid_：WeCom Agent、消息类型过滤器、企业微信机器人
-
 **Webox Cursor（Webox 游标）**：
-消费者提交并在整个 `getupdates` 响应成功落盘后推进的单一字符串水位。Finance 来源使用全局 `seq`；WeChat
-来源使用跨 Room 合并后的 `sort_seq`，空游标默认从最近五天开始且每次最多推进一小时。Webox 不持久化消费进度。
+消费者提交并在整个 `getupdates` 响应成功落盘后推进的单一字符串水位。WeChat 来源使用跨 Room 合并后的
+`sort_seq`，空游标默认从最近五天开始且每次最多推进一小时。Webox 不持久化消费进度。
 _Avoid_：Room Sequence、`next_seq`、Webox 消费 checkpoint
 
 **Unified Update（统一更新）**：
-WeChat DB 与企业微信 Finance 共用的扁平消息响应；消息采用企业微信会话存档 JSON 形状并包含 `roomid`，消费者
-按 Room 分开保存和调度。响应 `cursor` 只表示整个响应已消费到的位置，不属于单条消息。
+WeChat DB 生成的扁平消息响应；消息沿用企业微信会话存档 JSON 形状并包含 `roomid`，消费者按 Room 分开保存和
+调度。响应 `cursor` 只表示整个响应已消费到的位置，不属于单条消息。
 _Avoid_：按 Room 分组的响应、消息 `seq`、跨 Room Codex batch
 
 **WeChat Room Source Location（WeChat Room 数据源位置）**：

@@ -1,6 +1,6 @@
 # Webox 使用统一游标协议并独立运行企业微信归档代理
 
-状态：accepted
+状态：superseded by [0002](0002-wecom-capabilities-outside-webox.md)
 
 个人微信与企业微信会话存档都通过同一个 `getupdates` contract 返回扁平的企业微信会话存档形状消息：请求只带
 字符串 `cursor`，响应包含 `messages` 与已消费位置 `cursor`。消息必须包含 `msgid` 和 `roomid`，但不公开单条
