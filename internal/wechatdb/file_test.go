@@ -22,6 +22,17 @@ func TestResourceStoredFilename(t *testing.T) {
 	}
 }
 
+func TestResourceStoredFilenameFallsBackToOriginalName(t *testing.T) {
+	packed, err := hex.DecodeString("0A0A0A08647972642E7A6970")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := resourceStoredFilename(packed)
+	if err != nil || stored != "dyrd.zip" {
+		t.Fatalf("stored=%q err=%v", stored, err)
+	}
+}
+
 func TestLocalFilePathUsesDownloadedCollisionName(t *testing.T) {
 	account := t.TempDir()
 	created := time.Date(2026, 8, 4, 18, 0, 0, 0, time.Local)

@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var errProtoFieldNotFound = errors.New("protobuf field not found")
+
 type LocalFile struct {
 	Path     string
 	Filename string
@@ -94,6 +96,9 @@ func resourceStoredFilename(packed []byte) (string, error) {
 		return "", fmt.Errorf("decode WeChat file resource: %w", err)
 	}
 	stored, err := protoBytesField(outer, 2)
+	if errors.Is(err, errProtoFieldNotFound) {
+		stored, err = protoBytesField(outer, 1)
+	}
 	if err != nil {
 		return "", fmt.Errorf("decode stored WeChat file name: %w", err)
 	}
@@ -140,7 +145,7 @@ func protoBytesField(data []byte, fieldNumber uint64) ([]byte, error) {
 			return nil, fmt.Errorf("unsupported protobuf wire type %d", wireType)
 		}
 	}
-	return nil, fmt.Errorf("protobuf field %d not found", fieldNumber)
+	return nil, fmt.Errorf("%w: %d", errProtoFieldNotFound, fieldNumber)
 }
 
 func localFilePath(accountDir string, createTime int64, filename string) (string, error) {
