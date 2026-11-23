@@ -21,6 +21,7 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  WEBOX_RUNTIME_IMAGE: ghcr.io/netcat-ai/webox@sha256:5cfe933926b7c8622293c770b4bc6883dfd3e2a5b20413d531062962a018907f
   WECHAT_DOWNLOAD_BASE: https://dldir1v6.qq.com/weixin/Universal/Linux
 
 jobs:
@@ -53,10 +54,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            arch: amd64
-            wechat_package: WeChatLinux_x86_64.deb
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
@@ -66,6 +63,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Download bundled WeChat package
+        if: env.WEBOX_RUNTIME_IMAGE == 'runtime-wechat'
         run: |
           set -euo pipefail
           package="${{ matrix.wechat_package }}"
@@ -107,6 +105,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-args: WEBOX_RUNTIME_IMAGE=${{ env.WEBOX_RUNTIME_IMAGE }}
           platforms: ${{ matrix.platform }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE_NAME) || '' }}
           tags: ${{ env.IMAGE_NAME }}

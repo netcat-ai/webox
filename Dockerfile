@@ -1,6 +1,8 @@
 ARG GO_BUILDER_IMAGE=golang:1.26-bookworm
 ARG DEBIAN_RUNTIME_IMAGE=debian:bookworm-slim
 
+ARG WEBOX_RUNTIME_IMAGE=runtime-wechat
+
 FROM ${GO_BUILDER_IMAGE} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -77,7 +79,7 @@ RUN --mount=type=bind,source=docker/wechat,target=/tmp/wechat,ro \
     dpkg-deb -f "$deb" Version > /webox/wechat/.webox-version; \
     test -x /webox/wechat/opt/wechat/wechat
 
-FROM runtime-wechat AS runtime
+FROM ${WEBOX_RUNTIME_IMAGE} AS runtime
 
 COPY --from=build /out/weagent /webox/weagent/bin/weagent
 COPY docker/scripts/webox-identity.sh docker/scripts/entrypoint.sh /webox/weagent/bin/
