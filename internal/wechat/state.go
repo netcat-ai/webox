@@ -291,32 +291,18 @@ func (state *State) ContactsByRemark(remark string) ([]wechatdb.Contact, error) 
 	return contacts, nil
 }
 
-func (state *State) RoomMessagePositions(target string) (wechatdb.RoomMessagePositions, error) {
+func (state *State) ContactsByRoomID(roomID string) ([]wechatdb.Contact, error) {
 	state.dbMu.Lock()
 	defer state.dbMu.Unlock()
 	database, _, err := state.readyDatabase()
 	if err != nil {
 		return nil, err
 	}
-	positions, err := database.RoomMessagePositionsFor(target)
+	contacts, err := database.ContactsByRoomID(roomID)
 	if err != nil {
-		return nil, state.dbError("read WeChat message positions", err)
+		return nil, state.dbError("query WeChat contacts", err)
 	}
-	return positions, nil
-}
-
-func (state *State) OutgoingItemsAfter(positions wechatdb.RoomMessagePositions, target string) ([]wechatdb.OutgoingItem, error) {
-	state.dbMu.Lock()
-	defer state.dbMu.Unlock()
-	database, _, err := state.readyDatabase()
-	if err != nil {
-		return nil, err
-	}
-	items, err := database.OutgoingItemsAfter(target, positions)
-	if err != nil {
-		return nil, state.dbError("verify outgoing WeChat items", err)
-	}
-	return items, nil
+	return contacts, nil
 }
 
 func (state *State) ReadImage(roomID string, localID, createTime int64, md5 string) (*wechatdb.MediaFile, error) {

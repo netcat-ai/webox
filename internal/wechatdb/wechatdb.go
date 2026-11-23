@@ -42,18 +42,6 @@ type InitData struct {
 	Keys  map[string]string
 }
 
-type MessagePosition struct {
-	CreateTime int64 `json:"create_time"`
-	LocalID    int64 `json:"local_id"`
-}
-
-type RoomMessagePositions map[string]MessagePosition
-
-type OutgoingItem struct {
-	Kind  string
-	Value string
-}
-
 func messageResourceDB(store *Store, roomID string) (*sql.DB, int64, error) {
 	db, found, err := store.database("message/message_resource.db")
 	if err != nil {
@@ -119,6 +107,7 @@ type messageRecord struct {
 	createdAt    int64
 	realSenderID int64
 	content      string
+	source       string
 	originSource int64
 }
 
@@ -405,11 +394,12 @@ func (store *Store) ResolveRecipient(raw, currentUserID string) (*Recipient, err
 }
 
 func contactsByRemarkFromDB(db *sql.DB, remark string) ([]Contact, error) {
-	rows, err := db.Query(
-		`SELECT username, remark, nick_name FROM contact
-		 WHERE delete_flag=0 AND remark=? ORDER BY username`,
-		remark,
-	)
+	return queryContacts(db, `SELECT username, remark, nick_name FROM contact
+		 WHERE delete_flag=0 AND remark=? ORDER BY username`, remark)
+}
+
+func queryContacts(db *sql.DB, query string, argument string) ([]Contact, error) {
+	rows, err := db.Query(query, argument)
 	if err != nil {
 		return nil, err
 	}
@@ -437,6 +427,18 @@ func (store *Store) ContactsByRemark(remark string) ([]Contact, error) {
 		return nil, errors.New("contact database not found")
 	}
 	return contactsByRemarkFromDB(db, remark)
+}
+
+func (store *Store) ContactsByRoomID(roomID string) ([]Contact, error) {
+	db, found, err := store.database("contact/contact.db")
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("contact database not found")
+	}
+	return queryContacts(db, `SELECT username, remark, nick_name FROM contact
+		 WHERE delete_flag=0 AND username=? ORDER BY username`, roomID)
 }
 
 func (store *Store) AccountInfoFor(username string) (AccountInfo, error) {
@@ -478,71 +480,6 @@ func accountInfoFromDB(db *sql.DB, username string) (AccountInfo, error) {
 		Nickname:  strings.TrimSpace(nickname.String),
 		AvatarURL: avatarURL,
 	}, nil
-}
-
-func (store *Store) RoomMessagePositionsFor(roomID string) (RoomMessagePositions, error) {
-	shards, err := findMessageShards(store, roomID)
-	if err != nil {
-		return nil, err
-	}
-	positions := make(RoomMessagePositions)
-	for _, shard := range shards {
-		position, _, err := maxMessagePosition(shard.db, shard.table)
-		if err != nil {
-			continue
-		}
-		positions[shard.relativePath] = position
-	}
-	return positions, nil
-}
-
-func (store *Store) OutgoingItemsAfter(roomID string, positions RoomMessagePositions) ([]OutgoingItem, error) {
-	shards, err := findMessageShards(store, roomID)
-	if err != nil {
-		return nil, err
-	}
-	group := strings.HasSuffix(roomID, "@chatroom")
-	var items []OutgoingItem
-	for _, shard := range shards {
-		position := positions[shard.relativePath]
-		db := shard.db
-		query := fmt.Sprintf(`SELECT local_type, message_content, WCDB_CT_message_content FROM [%s]
-            WHERE ((create_time > ?) OR (create_time = ? AND local_id > ?))
-              AND status = 2 AND origin_source = 1
-            ORDER BY create_time ASC, local_id ASC`, shard.table)
-		rows, err := db.Query(query, position.CreateTime, position.CreateTime, position.LocalID)
-		if err != nil {
-			continue
-		}
-		for rows.Next() {
-			var localType int64
-			var content []byte
-			var contentType sql.NullInt64
-			if rows.Scan(&localType, &content, &contentType) != nil {
-				continue
-			}
-			switch baseType(localType) {
-			case 1:
-				text := decompressMessage(content, contentType.Int64)
-				items = append(items, OutgoingItem{Kind: "text", Value: stripGroupPrefix(text, group)})
-			case 3:
-				items = append(items, OutgoingItem{Kind: "image"})
-			case 49:
-				content := decompressMessage(content, contentType.Int64)
-				app, ok := parseAppMessage(content)
-				filename := safeLocalFilename(cleanXMLText(app.AppMessage.Title))
-				if ok && app.AppMessage.Type == fileAppMessageType && filename != "" {
-					items = append(items, OutgoingItem{Kind: "file", Value: filename})
-				}
-			}
-		}
-		rowsErr := rows.Err()
-		_ = rows.Close()
-		if rowsErr != nil {
-			continue
-		}
-	}
-	return items, nil
 }
 
 func scanKeys(dbDir string) ([]keyEntry, error) {
@@ -863,7 +800,7 @@ func loadUsernamesByID(db *sql.DB, ids map[int64]struct{}) (map[int64]string, er
 
 func queryMessageRecords(shard messageShard, after int64, limit int) ([]messageRecord, error) {
 	query := fmt.Sprintf(`SELECT local_id, server_id, local_type, create_time, real_sender_id,
-			message_content, WCDB_CT_message_content, origin_source
+			message_content, WCDB_CT_message_content, source, WCDB_CT_source, origin_source
 		 FROM [%s] WHERE local_id > ? AND server_id > 0
 		 ORDER BY local_id ASC LIMIT ?`, shard.table)
 	rows, err := shard.db.Query(query, after, limit)
@@ -874,15 +811,16 @@ func queryMessageRecords(shard messageShard, after int64, limit int) ([]messageR
 	var records []messageRecord
 	for rows.Next() {
 		var record messageRecord
-		var contentType sql.NullInt64
-		var content []byte
+		var contentType, sourceType sql.NullInt64
+		var content, source []byte
 		if err := rows.Scan(
 			&record.localID, &record.serverID, &record.localType, &record.createdAt,
-			&record.realSenderID, &content, &contentType, &record.originSource,
+			&record.realSenderID, &content, &contentType, &source, &sourceType, &record.originSource,
 		); err != nil {
 			return nil, err
 		}
 		record.content = decompressMessage(content, contentType.Int64)
+		record.source = decompressMessage(source, sourceType.Int64)
 		records = append(records, record)
 	}
 	return records, rows.Err()
@@ -890,7 +828,7 @@ func queryMessageRecords(shard messageShard, after int64, limit int) ([]messageR
 
 func queryMessageRecordsBySort(shard messageShard, after, before int64) ([]messageRecord, error) {
 	query := fmt.Sprintf(`SELECT local_id, server_id, sort_seq, local_type, create_time, real_sender_id,
-			message_content, WCDB_CT_message_content, origin_source
+			message_content, WCDB_CT_message_content, source, WCDB_CT_source, origin_source
 		 FROM [%s] WHERE sort_seq > ? AND sort_seq < ? AND server_id > 0
 		 ORDER BY sort_seq ASC`, shard.table)
 	rows, err := shard.db.Query(query, after, before)
@@ -901,15 +839,16 @@ func queryMessageRecordsBySort(shard messageShard, after, before int64) ([]messa
 	var records []messageRecord
 	for rows.Next() {
 		var record messageRecord
-		var contentType sql.NullInt64
-		var content []byte
+		var contentType, sourceType sql.NullInt64
+		var content, source []byte
 		if err := rows.Scan(
 			&record.localID, &record.serverID, &record.sortSequence, &record.localType, &record.createdAt,
-			&record.realSenderID, &content, &contentType, &record.originSource,
+			&record.realSenderID, &content, &contentType, &source, &sourceType, &record.originSource,
 		); err != nil {
 			return nil, err
 		}
 		record.content = decompressMessage(content, contentType.Int64)
+		record.source = decompressMessage(source, sourceType.Int64)
 		records = append(records, record)
 	}
 	return records, rows.Err()
@@ -935,7 +874,7 @@ func convertMessages(shard messageShard, roomID string, records []messageRecord)
 			MsgID:    strconv.FormatInt(record.serverID, 10),
 			Action:   wecom.ActionSend,
 			From:     from,
-			ToList:   []string{},
+			ToList:   mentionedUsers(record.source, group),
 			RoomID:   roomID,
 			MsgTime:  saturatingMilliseconds(record.createdAt),
 			Sequence: record.localID, SortSequence: record.sortSequence,
@@ -945,17 +884,6 @@ func convertMessages(shard messageShard, roomID string, records []messageRecord)
 		messages = append(messages, message)
 	}
 	return messages, nil
-}
-
-func maxMessagePosition(db *sql.DB, table string) (MessagePosition, bool, error) {
-	var position MessagePosition
-	err := db.QueryRow(fmt.Sprintf(
-		"SELECT create_time, local_id FROM [%s] ORDER BY local_id DESC LIMIT 1", table,
-	)).Scan(&position.CreateTime, &position.LocalID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return MessagePosition{}, false, nil
-	}
-	return position, err == nil, err
 }
 
 func normalizeMessage(message *wecom.Message, localType int64, content string, group bool) {
@@ -1240,6 +1168,23 @@ func isMessageShard(name string) bool {
 }
 
 func baseType(value int64) int64 { return int64(uint64(value) & math.MaxUint32) }
+
+func mentionedUsers(source string, group bool) []string {
+	users := []string{}
+	if !group {
+		return users
+	}
+	seen := map[string]struct{}{}
+	for _, user := range strings.Split(cleanXMLText(extractXMLText(source, "atuserlist")), ",") {
+		user = strings.TrimSpace(user)
+		if _, exists := seen[user]; user == "" || exists {
+			continue
+		}
+		seen[user] = struct{}{}
+		users = append(users, user)
+	}
+	return users
+}
 
 func stripGroupPrefix(content string, group bool) string {
 	if group {

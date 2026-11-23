@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	v2ImageMagic = []byte{0x07, 0x08, 'V', '2', 0x08, 0x07}
-	imageKeys    sync.Map
+	ErrImageDecode = errors.New("could not decode cached WeChat image")
+	v2ImageMagic   = []byte{0x07, 0x08, 'V', '2', 0x08, 0x07}
+	imageKeys      sync.Map
 )
 
 const (
@@ -73,7 +74,7 @@ func (store *Store) ReadImage(roomID string, localID, createTime int64, messageM
 		decodeErr = errors.Join(decodeErr, fmt.Errorf("decode %s: %w", filepath.Base(path), err))
 	}
 	if decodeErr != nil {
-		return nil, decodeErr
+		return nil, fmt.Errorf("%w: %w", ErrImageDecode, decodeErr)
 	}
 	return nil, nil
 }
