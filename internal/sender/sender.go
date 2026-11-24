@@ -15,7 +15,6 @@ import (
 
 	"github.com/netcat-ai/webox/internal/sharedmedia"
 	"github.com/netcat-ai/webox/internal/wechat"
-	"github.com/netcat-ai/webox/internal/wechatdb"
 )
 
 const maxTextLength = 5000
@@ -40,7 +39,6 @@ type preparedItem struct {
 	Text        string
 	Path        string
 	ContentType string
-	Filename    string
 }
 
 func New(state *wechat.State, media *sharedmedia.Store) *Service {
@@ -59,10 +57,6 @@ func (service *Service) Send(ctx context.Context, target string, items []Item) (
 	if err != nil {
 		return Receipt{}, err
 	}
-	positions, err := service.wechat.RoomMessagePositions(recipient.Username)
-	if err != nil {
-		return Receipt{}, err
-	}
 	receipt := Receipt{ClientMessageID: randomID()}
 	if os.Getenv("WEBOX_UI_SEND_DRY_RUN") == "1" {
 		return receipt, nil
@@ -71,21 +65,7 @@ func (service *Service) Send(ctx context.Context, target string, items []Item) (
 	if err := runUIScript(ctx, "80s", sendItemsScript(search, prepared), "send message"); err != nil {
 		return Receipt{}, err
 	}
-	for range 20 {
-		found, err := service.verifyItems(positions, recipient.Username, prepared)
-		if err != nil {
-			return Receipt{}, fmt.Errorf("verify sent message in WeChat db: %w", err)
-		}
-		if found {
-			return receipt, nil
-		}
-		select {
-		case <-ctx.Done():
-			return Receipt{}, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	return Receipt{}, errors.New("send verification failed: not every item was found in WeChat db")
+	return receipt, nil
 }
 
 func (service *Service) prepareItems(target string, items []Item) ([]preparedItem, error) {
@@ -113,44 +93,16 @@ func (service *Service) prepareItems(target string, items []Item) ([]preparedIte
 			if service.media == nil {
 				return nil, errors.New("shared media store is unavailable")
 			}
-			path, filename, err := service.media.ResolveFile(target, item.SharedPath)
+			path, _, err := service.media.ResolveFile(target, item.SharedPath)
 			if err != nil {
 				return nil, err
 			}
-			prepared = append(prepared, preparedItem{Kind: "file", Path: path, Filename: filename})
+			prepared = append(prepared, preparedItem{Kind: "file", Path: path})
 		default:
 			return nil, fmt.Errorf("unsupported message item kind %q", item.Kind)
 		}
 	}
 	return prepared, nil
-}
-
-func (service *Service) verifyItems(positions wechatdb.RoomMessagePositions, username string, items []preparedItem) (bool, error) {
-	sent, err := service.wechat.OutgoingItemsAfter(positions, username)
-	if err != nil {
-		return false, err
-	}
-	return containsItems(sent, items), nil
-}
-
-func containsItems(sent []wechatdb.OutgoingItem, expected []preparedItem) bool {
-	counts := make(map[wechatdb.OutgoingItem]int, len(sent))
-	for _, item := range sent {
-		counts[item]++
-	}
-	for _, item := range expected {
-		key := wechatdb.OutgoingItem{Kind: item.Kind}
-		if item.Kind == "text" {
-			key.Value = item.Text
-		} else if item.Kind == "file" {
-			key.Value = item.Filename
-		}
-		if counts[key] == 0 {
-			return false
-		}
-		counts[key]--
-	}
-	return true
 }
 
 func sendItemsScript(searchBase64 string, items []preparedItem) string {

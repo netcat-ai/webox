@@ -255,21 +255,6 @@ func TestQueryResumesByLocalIDWhenTimestampMovesBackward(t *testing.T) {
 	}
 }
 
-func TestMaxMessagePositionUsesLatestLocalID(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "message.db")
-	db := createMessageDB(t, path)
-	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (1, 101, 1, 1001, 0, 'first', 0, 3, 2)")
-	mustExec(t, db, "INSERT INTO [Msg_test] (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content, status, origin_source) VALUES (2, 102, 1, 999, 0, 'second', 0, 3, 2)")
-	defer func() { _ = db.Close() }()
-	position, found, err := maxMessagePosition(db, "Msg_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found || position.LocalID != 2 || position.CreateTime != 999 {
-		t.Fatalf("position=%#v found=%t", position, found)
-	}
-}
-
 func TestQuerySkipsRowsWithoutServerID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "message.db")
 	db := createMessageDB(t, path)

@@ -35,12 +35,13 @@ type sessionSource interface {
 
 type contactSource interface {
 	ContactsByRemark(string) ([]wechatdb.Contact, error)
+	ContactsByRoomID(string) ([]wechatdb.Contact, error)
 }
 
 type roomMessageSource interface {
 	RoomSessions(int64) (map[string]int64, error)
 	RoomMessagesBySort(string, int64, int64) ([]wecom.Message, error)
-	ReadImage(string, int64, int64, string) (*wechatdb.MediaFile, error)
+	ReadImage(string, int64, int64, string, bool) (*wechatdb.MediaFile, error)
 	ReadFile(string, int64, int64, string) (*wechatdb.LocalFile, error)
 }
 
@@ -98,6 +99,7 @@ func (server *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /ilink/bot/userinfo", server.getUserInfo)
 	mux.HandleFunc("GET /ilink/bot/contacts", server.getContacts)
+	mux.HandleFunc("GET /ilink/bot/media", server.getMedia)
 	mux.HandleFunc("POST /ilink/bot/getupdates", server.getUpdates)
 	mux.HandleFunc("POST /ilink/bot/sendmessage", server.sendMessage)
 	return mux
@@ -239,7 +241,7 @@ func (server *Server) readyMessages(messages []wecom.Message) ([]wecom.Message, 
 				server.logger.Debug("waiting for WeChat media", "roomid", roomID, "msgid", message.MsgID, "type", message.MsgType)
 				return ready, true, nil
 			}
-			server.logger.Warn("delivering WeChat media without sdkfileid after waiting one minute", "roomid", roomID, "msgid", message.MsgID, "type", message.MsgType)
+			server.logger.Warn("delivering WeChat media without sdkfileid after waiting one minute", "roomid", roomID, "msgid", message.MsgID, "type", message.MsgType, "error", err)
 		}
 		ready = append(ready, message)
 	}
@@ -290,8 +292,9 @@ func (server *Server) getContacts(response http.ResponseWriter, request *http.Re
 		return
 	}
 	remark := request.URL.Query().Get("remark")
-	if remark == "" {
-		writeError(response, http.StatusBadRequest, "remark is required")
+	roomID := request.URL.Query().Get("roomid")
+	if (remark == "") == (roomID == "") {
+		writeError(response, http.StatusBadRequest, "exactly one of remark or roomid is required")
 		return
 	}
 	if !server.session.IsInitialized() {
@@ -302,9 +305,15 @@ func (server *Server) getContacts(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusNotImplemented, "contacts are not supported by this message source")
 		return
 	}
-	contacts, err := server.contacts.ContactsByRemark(remark)
+	var contacts []wechatdb.Contact
+	var err error
+	if roomID != "" {
+		contacts, err = server.contacts.ContactsByRoomID(roomID)
+	} else {
+		contacts, err = server.contacts.ContactsByRemark(remark)
+	}
 	if err != nil {
-		server.logger.Error("could not query WeChat contacts", "remark", remark, "error", err)
+		server.logger.Error("could not query WeChat contacts", "remark", remark, "roomid", roomID, "error", err)
 		writeError(response, http.StatusInternalServerError, "could not query WeChat contacts")
 		return
 	}
@@ -345,7 +354,7 @@ func (server *Server) sendMessage(response http.ResponseWriter, request *http.Re
 	if len(body.Messages) != 0 && body.Messages[0].MsgID != "" {
 		resultID = body.Messages[0].MsgID
 	}
-	server.logger.Info("WeChat message sent", "target", target, "client_msg_id", resultID)
+	server.logger.Info("WeChat send script completed", "target", target, "client_msg_id", resultID)
 	writeJSON(response, http.StatusOK, sendSuccess(resultID))
 }
 

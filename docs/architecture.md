@@ -10,7 +10,7 @@
 2. 协议模型停留在适配层，微信数据库和 UI 发送逻辑不依赖 HTTP 消息字段。
 3. `weagent` 以 Linux 微信客户端为真实终端。
 4. WeChat DB 是消息事实源，不复制一套业务消息库。
-5. 对发送结果采用同步、可验证语义，不在 UI 操作完成前返回成功。
+5. 微信 UI 发送脚本执行完成后同步返回结果。
 
 ## 组件
 
@@ -50,8 +50,9 @@ HTTP token 单独持久化。Webox 不再生成额外的 provider account ID；�
 但两者语义不同。用户以后修改微信号时，新的可见值进入 `alias`，`account_id` 仍保持原 `username`。
 `/healthz` 仍只返回 `ok` 和 `ready`，不暴露这些身份或凭据。
 
-受 token 保护的 `GET /ilink/bot/contacts?remark=...` 在 contact 数据库中精确匹配未删除记录，返回
-`roomid`、`remark` 和可用时的 `nickname`。接口不支持空条件枚举整个通讯录；返回数组而不是假定备注唯一，
+受 token 保护的 `GET /ilink/bot/contacts` 只接受 `remark` 或 `roomid` 其中一个条件，在 contact 数据库中精确匹配
+未删除记录，返回 `roomid`、`remark` 和可用时的 `nickname`。`remark` 用于把备注解析为发送目标，`roomid` 用于
+消费端按收到的 Room 读取备注作为展示名称。接口不支持空条件枚举整个通讯录；返回数组而不是假定备注唯一，
 调用方遇到多个匹配时可以明确拒绝目标歧义。
 
 ## 收消息
@@ -78,25 +79,26 @@ WeChat DB 来源的主要字段映射：
 | `local_id` | Room 内媒体定位和消息读取所需的本地 ID，不参与合并排序 |
 | 实际发送者 | `from`；当前账号发出的消息使用登录账号 `account_id` |
 | `SessionTable.username` | `roomid`；私聊与群聊都非空 |
-| 暂不解析的 @ 接收者 | `tolist=[]` |
+| 群聊 `source` 中 `atuserlist` 的 @ 接收者 | `tolist`：按出现顺序去重的 username，@所有人为 `notify@all`；私聊固定为空 |
 | `msgtime` | `msgtime`（毫秒） |
 | 文本 | `msgtype=text`、`text.content` |
 | 普通链接 `appmsg` | `msgtype=link`、`link` |
 | 视频号 `appmsg.finderFeed` | `msgtype=sphfeed`、`sphfeed` |
-| 图片 | `msgtype=image`、`image.sdkfileid` |
+| 图片、带有效媒体摘要的表情（`local_type=47` 或 `appmsg.type=8`） | `msgtype=image`、`image.sdkfileid` |
 | 文件 | `msgtype=file`、`file.filename`、`file.sdkfileid` |
 | 引用/回复 `appmsg.type=57` | `msgtype=reply`、`reply.title`、`reply.parent` |
 
 数据库消息直接转换为公开 Go 包 `github.com/netcat-ai/webox/wecom` 的 `Message`。消息信封沿用
 [企业微信会话内容存档消息格式](https://developer.work.weixin.qq.com/document/path/91774)的字段形状，但 Webox 将
-`roomid` 统一定义为 `SessionTable.username`，并在当前版本固定输出空 `tolist`。消息对象不包含
+`roomid` 统一定义为 `SessionTable.username`，并以 `tolist` 表达群聊消息 @ 的接收者。消息对象不包含
 `item_list`、`context_token`、`mentioned_me`、`is_completed` 或 `shared_path` 等 Webox 私有字段。
 媒体在共享目录中的相对路径作为 opaque `sdkfileid` 使用；Webox 不增加另一套路径字段。
 视频号分享的 `appmsg` 顶层可能只包含“当前微信版本不支持”的兼容标题和升级 URL；Webox 优先读取
 `finderFeed`，输出 `sphfeed` 消息体，不生成 `text`，也不把顶层兼容占位交付给消费者。
 
-群聊 `roomid` 以 `@chatroom` 结尾，其他 `roomid` 表示私聊。图片消息只解码 Linux 微信 V2 `.dat`；已下载文件从微信本地目录复制到
-共享目录。媒体可用时 `sdkfileid` 是 `inbox/` 相对路径，不可用时为空字符串。
+群聊 `roomid` 以 `@chatroom` 结尾，其他 `roomid` 表示私聊。普通图片读取 Linux 微信 V2 `.dat`。表情按媒体
+摘要读取当前账号的月度 `Emoticon` 缓存，GIF 解码后以原始字节导出。已下载文件从微信本地目录复制到共享目录。
+媒体可用时 `sdkfileid` 是 `inbox/` 相对路径，不可用时为空字符串。
 
 引用/回复消息使用 Webox 扩展的 `reply` 类型。`reply.title` 是当前消息正文；`reply.parent` 只保存同一
 `roomid` 内直接父消息的 `msgid`、`from`、`msgtype` 和 `msgtime`，不重复嵌入父消息正文或媒体。
@@ -106,7 +108,7 @@ WeChat DB 来源的主要字段映射：
 图片优先尝试 `_h.dat`、`.dat`；只有 `_t.dat` 时，从缩略图落盘起等待 3 秒，期间继续重试高清候选，
 到期后才使用 `_t.dat` 兜底。图片或文件尚未准备好时，`getupdates` 可返回全局序列中它之前的 ready 前缀，
 但保持请求 cursor 不变；当前允许消费者重复追加重放消息。从微信消息时间起等待满 1 分钟仍
-不可用时，Webox 记录 WARN、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。微信发送文件时可能先在同一
+不可用时（包括本地图片无法解码），Webox 记录原因、返回空 `sdkfileid` 的原媒体消息，避免永久队头阻塞。微信发送文件时可能先在同一
 `local_id` 写入只有标题的空链接占位，随后原地更新为文件消息；Webox 同样等待这种近期占位稳定后再推进 cursor。
 
 V2 `.dat` 外层解密后若得到 `wxgf`，Linux CGO 构建直接加载微信随客户端提供的 `libvoipComm.so` 和
@@ -122,21 +124,21 @@ POST sendmessage(msgs[text/image/file...])
   -> resolve the common target from roomid
   -> resolve media sdkfileid under /webox/state/shared/rooms/<roomid>/inbox or outbox
   -> activate WeChat once, paste and press Enter for every message in order
-  -> verify every expected text, image, and file in the same local DB conversation
   -> return the first msgid as client_msg_id with ret=0
 ```
 
 批内所有消息必须拥有相同的非空 `roomid`，且 `tolist` 必须为空。
 整个发送路径由互斥锁串行化。一个 `msgs` 数组是一次有序 UI 发送批次：每条文本、图片和文件都通过剪贴板粘贴后立即按 Enter，
 不使用附件按钮、文件选择器或坐标点击。该批次不是原子操作，中途失败时前面的消息可能已经发出，调用方不能自动重试整个批次。
-HTTP 成功表示全部消息的 UI 发送及数据库回读都已完成，不是“已进入队列”。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
+HTTP 成功表示整个批次的 UI 发送脚本已经执行完毕，收件方是否收到由微信决定。媒体 API 只传共享目录相对路径，不上传文件、不生成下载 URL。
 ## HTTP 接口
 
 Webox 只暴露以下接口：
 
 - `GET /healthz`：返回进程存活与当前消息来源的就绪状态。
 - `GET /ilink/bot/userinfo`：返回当前来源身份。
-- `GET /ilink/bot/contacts?remark=...`：WeChat 来源按备注精确查询联系人或群聊的 `roomid`。
+- `GET /ilink/bot/contacts?remark=...|roomid=...`：WeChat 来源按备注或 `roomid` 精确查询联系人或群聊。
+- `GET /ilink/bot/media?roomid=...&sdkfileid=...&account_id=...`：读取已接入会话 `inbox/` 下由 Webox 导出的入站图片。绑定当前账号，返回原始字节和文件长度。
 - `POST /ilink/bot/getupdates`：长轮询接收消息。
 - `POST /ilink/bot/sendmessage`：发送文本、图片和文件。
 
@@ -147,7 +149,6 @@ Webox 只暴露以下接口：
 - WeChat DB 是持久事件源。
 - 消费进度是调用方提交的单一字符串 `cursor`；Webox 不保存调用方 checkpoint。
 - 空 cursor 默认读取最近五天；需要更久历史时，调用方可手动设置 cursor。
-- WeChat UI 发送必须从 WeChat DB 验证目标和精确文本后才返回成功。
 - `client_id` 由调用方标识出站消息；`msgid` 标识消息身份，cursor 标识整个响应的消费位置。
 - WeChat 会话退出后，业务接口返回 `ret=-14`；使用者通过 noVNC 重新登录。
 

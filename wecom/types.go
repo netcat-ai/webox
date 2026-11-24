@@ -25,6 +25,7 @@ type Image struct {
 	SDKFileID string `json:"sdkfileid"`
 	MD5Sum    string `json:"md5sum"`
 	FileSize  int64  `json:"filesize"`
+	Emoticon  bool   `json:"-"`
 }
 
 type Voice struct {

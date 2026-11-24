@@ -9,7 +9,7 @@ Webox 是底层微信适配器，不是完整的机器人产品。它不包含 a
 
 - 收消息：读取 Linux 微信本地数据库，以单一 `cursor` 合并返回各 Room 的企业微信会话存档形状消息。
 - 发消息：根据 `roomid` 定位私聊或群聊，通过微信 UI 依次发送文本、图片和文件。
-- 确认发送：再次读取本地数据库，确认消息已出现在正确会话中。
+- 发送回执：微信界面的发送脚本执行完成后立即返回。收件方是否收到由微信决定。
 - 交换媒体：通过 Room 目录中的 `inbox/` 和 `outbox/` 在 Webox 和本地消费端之间共享文件。
 
 ## 风险提示
@@ -60,11 +60,12 @@ Webox 提供以下 HTTP 接口：
 | --- | --- | --- |
 | `GET` | `/healthz` | 进程和微信初始化状态 |
 | `GET` | `/ilink/bot/userinfo` | 当前微信账号身份 |
-| `GET` | `/ilink/bot/contacts?remark=webox.test` | 按备注精确查询联系人或群聊的 `roomid` |
+| `GET` | `/ilink/bot/contacts?remark=webox.test` | 按备注或 `roomid` 精确查询联系人或群聊 |
 | `POST` | `/ilink/bot/getupdates` | 按全局 `cursor` 长轮询接收消息 |
+| `GET` | `/ilink/bot/media?roomid=...&sdkfileid=...&account_id=...` | 读取当前账号下已导出的入站图片文件 |
 | `POST` | `/ilink/bot/sendmessage` | 发送文本、图片和文件 |
 
-`contacts` 只做 `remark` 精确匹配，并返回未删除记录；`contacts` 数组保留重复备注，调用方可以据此拒绝不唯一的发送目标。
+`contacts` 只接受 `remark` 或 `roomid` 其中一个条件做精确匹配，并返回未删除记录；`contacts` 数组保留重复备注，调用方可以据此拒绝不唯一的发送目标。
 
 接收消息时提交已经完整持久化的游标；首次请求使用空字符串：
 
@@ -97,7 +98,8 @@ Webox 提供以下 HTTP 接口：
 ```
 
 图片和文件通过 `<state>/shared/rooms/<roomid>/` 下的 `inbox/`、`outbox/` 交换，消息中的 `sdkfileid`
-使用相对于 Room 目录的路径。完整字段语义和可靠性限制见 [架构说明](docs/architecture.md)。
+使用相对于 Room 目录的路径。HTTP 客户端可用消息的 `roomid`、`image.sdkfileid` 和 `userinfo` 返回的
+`account_id` 请求 `/ilink/bot/media`，成功时返回文件字节。完整字段语义和可靠性限制见 [架构说明](docs/architecture.md)。
 
 ## 参考与致谢
 

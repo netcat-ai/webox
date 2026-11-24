@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type Store struct {
@@ -35,7 +36,7 @@ func New(root string) (*Store, error) {
 }
 
 func (store *Store) RoomDirectory(roomID string) (string, error) {
-	if roomID == "" || roomID == "." || roomID == ".." || strings.ContainsAny(roomID, "/\\\x00") {
+	if !validSegment(roomID) {
 		return "", errors.New("roomid is not a safe directory name")
 	}
 	directory := filepath.Join(store.root, "rooms", roomID)
@@ -45,6 +46,34 @@ func (store *Store) RoomDirectory(roomID string) (string, error) {
 		}
 	}
 	return directory, nil
+}
+
+func validSegment(value string) bool {
+	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, "/\\\x00")
+}
+
+func (store *Store) OpenInbox(roomID, sdkfileID string) (*os.File, error) {
+	name, ok := strings.CutPrefix(sdkfileID, "inbox/")
+	if !ok || !validSegment(roomID) || !validSegment(name) || strings.HasPrefix(name, ".") {
+		return nil, os.ErrNotExist
+	}
+	root, err := os.OpenRoot(store.root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	room := filepath.Join("rooms", roomID)
+	inbox := filepath.Join(room, "inbox")
+	for _, directory := range []string{"rooms", room, inbox} {
+		info, err := root.Lstat(directory)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, os.ErrNotExist
+		}
+	}
+	return root.OpenFile(filepath.Join(inbox, name), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
 
 func (store *Store) WriteInbox(roomID, messageID string, data []byte, contentType string) (string, error) {

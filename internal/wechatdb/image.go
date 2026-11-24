@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	v2ImageMagic = []byte{0x07, 0x08, 'V', '2', 0x08, 0x07}
-	imageKeys    sync.Map
+	ErrImageDecode = errors.New("could not decode cached WeChat image")
+	v2ImageMagic   = []byte{0x07, 0x08, 'V', '2', 0x08, 0x07}
+	imageKeys      sync.Map
 )
 
 const (
@@ -38,8 +39,9 @@ type MediaFile struct {
 }
 
 type imageKeyMaterial struct {
-	aes [16]byte
-	xor byte
+	aes      [16]byte
+	emoticon [16]byte
+	xor      byte
 }
 
 type v2ImageCandidate struct {
@@ -73,7 +75,7 @@ func (store *Store) ReadImage(roomID string, localID, createTime int64, messageM
 		decodeErr = errors.Join(decodeErr, fmt.Errorf("decode %s: %w", filepath.Base(path), err))
 	}
 	if decodeErr != nil {
-		return nil, decodeErr
+		return nil, fmt.Errorf("%w: %w", ErrImageDecode, decodeErr)
 	}
 	return nil, nil
 }
@@ -261,8 +263,8 @@ func deriveImageKey(accountDir string, files []v2ImageCandidate) (imageKeyMateri
 		return imageKeyMaterial{}, errors.New("account directory for WeChat has an invalid suffix")
 	}
 	for _, wxid := range []string{raw[:separator], raw} {
-		if aesKey, found := bruteForceImageKey(xorKey, suffix, wxid, templates); found {
-			return imageKeyMaterial{aes: aesKey, xor: xorKey}, nil
+		if keys, found := bruteForceImageKey(xorKey, suffix, wxid, templates); found {
+			return keys, nil
 		}
 	}
 	return imageKeyMaterial{}, errors.New("could not derive the local WeChat image key")
@@ -331,10 +333,10 @@ func imageTemplateBlocks(files []v2ImageCandidate, limit int) ([][16]byte, error
 	return result, nil
 }
 
-func bruteForceImageKey(xorKey byte, suffix []byte, wxid string, templates [][16]byte) ([16]byte, bool) {
+func bruteForceImageKey(xorKey byte, suffix []byte, wxid string, templates [][16]byte) (imageKeyMaterial, bool) {
 	workers := max(runtime.NumCPU(), 1)
 	var stop atomic.Bool
-	result := make(chan [16]byte, 1)
+	result := make(chan imageKeyMaterial, 1)
 	var group sync.WaitGroup
 	total := uint32(1 << 24)
 	chunk := total / uint32(workers)
@@ -359,7 +361,7 @@ func bruteForceImageKey(xorKey byte, suffix []byte, wxid string, templates [][16
 				var key [16]byte
 				copy(key[:], aesHex[:16])
 				if verifyImageKey(key, templates) && stop.CompareAndSwap(false, true) {
-					result <- key
+					result <- imageKeyMaterial{aes: key, xor: xorKey, emoticon: md5.Sum([]byte(uinText + wxid + "EMOTICON"))}
 				}
 			}
 		}()

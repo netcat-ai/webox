@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -56,6 +58,9 @@ func (source *fakeMessages) ContactsByRemark(remark string) ([]wechatdb.Contact,
 	source.remark = remark
 	return source.contacts, source.contactsErr
 }
+func (source *fakeMessages) ContactsByRoomID(roomID string) ([]wechatdb.Contact, error) {
+	return source.contacts, source.contactsErr
+}
 func (source *fakeMessages) RoomSessions(after int64) (map[string]int64, error) {
 	source.sessionAfter = after
 	sessions := make(map[string]int64)
@@ -79,7 +84,7 @@ func (source *fakeMessages) RoomMessagesBySort(roomID string, after, before int6
 	}
 	return messages, nil
 }
-func (source *fakeMessages) ReadImage(roomID string, localID, createTime int64, md5 string) (*wechatdb.MediaFile, error) {
+func (source *fakeMessages) ReadImage(roomID string, localID, createTime int64, md5 string, _ bool) (*wechatdb.MediaFile, error) {
 	source.imageRoomID = roomID
 	source.imageLocalID = localID
 	source.imageTime = createTime
@@ -170,6 +175,53 @@ func TestGetContactsRequiresAuthenticatedNonEmptyRemark(t *testing.T) {
 	}
 	if response := perform(server, http.MethodGet, "/ilink/bot/contacts", nil, true); response.Code != http.StatusBadRequest {
 		t.Fatalf("missing remark status=%d", response.Code)
+	}
+}
+
+func TestMediaReturnsOnlyAuthorizedRoomInboxFiles(t *testing.T) {
+	server, messages, _ := testServer(t)
+	messages.initialized = true
+	messages.userInfo = wechat.UserInfo{AccountID: "wxid_current", WeChatID: "test"}
+	messages.contacts = []wechatdb.Contact{{RoomID: "group@chatroom", Remark: "webox.group"}}
+	data := []byte("opaque synthetic media bytes")
+	fileID, err := server.media.WriteInbox("group@chatroom", "image-1", data, "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := func(room, account, file string) string {
+		q := url.Values{"roomid": {room}, "account_id": {account}, "sdkfileid": {file}}
+		return "/ilink/bot/media?" + q.Encode()
+	}
+	valid := target("group@chatroom", "wxid_current", fileID)
+	response := perform(server, http.MethodGet, valid, nil, true)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" ||
+		!bytes.Equal(response.Body.Bytes(), data) {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	for _, tc := range []struct {
+		path string
+		auth bool
+		want int
+	}{
+		{valid, false, http.StatusUnauthorized},
+		{target("group@chatroom", "wxid_old", fileID), true, http.StatusConflict},
+		{target("other@chatroom", "wxid_current", fileID), true, http.StatusNotFound},
+		{target("group@chatroom", "wxid_current", "outbox/image.png"), true, http.StatusNotFound},
+		{target("group@chatroom", "wxid_current", "inbox/../image.png"), true, http.StatusNotFound},
+	} {
+		if got := perform(server, http.MethodGet, tc.path, nil, tc.auth).Code; got != tc.want {
+			t.Errorf("%s returned %d, want %d", tc.path, got, tc.want)
+		}
+	}
+	roomDir, err := server.media.RoomDirectory("group@chatroom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(roomDir, fileID), filepath.Join(roomDir, "inbox", "alias.png")); err != nil {
+		t.Fatal(err)
+	}
+	if got := perform(server, http.MethodGet, target("group@chatroom", "wxid_current", "inbox/alias.png"), nil, true).Code; got != http.StatusNotFound {
+		t.Errorf("symlink returned %d", got)
 	}
 }
 
